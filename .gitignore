@@ -1,0 +1,6 @@
+# Build artifacts
+debug/
+target/
+
+# Release output
+dist/

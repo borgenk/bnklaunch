@@ -1,0 +1,11 @@
+[unstable]
+# The binary is no_std: only core is rebuilt. The test harness needs std, so the
+# test target overrides this with CARGO_UNSTABLE_BUILD_STD=std,core (see the
+# Makefile). build-std-features stays empty for the same reason it always was:
+# nothing here uses std's backtrace stack.
+build-std = ["core"]
+build-std-features = []
+
+[build]
+target = "x86_64-unknown-linux-gnu"
+rustflags = ["-Zlocation-detail=none", "-Zunstable-options", "-Cpanic=immediate-abort"]

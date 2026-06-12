@@ -1,0 +1,15 @@
+[package]
+name = "bnklaunch"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = 3          # Max optimization for speed
+lto = true             # Link-time optimization (better perf + smaller binary)
+codegen-units = 1      # Single codegen unit for better optimization
+panic = "abort"        # No unwinding, smaller binary
+strip = true           # Strip symbols
+
+[profile.release-small]
+inherits = "release"
+opt-level = "z"        # Optimize for size over speed
