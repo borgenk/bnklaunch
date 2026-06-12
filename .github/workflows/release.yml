@@ -20,6 +20,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # The binary links libfreetype and libxkbcommon by name. The runner ships
+      # the runtime shared objects but not the unversioned .so symlinks the
+      # linker resolves -lfreetype and -lxkbcommon against, which the -dev
+      # packages provide.
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfreetype-dev libxkbcommon-dev
+
       # The release tarball is named from the Cargo.toml version, and
       # install.sh fetches it by the release tag. A mismatch would publish
       # an asset the installer cannot find, so fail fast before building.

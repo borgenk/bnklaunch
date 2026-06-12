@@ -18,6 +18,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # The binary links libfreetype and libxkbcommon by name. The runner ships
+      # the runtime shared objects but not the unversioned .so symlinks the
+      # linker resolves -lfreetype and -lxkbcommon against, which the -dev
+      # packages provide.
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfreetype-dev libxkbcommon-dev
+
       # Nightly with rust-src: the build relies on -Z build-std, which rebuilds
       # the standard library from source.
       - name: Install Rust toolchain
