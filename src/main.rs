@@ -11,6 +11,8 @@ mod desktop;
 mod editor;
 mod font;
 mod launch;
+#[cfg(test)]
+mod perf;
 mod platform;
 mod present;
 mod shm;

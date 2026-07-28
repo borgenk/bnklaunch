@@ -4,6 +4,9 @@
 //! alpha blending onto the pixel buffer. Glyph rasterization and metrics come
 //! from freetype.rs; this module owns font discovery, layout, and the blit.
 
+use core::cell::RefCell;
+
+use crate::platform::arena::ArrayVec;
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype;
 use crate::platform::syscall::{self, Fd, AT_FDCWD, DT_DIR, DT_LNK, DT_REG, O_RDONLY};
@@ -28,9 +31,131 @@ pub const INPUT_SIZE: f32 = 20.0;
 pub const NAME_SIZE: f32 = 16.0;
 pub const SUBTITLE_SIZE: f32 = 14.0;
 
+/// Slots in the glyph cache. The launcher's repertoire is the characters of a
+/// few dozen application names at three sizes, so a direct-mapped table this
+/// size collides rarely and a collision only costs a re-rasterization.
+const GLYPH_SLOTS: usize = 512;
+
+/// Coverage bytes held for all cached glyphs together. At the sizes drawn here
+/// a glyph's ink is a few hundred bytes, so this holds the whole working set
+/// several times over. When it does fill, glyphs are still drawn, just not
+/// cached.
+const INK_CAP: usize = 256 * 1024;
+
+/// A glyph that has been rasterized once: its metrics, and where its coverage
+/// sits in the ink arena.
+#[derive(Clone, Copy)]
+struct Cached {
+    ch: char,
+    /// The pixel size it was rasterized at. Part of the key: the same character
+    /// at two sizes is two glyphs.
+    px: u32,
+    left: i32,
+    top: i32,
+    width: usize,
+    rows: usize,
+    advance: f32,
+    ink_at: usize,
+    ink_len: usize,
+}
+
+/// Rasterized glyphs, kept for the life of the font.
+///
+/// Rasterizing means decomposing an outline and filling scanlines, and every
+/// frame drew the same handful of characters afresh. A launcher opens, shows a
+/// few names, and closes, so its glyph repertoire is tiny and fixed: the cache
+/// fills during the first frame and every frame after it is hits.
+///
+/// Measurement reads the same entries as drawing, which is the point of putting
+/// the advance in the cache rather than beside it. If the caret asked FreeType
+/// for an advance while the blit used a cached one, the two could disagree, and
+/// the caret would drift away from the text it is supposed to sit in.
+struct GlyphCache {
+    slots: [Option<Cached>; GLYPH_SLOTS],
+    ink: ArrayVec<u8, INK_CAP>,
+}
+
+impl GlyphCache {
+    fn new() -> Self {
+        Self {
+            slots: [None; GLYPH_SLOTS],
+            ink: ArrayVec::new(),
+        }
+    }
+
+    /// Which slot a glyph belongs in. Characters used together (a run of ASCII)
+    /// have to land in different slots, so the size is folded in with an odd
+    /// multiplier rather than added.
+    fn slot(ch: char, px: u32) -> usize {
+        let key = (ch as u32)
+            .wrapping_mul(31)
+            .wrapping_add(px.wrapping_mul(2_654_435_761));
+        (key as usize) % GLYPH_SLOTS
+    }
+
+    /// The cached glyph, rasterizing it first if this is its first sighting.
+    /// None when the face cannot produce it.
+    fn get(&mut self, face: &freetype::Face, ch: char, px: u32) -> Option<Cached> {
+        let slot = Self::slot(ch, px);
+        if let Some(hit) = self.slots[slot] {
+            if hit.ch == ch && hit.px == px {
+                return Some(hit);
+            }
+        }
+
+        // A miss, or another glyph sitting in this slot. Rasterize, and take the
+        // slot over: two characters that collide here are rare, and the loser is
+        // simply rasterized again next time it is drawn.
+        face.set_pixel_size(px).ok()?;
+        let glyph = face.rasterize(ch);
+
+        let ink_at = self.ink.len();
+        if self.ink.extend_from_slice(&glyph.coverage).is_err() {
+            // The arena is full. The glyph is still usable, it just cannot be
+            // kept, so hand it back without caching it.
+            self.ink.truncate(ink_at);
+            // No ink means no blit, so it must claim no size either. The
+            // advance is still right, so the line lays out as it should and the
+            // glyph is merely blank.
+            return Some(Cached {
+                ch,
+                px,
+                left: glyph.left,
+                top: glyph.top,
+                width: 0,
+                rows: 0,
+                advance: glyph.advance,
+                ink_at,
+                ink_len: 0,
+            });
+        }
+
+        let cached = Cached {
+            ch,
+            px,
+            left: glyph.left,
+            top: glyph.top,
+            width: glyph.width,
+            rows: glyph.rows,
+            advance: glyph.advance,
+            ink_at,
+            ink_len: glyph.coverage.len(),
+        };
+        self.slots[slot] = Some(cached);
+        Some(cached)
+    }
+
+    fn coverage(&self, g: &Cached) -> &[u8] {
+        &self.ink[g.ink_at..g.ink_at + g.ink_len]
+    }
+}
+
 /// Loaded font for text rendering.
 pub struct Font {
     face: freetype::Face,
+    /// Rasterized glyphs. Behind a cell because drawing takes the font by shared
+    /// reference: filling the cache is not a change anyone can observe.
+    cache: RefCell<GlyphCache>,
 }
 
 /// Preferred font filenames, searched in order.
@@ -86,11 +211,14 @@ impl Font {
         ))
     }
 
-    fn from_path(path: &str) -> Result<Self> {
+    pub(crate) fn from_path(path: &str) -> Result<Self> {
         let (ptr, len) = mmap_file(path)?;
         // Face takes ownership of the mapping and unmaps it on drop.
         let face = freetype::Face::from_mmap(ptr, len)?;
-        let font = Self { face };
+        let font = Self {
+            face,
+            cache: RefCell::new(GlyphCache::new()),
+        };
         // Confirm the face can be set to every UI size now. The layout and
         // render paths set the size but cannot surface a failure, so a face
         // that rejects one of these sizes (a bitmap strike font missing it) is
@@ -116,9 +244,10 @@ impl Font {
         max_width: u32,
         size: f32,
     ) -> u32 {
+        let px = pixel_size(size);
         // from_path validated every UI size, so this cannot fail for the sizes
         // the caller passes; the same holds at the other set_pixel_size sites.
-        let _ = self.face.set_pixel_size(pixel_size(size));
+        let _ = self.face.set_pixel_size(px);
         let (ascent, _descent) = self.face.line_metrics();
 
         let baseline_y = y as f32 + ascent;
@@ -126,8 +255,11 @@ impl Font {
         let max_x = (x + max_width) as f32;
         let clip_x = max_x as i32;
 
+        let mut cache = self.cache.borrow_mut();
         for ch in text.chars() {
-            let glyph = self.face.rasterize(ch);
+            let Some(glyph) = cache.get(&self.face, ch, px) else {
+                continue;
+            };
 
             if cursor_x + glyph.advance > max_x {
                 break;
@@ -145,7 +277,7 @@ impl Font {
                 clip_x,
                 gx,
                 gy,
-                &glyph.coverage,
+                cache.coverage(&glyph),
                 glyph.width,
                 glyph.rows,
                 color,
@@ -157,6 +289,15 @@ impl Font {
         (cursor_x - x as f32) as u32
     }
 
+    /// The pen advance of a character, from the same cache the blit draws from.
+    fn advance(&self, ch: char, px: u32) -> f32 {
+        self.cache
+            .borrow_mut()
+            .get(&self.face, ch, px)
+            .map(|g| g.advance)
+            .unwrap_or(0.0)
+    }
+
     /// Visual text height (ascent to descent) for a given font size.
     pub fn text_height(&self, size: f32) -> f32 {
         let _ = self.face.set_pixel_size(pixel_size(size));
@@ -164,21 +305,21 @@ impl Font {
         ascent - descent
     }
 
-    /// Pixel x position of the cursor at a given char offset.
+    /// Pixel x position of the caret at a given char offset.
     pub fn x_at_char_offset(&self, text: &str, char_offset: usize, size: f32) -> f32 {
-        let _ = self.face.set_pixel_size(pixel_size(size));
+        let px = pixel_size(size);
         text.chars()
             .take(char_offset)
-            .map(|ch| self.face.advance(ch))
+            .map(|ch| self.advance(ch, px))
             .sum()
     }
 
     /// Find the char offset closest to a pixel x position (for mouse hit-testing).
     pub fn char_offset_at_x(&self, text: &str, x: f32, size: f32) -> usize {
-        let _ = self.face.set_pixel_size(pixel_size(size));
+        let px = pixel_size(size);
         let mut acc = 0.0f32;
         for (i, ch) in text.chars().enumerate() {
-            let advance = self.face.advance(ch);
+            let advance = self.advance(ch, px);
             if x < acc + advance / 2.0 {
                 return i;
             }
@@ -209,29 +350,43 @@ fn blit_coverage(
     glyph_height: usize,
     color: u32,
 ) {
-    for row in 0..glyph_height {
-        let py = gy + row as i32;
-        if py < 0 || py >= buf_height as i32 {
-            continue;
-        }
+    // The coverage is one byte per pixel, row-major and tightly packed. A glyph
+    // whose bitmap is short of that is not drawable; the cache only ever hands
+    // out a full one, so this is a guard, not a case.
+    if glyph_width == 0 || glyph_height == 0 || bitmap.len() < glyph_width * glyph_height {
+        return;
+    }
 
-        for col in 0..glyph_width {
-            let Some(&coverage) = bitmap.get(row * glyph_width + col) else {
-                continue;
-            };
+    // Clip once for the whole glyph rather than testing every pixel against
+    // four bounds. What is left is the rectangle of the glyph that lands inside
+    // the buffer and inside the text box, and every pixel in it is in range.
+    let right = (buf_width as i32).min(clip_x);
+    let col_start = (-gx).max(0) as usize;
+    let col_end = ((right - gx).max(0) as usize).min(glyph_width);
+    let row_start = (-gy).max(0) as usize;
+    let row_end = ((buf_height as i32 - gy).max(0) as usize).min(glyph_height);
+    if col_start >= col_end || row_start >= row_end {
+        return;
+    }
+
+    for row in row_start..row_end {
+        let coverage_row = &bitmap[row * glyph_width + col_start..row * glyph_width + col_end];
+        let line = (gy + row as i32) as usize * buf_width as usize;
+        let left = line + (gx + col_start as i32) as usize;
+
+        for (i, &coverage) in coverage_row.iter().enumerate() {
             if coverage == 0 {
                 continue;
             }
-
-            let px = gx + col as i32;
-            if px < 0 || px >= buf_width as i32 || px >= clip_x {
-                continue;
-            }
-
-            let offset = (py as u32 * buf_width + px as u32) as usize;
-            if offset < pixels.len() {
-                pixels[offset] = blend(pixels[offset], color, coverage);
-            }
+            let offset = left + i;
+            pixels[offset] = if coverage == u8::MAX {
+                // The inside of a glyph is fully covered, and most of a glyph is
+                // inside: only its edges are partial. A full pixel is the colour
+                // itself, so there is nothing to blend it with.
+                color
+            } else {
+                blend(pixels[offset], color, coverage)
+            };
         }
     }
 }
@@ -359,6 +514,42 @@ mod tests {
             pixels.iter().any(|&p| p != 0),
             "rendering should leave at least one blended pixel"
         );
+    }
+
+    /// A glyph can land partly outside the buffer: the last one in a run reaches
+    /// past the right edge, and a tall one at y=0 reaches above the top. The
+    /// clipping is worked out once per glyph now, so an off-by-one there writes
+    /// out of bounds rather than merely drawing wrong.
+    #[test]
+    fn a_glyph_hanging_off_the_edge_is_clipped_not_dropped() {
+        let font = load_fixture_font();
+        let (w, h) = (40u32, 24u32);
+
+        // Text far wider than the buffer, drawn from the last few columns, so
+        // every glyph but the first is entirely outside it.
+        let mut pixels = vec![0u32; (w * h) as usize];
+        let width = font.render_text(
+            &mut pixels,
+            w,
+            h,
+            w - 4,
+            2,
+            "WWWWWWWW",
+            0x00FF_FFFF,
+            w * 4,
+            NAME_SIZE,
+        );
+        assert!(width > 0);
+
+        // Drawn at the very top, where a glyph's ink rises above the baseline
+        // and out of the buffer.
+        let mut pixels = vec![0u32; (w * h) as usize];
+        font.render_text(&mut pixels, w, h, 0, 0, "Wg", 0x00FF_FFFF, w, NAME_SIZE);
+
+        // And with the text box ending before the buffer does, which is the case
+        // the input field draws: the glyph fits the buffer but not the box.
+        let mut pixels = vec![0u32; (w * h) as usize];
+        font.render_text(&mut pixels, w, h, 0, 2, "WW", 0x00FF_FFFF, 6, NAME_SIZE);
     }
 
     #[test]

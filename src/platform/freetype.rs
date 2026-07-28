@@ -39,8 +39,6 @@ type FtLibrary = *mut c_void;
 /// FT_Face: a pointer to a struct whose fields this module reads.
 type FtFace = *mut FtFaceRec;
 
-/// Load the glyph and its metrics, no bitmap (FT_LOAD_DEFAULT).
-const FT_LOAD_DEFAULT: i32 = 0x0;
 /// Also rasterize to an 8-bit coverage bitmap, default gray render mode
 /// (FT_LOAD_RENDER). FT_RENDER_MODE_NORMAL needs no extra argument.
 const FT_LOAD_RENDER: i32 = 1 << 2;
@@ -357,24 +355,6 @@ impl Face {
         }
     }
 
-    /// Pen advance of a character at the current pixel size, in pixels. Loads
-    /// metrics only (no rasterization). Zero on a load failure.
-    pub fn advance(&self, ch: char) -> f32 {
-        // SAFETY: face is valid; FT_LOAD_DEFAULT loads metrics into the glyph
-        // slot without rendering. The advance is read out immediately.
-        let err =
-            unsafe { FT_Load_Char(self.face.as_ptr(), ch as u32 as c_ulong, FT_LOAD_DEFAULT) };
-        if err != 0 {
-            return 0.0;
-        }
-        let slot = unsafe { (*self.face.as_ptr()).glyph };
-        let Some(slot) = NonNull::new(slot) else {
-            return 0.0;
-        };
-        // SAFETY: slot is non-null and valid after a successful load.
-        unsafe { slot.as_ref().advance.x as f32 / 64.0 }
-    }
-
     /// Ascent and descent at the current pixel size, in pixels. Descent is
     /// negative, matching the FreeType convention.
     pub fn line_metrics(&self) -> (f32, f32) {
@@ -551,9 +531,11 @@ mod tests {
 
     #[test]
     fn advance_is_positive_for_letters() {
+        // The pen advance comes back with the rasterized glyph, which is what
+        // both the blit and the caret read it from.
         let face = load_face();
         face.set_pixel_size(16).expect("set size");
-        assert!(face.advance('A') > 0.0);
-        assert!(face.advance('m') > 0.0);
+        assert!(face.rasterize('A').advance > 0.0);
+        assert!(face.rasterize('m').advance > 0.0);
     }
 }

@@ -1,9 +1,13 @@
 //! Binary cache of discovered desktop entries plus recent launches.
 //!
-//! The launcher loads this to paint instantly, then a background rescan
-//! refreshes it. The file is disposable: load returns None on any problem with
-//! the header or entries (missing, wrong magic, wrong version, truncated, bad
-//! utf-8) and the caller falls back to a fresh scan.
+//! Scanning the application directories takes milliseconds; decoding this takes
+//! microseconds. So a start reads the cache, compares the fingerprint it carries
+//! against the directories, and only walks them again when the two disagree,
+//! which means an application was installed or removed since last time.
+//!
+//! The file is disposable. load returns None on any problem with it at all
+//! (missing, wrong magic, wrong version, truncated, bad utf-8), and the caller
+//! simply scans instead. Nothing here needs to be repaired, only rebuilt.
 //!
 //! Two sections, two write paths. The entries section changes only when the set
 //! of installed apps changes, and is written whole through a temp file and
@@ -201,7 +205,7 @@ const RECENTS_ENC_CAP: usize = RECENT_CAP * (2 + NAME_CAP) + 2;
 /// error, not a truncation: save renames its output over the live cache, and a
 /// half-written record there would fail decode on every subsequent start, which
 /// rescans and writes the same broken file again.
-fn encode(
+pub(crate) fn encode(
     entries: &[DesktopEntry],
     fingerprint: u64,
     recents: &[ArrayString<NAME_CAP>],
@@ -242,7 +246,7 @@ fn write_string<const N: usize>(out: &mut ArrayVec<u8, N>, s: &str) -> Result<()
     write_bytes(out, s.as_bytes())
 }
 
-fn decode(data: &[u8]) -> Option<Cached> {
+pub(crate) fn decode(data: &[u8]) -> Option<Cached> {
     let mut r = Reader::new(data);
     if r.take(MAGIC.len())? != MAGIC {
         return None;

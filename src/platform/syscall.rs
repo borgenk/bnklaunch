@@ -60,7 +60,9 @@ impl CPath {
         Some(CPath { buf })
     }
 
-    fn as_ptr(&self) -> *const u8 {
+    /// The NUL-terminated bytes, for a caller that hands the kernel a raw path
+    /// pointer of its own (the ring's openat does).
+    pub fn as_ptr(&self) -> *const u8 {
         self.buf.as_ptr()
     }
 }

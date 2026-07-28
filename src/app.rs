@@ -17,8 +17,8 @@ use crate::{cache, config, denylist, font, launch, ui};
 /// long.
 const CURSOR_BLINK_MS: u64 = 530;
 
-/// Submission-queue depth for the event-loop ring. A handful of ops are in
-/// flight at once (the socket poll, the timer, later the rescan reads).
+/// Submission-queue depth for the event-loop ring. Two operations are in flight
+/// at a time, the socket poll and the tick, and each is re-armed as it fires.
 const RING_ENTRIES: u32 = 32;
 
 /// Event-loop timer period. Paces key repeat and the caret blink; the socket
@@ -171,6 +171,16 @@ pub(crate) struct AppState {
     pub(crate) selected: usize,
 }
 
+impl AppState {
+    pub(crate) fn new(entries: desktop::Catalog, recents: cache::Recents) -> Self {
+        Self {
+            entries,
+            recents,
+            selected: 0,
+        }
+    }
+}
+
 /// Record a successful launch as the most recent, overwriting the recents tail
 /// of the cache in place. A no-op when nothing launched or the cache offset is
 /// unknown (no cache dir).
@@ -250,11 +260,7 @@ pub(crate) fn run() -> Result<()> {
     }
     denylist::apply(&mut entries, &cfg.denied);
 
-    let mut state = AppState {
-        entries,
-        recents,
-        selected: 0,
-    };
+    let mut state = AppState::new(entries, recents);
 
     // Connect to compositor
     let mut client = Client::connect()?;
@@ -506,17 +512,17 @@ fn repaint(
     cursor_visible: bool,
 ) -> Result<()> {
     let text = client.editor.text_owned();
+    let caret = ui::Caret {
+        offset: client.editor.cursor(),
+        selection: client.editor.selection(),
+        visible: cursor_visible,
+    };
     client.render(|client| {
+        let Some(pixels) = client.pixels() else {
+            return;
+        };
         let (results, _) = resolve_results(&text, search_enabled, &state.entries, &state.recents);
-        draw_ui(
-            client,
-            &text,
-            state,
-            &results,
-            font,
-            search_enabled,
-            cursor_visible,
-        );
+        draw_ui(pixels, &text, state, &results, font, search_enabled, &caret);
     })
 }
 

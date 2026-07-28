@@ -2,7 +2,6 @@
 //! that composite the input field and result rows into the pixel buffer.
 
 use crate::app::{normalize_url, parse_action, AppState, InputAction};
-use crate::client::Client;
 use crate::config::{MAX_RESULTS, WINDOW_WIDTH};
 use crate::desktop::{self, DesktopEntry};
 use crate::launch::URL_CAP;
@@ -13,16 +12,15 @@ const fn argb(a: u8, r: u8, g: u8, b: u8) -> u32 {
     ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-// UI colours, mirroring bnksound's dark palette. Everything sits on the
-// titlebar shade; the selected row picks up the same wash bnksound paints on
-// the titlebar profile button.
+// A dark palette. Everything sits on one flat background shade; the selected row
+// is the only part that lifts off it, by a few percent of white.
 const BODY_BG: u32 = argb(255, 0x29, 0x2b, 0x30);
 const TEXT_COLOR: u32 = argb(255, 0xec, 0xec, 0xec);
 const SUBTITLE_COLOR: u32 = argb(255, 0x88, 0x88, 0x88);
 const CURSOR_COLOR: u32 = argb(255, 0xff, 0x00, 0xaa);
-// White at 4% composited over the titlebar shade (the profile button's fill).
+// White at 4%, composited over the background.
 const SELECTED_BG: u32 = argb(255, 50, 51, 56);
-// Muted brand accent behind selected input text.
+// A muted accent behind selected input text.
 const SELECTION_COLOR: u32 = argb(255, 96, 40, 82);
 
 /// Y position where the input field starts
@@ -59,24 +57,33 @@ pub(crate) fn calculate_height(num_results: usize) -> u32 {
     }
 }
 
-/// Draw the full UI
+/// What the caret and the selection look like this frame.
+pub(crate) struct Caret {
+    /// Char offset of the caret in the input text.
+    pub offset: usize,
+    /// The selected range, as char offsets.
+    pub selection: Option<(usize, usize)>,
+    /// The caret is solid for half its blink period and hidden for the other.
+    pub visible: bool,
+}
+
+/// Draw the whole launcher into a pixel buffer.
+///
+/// It takes the buffer and the caret rather than the client, so drawing a frame
+/// needs no compositor: the same call renders into an offscreen buffer.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_ui(
-    client: &mut Client,
+    pixels: &mut shm::PixelBuffer,
     input_text: &str,
     state: &AppState,
     results: &[&DesktopEntry],
     font: &font::Font,
     search_enabled: bool,
-    cursor_visible: bool,
+    caret: &Caret,
 ) {
-    // Extract cursor/selection before borrowing pixels
-    let cursor = client.editor.cursor();
-    let selection = client.editor.selection();
-
-    let pixels = match client.pixels() {
-        Some(p) => p,
-        None => return,
-    };
+    let cursor = caret.offset;
+    let selection = caret.selection;
+    let cursor_visible = caret.visible;
 
     // A single flat surface; the selected row is the only part that washes.
     pixels.fill(BODY_BG);

@@ -1,9 +1,10 @@
 //! User configuration.
 //!
-//! $XDG_CONFIG_HOME/bnklaunch/config (fallback ~/.config/bnklaunch/config),
-//! one `field value` per line, like bnksound's settings.conf. Blank lines and
-//! # comments are ignored, and unknown fields are tolerated for forward-compat.
-//! A field may repeat: hidden takes one app name per line and they accumulate.
+//! $XDG_CONFIG_HOME/bnklaunch/config (fallback ~/.config/bnklaunch/config), one
+//! `field value` per line. Blank lines and # comments are ignored, and an
+//! unknown field is skipped rather than refused, so a config written for a later
+//! version still loads. A field may repeat: hidden takes one app name per line
+//! and they accumulate.
 
 use crate::desktop::NAME_CAP;
 use crate::platform::arena::{ArrayString, ArrayVec};

@@ -6,6 +6,8 @@
 use crate::platform::arena::{ArrayString, ArrayVec};
 use crate::platform::syscall::{DT_DIR, DT_LNK, DT_REG};
 use crate::platform::{env, fs};
+#[cfg(test)]
+use crate::platform::{syscall, uring};
 
 /// Most XDG data directories scanned for applications.
 const MAX_DATA_DIRS: usize = 16;
@@ -47,15 +49,35 @@ pub const ARG_CAP: usize = EXEC_CAP;
 pub const MAX_ARGS: usize = 32;
 /// Byte capacity of the rendered command-line subtitle under a result.
 pub const SUBTITLE_CAP: usize = 320;
-/// Most desktop entries the catalog holds; extras past this are dropped. Two
-/// catalogs (the live one and the pending rescan) sit on the stack, so this is
-/// kept modest while staying well above any real application count.
+/// Most desktop entries the catalog holds; extras past this are dropped. With no
+/// allocator the catalog is one fixed array of entries, and it lives on the
+/// stack, so this is kept modest while staying well above the number of
+/// applications any real system installs.
 pub const MAX_ENTRIES: usize = 1024;
 /// Most results search or recents resolution return. Only the first handful
 /// are ever displayed, so this is comfortably above what the UI shows.
 pub const RESULT_CAP: usize = 32;
 /// Byte capacity of a desktop file ID (the flattened relative path).
 const ID_CAP: usize = 256;
+
+/// Files read from the ring in one batch, and the bytes reserved for each.
+///
+/// A desktop file runs to a couple of kilobytes; the largest on a full desktop
+/// is a few tens, and one that fills its slot is re-read whole rather than
+/// parsed from a buffer that may have been cut short. The batch and the slot
+/// together set the scratch buffer, at half a megabyte.
+///
+/// Only the bench uses these: reading the files through the ring is measurably
+/// slower than reading them one at a time (see read_entries).
+#[cfg(test)]
+const BATCH: usize = 32;
+#[cfg(test)]
+const FILE_SLOT: usize = 16 * 1024;
+
+/// Submission queue depth for the scan's ring: a batch costs one open per file,
+/// then a read and a close per file that opened.
+#[cfg(test)]
+pub(crate) const RING_ENTRIES: u32 = (BATCH * 2) as u32;
 
 /// The discovered set of applications, held inline without a heap.
 pub type Catalog = ArrayVec<DesktopEntry, MAX_ENTRIES>;
@@ -82,12 +104,19 @@ impl EntryType {
 }
 
 /// A parsed desktop entry representing an application. Fixed-size fields keep
-/// the catalog heapless; the lowercased name used for matching is recomputed on
-/// the fly rather than stored alongside the name.
+/// the catalog heapless.
 #[derive(Clone, Copy, Debug)]
 pub struct DesktopEntry {
     /// Application name (from the Name field).
     pub name: ArrayString<NAME_CAP>,
+    /// The name lowercased, which is what search compares against.
+    ///
+    /// Derived, not stored on disk: the cache holds the name and this is rebuilt
+    /// when an entry is made. Keeping it costs a few hundred bytes per entry and
+    /// saves lowercasing every name in the catalog on every keystroke, which is
+    /// the difference between a search that scales with the alphabet and one
+    /// that scales with the catalog.
+    name_lower: ArrayString<NAME_CAP>,
     /// Raw Exec value, tokenized per the spec at launch time (see exec_argv).
     pub exec: ArrayString<EXEC_CAP>,
     /// Icon name, empty when the entry has none. Not rendered yet.
@@ -102,13 +131,21 @@ impl DesktopEntry {
     pub fn new(name: &str, exec: &str, icon: &str) -> Option<Self> {
         let mut e = DesktopEntry {
             name: ArrayString::new(),
+            name_lower: ArrayString::new(),
             exec: ArrayString::new(),
             icon: ArrayString::new(),
         };
         e.name.push_str(name).ok()?;
         e.exec.push_str(exec).ok()?;
         e.icon.push_str(icon).ok()?;
+        e.derive_match_key();
         Some(e)
+    }
+
+    /// Rebuild the lowercased name from the name.
+    fn derive_match_key(&mut self) {
+        self.name_lower.clear();
+        push_lower(&mut self.name_lower, &self.name);
     }
 
     /// Parse a desktop file from the given path.
@@ -121,7 +158,7 @@ impl DesktopEntry {
 
     /// Parse desktop entry content. None when the entry is not a launchable,
     /// visible Application or a required field is missing or oversized.
-    fn parse(content: &str) -> Option<Self> {
+    pub(crate) fn parse(content: &str) -> Option<Self> {
         let mut in_desktop_entry = false;
         // Track only the keys that matter, as slices into content. A repeated
         // key keeps the last value, matching a map insert.
@@ -186,51 +223,65 @@ impl DesktopEntry {
         // here, before anything reads the value.
         let mut e = DesktopEntry {
             name: ArrayString::new(),
+            name_lower: ArrayString::new(),
             exec: ArrayString::new(),
             icon: ArrayString::new(),
         };
         unescape_into(&mut e.name, name?).ok()?;
         unescape_into(&mut e.exec, exec?).ok()?;
         unescape_into(&mut e.icon, icon).ok()?;
+        e.derive_match_key();
         Some(e)
     }
 
-    /// Check if this entry matches a search query (case-insensitive substring
-    /// match on name).
-    pub fn matches(&self, query: &str) -> bool {
-        if query.is_empty() {
-            return true;
+    /// Score this entry against a query that is already lowercased. Zero means
+    /// it does not match at all.
+    ///
+    /// Matching and ranking are one pass over one lowercased name, which is what
+    /// keeps a keystroke cheap: the query is lowercased once for the whole
+    /// catalog, and no name is lowercased at all.
+    ///
+    /// Tiers: an exact match, then a prefix, then a substring anywhere. Within a
+    /// tier a shorter name ranks higher, on the reasoning that a query is a
+    /// larger fraction of it.
+    fn score(&self, query_lower: &str) -> i32 {
+        if query_lower.is_empty() {
+            return 1; // everything matches, and nothing outranks anything
         }
-        let mut q: ArrayString<NAME_CAP> = ArrayString::new();
-        push_lower(&mut q, query);
-        let mut n: ArrayString<NAME_CAP> = ArrayString::new();
-        push_lower(&mut n, &self.name);
-        n.as_str().contains(q.as_str())
+        let name = self.name_lower.as_str();
+        if name == query_lower {
+            return 300;
+        }
+        let len_penalty = (self.name.chars().count() as i32).min(50);
+        if name.starts_with(query_lower) {
+            return 200 - len_penalty;
+        }
+        if name.contains(query_lower) {
+            return 100 - len_penalty;
+        }
+        0
     }
 
-    /// Calculate a relevance score for sorting (higher = more relevant).
-    /// Tiers: exact match, then prefix match, then substring match; within a
-    /// tier shorter names rank higher.
+    /// Whether this entry matches a search query, case-insensitively. The
+    /// search itself goes through score, having lowercased the query once for
+    /// the whole catalog; this is the same question asked of one entry.
+    #[cfg(test)]
+    pub fn matches(&self, query: &str) -> bool {
+        let mut q: ArrayString<NAME_CAP> = ArrayString::new();
+        push_lower(&mut q, query);
+        self.score(q.as_str()) > 0
+    }
+
+    /// The relevance of this entry to a query: higher sorts first, zero does not
+    /// match.
+    #[cfg(test)]
     pub fn relevance(&self, query: &str) -> i32 {
         if query.is_empty() {
             return 0;
         }
-
         let mut q: ArrayString<NAME_CAP> = ArrayString::new();
         push_lower(&mut q, query);
-        let mut n: ArrayString<NAME_CAP> = ArrayString::new();
-        push_lower(&mut n, &self.name);
-        let len_penalty = (self.name.chars().count() as i32).min(50);
-
-        if n.as_str() == q.as_str() {
-            300
-        } else if n.as_str().starts_with(q.as_str()) {
-            200 - len_penalty
-        } else if n.as_str().contains(q.as_str()) {
-            100 - len_penalty
-        } else {
-            0
-        }
+        self.score(q.as_str())
     }
 }
 
@@ -270,6 +321,16 @@ fn unescape_into<const N: usize>(out: &mut ArrayString<N>, s: &str) -> Result<()
 /// affects matching for pathologically long names.
 fn push_lower<const N: usize>(out: &mut ArrayString<N>, s: &str) {
     for c in s.chars() {
+        // Almost every application name is ASCII, and an ASCII letter folds to
+        // exactly one ASCII letter. char::to_lowercase is a Unicode table lookup
+        // that hands back an iterator, because a general fold can yield several
+        // chars; sidestepping it for ASCII is most of the cost of a match key.
+        if c.is_ascii() {
+            if out.push(c.to_ascii_lowercase()).is_err() {
+                return;
+            }
+            continue;
+        }
         for lc in c.to_lowercase() {
             if out.push(lc).is_err() {
                 return;
@@ -377,6 +438,12 @@ pub fn exec_subtitle(exec: &str, out: &mut ArrayString<SUBTITLE_CAP>) {
 /// its previous contents.
 pub fn discover_entries(out: &mut ArrayVec<DesktopEntry, MAX_ENTRIES>) {
     out.clear();
+
+    // Walk the directories first and collect the paths. The walk is inherently
+    // serial (a directory has to be read before its files are known), but the
+    // reads that follow are not: a few hundred small files, none of which cares
+    // about the others.
+    let mut paths: ArrayVec<ScanPath, MAX_ENTRIES> = ArrayVec::new();
     let mut seen_ids: ArrayVec<ArrayString<ID_CAP>, MAX_ENTRIES> = ArrayVec::new();
 
     let mut dirs: ArrayVec<ScanPath, MAX_DATA_DIRS> = ArrayVec::new();
@@ -384,26 +451,147 @@ pub fn discover_entries(out: &mut ArrayVec<DesktopEntry, MAX_ENTRIES>) {
     for dir in dirs.iter() {
         if let Some(apps_dir) = join(dir, "applications") {
             if fs::is_dir(&apps_dir) {
-                collect_entries(&apps_dir, &apps_dir, &mut seen_ids, out);
+                collect_paths(&apps_dir, &apps_dir, &mut seen_ids, &mut paths);
             }
         }
     }
 
-    // Sort alphabetically by name.
+    read_entries(&paths, out);
+
+    // Sort alphabetically by name, on the lowercased key each entry carries.
     out.as_mut_slice()
-        .sort_unstable_by(|a, b| cmp_lower(&a.name, &b.name));
+        .sort_unstable_by(|a, b| a.name_lower.as_str().cmp(b.name_lower.as_str()));
 }
 
-/// Walk an applications directory tree, collecting visible entries. `root` is
-/// the applications dir each desktop file ID is computed against; `dir` is the
-/// directory currently being scanned. The first file seen for an ID wins, so
-/// listing data dirs in precedence order makes earlier dirs shadow later ones,
-/// and a higher-precedence Hidden entry hides the app per the spec.
-fn collect_entries(
+/// The path of every desktop file the data dirs offer, deduplicated by id in
+/// precedence order. The walk half of a scan, without the reading half, so the
+/// bench can time the reading on its own.
+#[cfg(test)]
+pub(crate) fn collect_all_paths(paths: &mut ArrayVec<ScanPath, MAX_ENTRIES>) {
+    let mut seen_ids: ArrayVec<ArrayString<ID_CAP>, MAX_ENTRIES> = ArrayVec::new();
+    let mut dirs: ArrayVec<ScanPath, MAX_DATA_DIRS> = ArrayVec::new();
+    get_data_dirs(&mut dirs);
+    for dir in dirs.iter() {
+        if let Some(apps_dir) = join(dir, "applications") {
+            if fs::is_dir(&apps_dir) {
+                collect_paths(&apps_dir, &apps_dir, &mut seen_ids, paths);
+            }
+        }
+    }
+}
+
+/// Read and parse every discovered file, one at a time.
+///
+/// This looks like the obvious candidate for io_uring: a few hundred small
+/// independent files, order irrelevant, three syscalls apiece. The ring can do
+/// exactly that, and uring::read_files does, in a couple of submissions instead
+/// of eight hundred syscalls. It was measured, and it is much slower.
+///
+/// The first file operation a ring performs costs 12 to 20 ms, once per process.
+/// io_uring hands an operation that would block to a kernel worker pool, and
+/// standing that pool up is not cheap. A long-lived program does not care: a
+/// database amortizes it over millions of operations. A launcher starts, scans
+/// once, shows a window, and exits, so it pays that cost in full, on the cold
+/// start it was meant to speed up, and it is ten times the entire scan.
+///
+/// Reading the same files one at a time takes 1.2 to 1.7 ms, first time or not.
+/// Once the pool is warm the ring roughly matches it (1.4 ms), which is the
+/// other half of the answer: even at its best it wins nothing here, because the
+/// syscalls were never what the scan was spending its time on. The kernel-side
+/// path walk in openat is, and io_uring does that walk too.
+///
+/// The capability stays in the platform layer, tested, because the finding is
+/// worth being able to re-check. `make scan-bench` times both against each
+/// other.
+fn read_entries(paths: &[ScanPath], out: &mut ArrayVec<DesktopEntry, MAX_ENTRIES>) {
+    read_entries_serial(paths, out);
+}
+
+/// One file at a time: open, read, close, parse, next.
+pub(crate) fn read_entries_serial(
+    paths: &[ScanPath],
+    out: &mut ArrayVec<DesktopEntry, MAX_ENTRIES>,
+) {
+    for path in paths {
+        if let Some(entry) = DesktopEntry::from_file(path) {
+            let _ = out.push(entry);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn read_entries_batched(
+    ring: &mut uring::Ring,
+    paths: &[ScanPath],
+    out: &mut ArrayVec<DesktopEntry, MAX_ENTRIES>,
+) {
+    // One slot per file in the batch. A slot holds any desktop file worth the
+    // name: they run to a couple of kilobytes, and the largest on a full desktop
+    // is a few tens. A file that fills its slot might have been cut short, so it
+    // is read again the plain way rather than parsed from a maybe-truncated
+    // buffer.
+    let mut bufs: ArrayVec<u8, { BATCH * FILE_SLOT }> = ArrayVec::new();
+    for _ in 0..BATCH * FILE_SLOT {
+        let _ = bufs.push(0);
+    }
+    let mut lens = [0usize; BATCH];
+
+    for chunk in paths.chunks(BATCH) {
+        let mut cpaths: ArrayVec<syscall::CPath, BATCH> = ArrayVec::new();
+        for path in chunk {
+            match syscall::CPath::new(path) {
+                Some(cp) => {
+                    let _ = cpaths.push(cp);
+                }
+                None => break, // a path with an interior NUL is not a path
+            }
+        }
+        if cpaths.len() != chunk.len() {
+            continue;
+        }
+
+        if uring::read_files(ring, &cpaths, &mut bufs, FILE_SLOT, &mut lens).is_err() {
+            // The batch did not go through; read it the plain way rather than
+            // drop the applications in it.
+            for path in chunk {
+                if let Some(entry) = DesktopEntry::from_file(path) {
+                    let _ = out.push(entry);
+                }
+            }
+            continue;
+        }
+
+        for (i, path) in chunk.iter().enumerate() {
+            let len = lens[i];
+            if len == 0 {
+                continue; // unopenable or empty
+            }
+            let entry = if len == FILE_SLOT {
+                // It filled the slot, so it may have more to give. Read it whole.
+                DesktopEntry::from_file(path)
+            } else {
+                core::str::from_utf8(&bufs[i * FILE_SLOT..i * FILE_SLOT + len])
+                    .ok()
+                    .and_then(DesktopEntry::parse)
+            };
+            if let Some(entry) = entry {
+                let _ = out.push(entry);
+            }
+        }
+    }
+}
+
+/// Walk an applications directory tree, collecting the path of every desktop
+/// file worth reading. `root` is the applications dir each desktop file ID is
+/// computed against; `dir` is the directory currently being walked. The first
+/// file seen for an ID wins, so listing the data dirs in precedence order makes
+/// an earlier one shadow a later one, and a higher-precedence Hidden entry hides
+/// the application per the spec.
+fn collect_paths(
     root: &str,
     dir: &str,
     seen_ids: &mut ArrayVec<ArrayString<ID_CAP>, MAX_ENTRIES>,
-    entries: &mut ArrayVec<DesktopEntry, MAX_ENTRIES>,
+    paths: &mut ArrayVec<ScanPath, MAX_ENTRIES>,
 ) {
     let Ok(mut read_dir) = fs::ReadDir::open(dir) else {
         return;
@@ -420,19 +608,18 @@ fn collect_entries(
             _ => fs::is_dir_nofollow(&path),
         };
         if is_directory {
-            collect_entries(root, &path, seen_ids, entries);
+            collect_paths(root, &path, seen_ids, paths);
         } else if name.ends_with(".desktop") {
             let Some(id) = desktop_id(root, &path) else {
                 return;
             };
-            // First id seen wins; a duplicate (a lower-precedence dir) is skipped.
+            // First id seen wins; a duplicate (from a lower-precedence dir) is
+            // skipped.
             if seen_ids.iter().any(|s| s.as_str() == id.as_str()) {
                 return;
             }
             let _ = seen_ids.push(id);
-            if let Some(desktop_entry) = DesktopEntry::from_file(&path) {
-                let _ = entries.push(desktop_entry);
-            }
+            let _ = paths.push(path);
         }
     });
 }
@@ -508,23 +695,6 @@ pub fn dirs_fingerprint() -> u64 {
     newest
 }
 
-/// Compare two strings by their lowercase, without allocating a lowercased
-/// copy of either.
-fn cmp_lower(a: &str, b: &str) -> core::cmp::Ordering {
-    use core::cmp::Ordering;
-    let mut ai = a.chars().flat_map(char::to_lowercase);
-    let mut bi = b.chars().flat_map(char::to_lowercase);
-    loop {
-        match (ai.next(), bi.next()) {
-            (Some(x), Some(y)) if x == y => continue,
-            (Some(x), Some(y)) => return x.cmp(&y),
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-        }
-    }
-}
-
 /// Search entries and return the top matches ranked by relevance, then name.
 /// Relevance is computed once per match into a scratch buffer, which is sorted
 /// in place; the caller only ever shows the first few.
@@ -532,17 +702,26 @@ pub fn search<'a>(
     entries: &'a [DesktopEntry],
     query: &str,
 ) -> ArrayVec<&'a DesktopEntry, RESULT_CAP> {
+    // The query is lowercased once, for the whole catalog. Every name it is
+    // compared against is lowercase already.
+    let mut q: ArrayString<NAME_CAP> = ArrayString::new();
+    push_lower(&mut q, query);
+
     let mut scored: ArrayVec<(i32, &DesktopEntry), MAX_ENTRIES> = ArrayVec::new();
     for e in entries {
-        if e.matches(query) && scored.push((e.relevance(query), e)).is_err() {
+        let score = e.score(q.as_str());
+        if score > 0 && scored.push((score, e)).is_err() {
             break;
         }
     }
 
-    // Relevance descending, then name ascending.
-    scored
-        .as_mut_slice()
-        .sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| cmp_lower(&a.1.name, &b.1.name)));
+    // Relevance descending, then name ascending. The tiebreak compares the
+    // lowercased names the entries already carry, so a sort does no case folding
+    // of its own.
+    scored.as_mut_slice().sort_unstable_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.name_lower.as_str().cmp(b.1.name_lower.as_str()))
+    });
 
     let mut out: ArrayVec<&DesktopEntry, RESULT_CAP> = ArrayVec::new();
     for &(_, e) in scored.iter().take(RESULT_CAP) {
@@ -882,7 +1061,7 @@ Exec=myapp --new
     }
 
     #[test]
-    fn collect_entries_recurses_into_subdirs() {
+    fn discovery_recurses_into_subdirs() {
         let base = format!(
             "{}/bnklaunch_recurse_{}",
             std::env::temp_dir().display(),
@@ -900,8 +1079,10 @@ Exec=myapp --new
         );
 
         let mut seen: ArrayVec<ArrayString<ID_CAP>, MAX_ENTRIES> = ArrayVec::new();
+        let mut paths: ArrayVec<ScanPath, MAX_ENTRIES> = ArrayVec::new();
         let mut entries: ArrayVec<DesktopEntry, MAX_ENTRIES> = ArrayVec::new();
-        collect_entries(&apps, &apps, &mut seen, &mut entries);
+        collect_paths(&apps, &apps, &mut seen, &mut paths);
+        read_entries(&paths, &mut entries);
 
         let names: HashSet<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains("Aaa"));
@@ -915,7 +1096,7 @@ Exec=myapp --new
     }
 
     #[test]
-    fn collect_entries_higher_precedence_id_shadows_lower() {
+    fn discovery_higher_precedence_id_shadows_lower() {
         let base = format!(
             "{}/bnklaunch_shadow_{}",
             std::env::temp_dir().display(),
@@ -935,10 +1116,12 @@ Exec=myapp --new
         );
 
         let mut seen: ArrayVec<ArrayString<ID_CAP>, MAX_ENTRIES> = ArrayVec::new();
+        let mut paths: ArrayVec<ScanPath, MAX_ENTRIES> = ArrayVec::new();
         let mut entries: ArrayVec<DesktopEntry, MAX_ENTRIES> = ArrayVec::new();
         // high precedence scanned first.
-        collect_entries(&high, &high, &mut seen, &mut entries);
-        collect_entries(&low, &low, &mut seen, &mut entries);
+        collect_paths(&high, &high, &mut seen, &mut paths);
+        collect_paths(&low, &low, &mut seen, &mut paths);
+        read_entries(&paths, &mut entries);
 
         assert!(seen.iter().any(|s| s.as_str() == "foo"));
         assert!(
