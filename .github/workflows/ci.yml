@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The toolchain is nightly and floats, so a lint that did not exist yesterday
+  # can fail a build nobody touched. Monday morning is a better time to find
+  # that than the moment a tag goes out.
+  schedule:
+    - cron: "0 6 * * 1"
 
 env:
   CARGO_TERM_COLOR: always

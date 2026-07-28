@@ -22,8 +22,8 @@
 use core::ffi::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_ushort, c_void};
 use core::ptr::{self, NonNull};
 
-use crate::arena::ArrayVec;
-use crate::error::{Error, Result};
+use crate::platform::arena::ArrayVec;
+use crate::platform::error::{Error, Result};
 
 /// Largest glyph coverage bitmap (width * rows). The UI font sizes are small,
 /// so a glyph never approaches this; an oversized one renders blank.
@@ -39,8 +39,6 @@ type FtLibrary = *mut c_void;
 /// FT_Face: a pointer to a struct whose fields this module reads.
 type FtFace = *mut FtFaceRec;
 
-/// Load the glyph and its metrics, no bitmap (FT_LOAD_DEFAULT).
-const FT_LOAD_DEFAULT: i32 = 0x0;
 /// Also rasterize to an 8-bit coverage bitmap, default gray render mode
 /// (FT_LOAD_RENDER). FT_RENDER_MODE_NORMAL needs no extra argument.
 const FT_LOAD_RENDER: i32 = 1 << 2;
@@ -248,14 +246,14 @@ impl Face {
         let err = unsafe { FT_Init_FreeType(&mut library) };
         if err != 0 {
             // SAFETY: we own the mapping and free it on this error path.
-            unsafe { crate::syscall::munmap(map_ptr, map_len) };
+            unsafe { crate::platform::syscall::munmap(map_ptr, map_len) };
             return Err(Error::msg("FT_Init_FreeType failed"));
         }
         let library = match NonNull::new(library) {
             Some(l) => l,
             None => {
                 // SAFETY: we own the mapping.
-                unsafe { crate::syscall::munmap(map_ptr, map_len) };
+                unsafe { crate::platform::syscall::munmap(map_ptr, map_len) };
                 return Err(Error::msg("FT_Init_FreeType returned null"));
             }
         };
@@ -277,7 +275,7 @@ impl Face {
             // SAFETY: library came from FT_Init_FreeType; the mapping is ours.
             unsafe {
                 FT_Done_FreeType(library.as_ptr());
-                crate::syscall::munmap(map_ptr, map_len);
+                crate::platform::syscall::munmap(map_ptr, map_len);
             }
             return Err(Error::msg("FT_New_Memory_Face failed"));
         }
@@ -287,7 +285,7 @@ impl Face {
                 // SAFETY: library is valid and not yet freed; mapping is ours.
                 unsafe {
                     FT_Done_FreeType(library.as_ptr());
-                    crate::syscall::munmap(map_ptr, map_len);
+                    crate::platform::syscall::munmap(map_ptr, map_len);
                 }
                 return Err(Error::msg("FT_New_Memory_Face returned null"));
             }
@@ -357,24 +355,6 @@ impl Face {
         }
     }
 
-    /// Pen advance of a character at the current pixel size, in pixels. Loads
-    /// metrics only (no rasterization). Zero on a load failure.
-    pub fn advance(&self, ch: char) -> f32 {
-        // SAFETY: face is valid; FT_LOAD_DEFAULT loads metrics into the glyph
-        // slot without rendering. The advance is read out immediately.
-        let err =
-            unsafe { FT_Load_Char(self.face.as_ptr(), ch as u32 as c_ulong, FT_LOAD_DEFAULT) };
-        if err != 0 {
-            return 0.0;
-        }
-        let slot = unsafe { (*self.face.as_ptr()).glyph };
-        let Some(slot) = NonNull::new(slot) else {
-            return 0.0;
-        };
-        // SAFETY: slot is non-null and valid after a successful load.
-        unsafe { slot.as_ref().advance.x as f32 / 64.0 }
-    }
-
     /// Ascent and descent at the current pixel size, in pixels. Descent is
     /// negative, matching the FreeType convention.
     pub fn line_metrics(&self) -> (f32, f32) {
@@ -401,7 +381,7 @@ impl Drop for Face {
         unsafe {
             FT_Done_Face(self.face.as_ptr());
             FT_Done_FreeType(self.library.as_ptr());
-            crate::syscall::munmap(self.map_ptr, self.map_len);
+            crate::platform::syscall::munmap(self.map_ptr, self.map_len);
         }
     }
 }
@@ -446,24 +426,29 @@ mod tests {
     fn load_face() -> Face {
         // mmap the fixture the same way the real loader does, then hand the
         // mapping to the Face (which owns and unmaps it).
-        let cp = crate::fs::cpath(FIXTURE).expect("cpath");
-        let st =
-            crate::syscall::newfstatat(crate::syscall::AT_FDCWD, &cp, 0).expect("stat fixture");
+        let cp = crate::platform::fs::cpath(FIXTURE).expect("cpath");
+        let st = crate::platform::syscall::newfstatat(crate::platform::syscall::AT_FDCWD, &cp, 0)
+            .expect("stat fixture");
         let len = st.st_size as usize;
-        let fd = crate::syscall::openat(crate::syscall::AT_FDCWD, &cp, crate::syscall::O_RDONLY, 0);
+        let fd = crate::platform::syscall::openat(
+            crate::platform::syscall::AT_FDCWD,
+            &cp,
+            crate::platform::syscall::O_RDONLY,
+            0,
+        );
         assert!(fd >= 0, "open fixture");
         let ptr = unsafe {
-            crate::syscall::mmap(
+            crate::platform::syscall::mmap(
                 core::ptr::null_mut(),
                 len,
-                crate::syscall::PROT_READ,
-                crate::syscall::MAP_PRIVATE,
+                crate::platform::syscall::PROT_READ,
+                crate::platform::syscall::MAP_PRIVATE,
                 fd,
                 0,
             )
         };
-        assert!(!crate::syscall::mmap_failed(ptr), "mmap fixture");
-        unsafe { crate::syscall::close(fd) };
+        assert!(!crate::platform::syscall::mmap_failed(ptr), "mmap fixture");
+        unsafe { crate::platform::syscall::close(fd) };
         Face::from_mmap(ptr, len).expect("build face from fixture")
     }
 
@@ -546,9 +531,11 @@ mod tests {
 
     #[test]
     fn advance_is_positive_for_letters() {
+        // The pen advance comes back with the rasterized glyph, which is what
+        // both the blit and the caret read it from.
         let face = load_face();
         face.set_pixel_size(16).expect("set size");
-        assert!(face.advance('A') > 0.0);
-        assert!(face.advance('m') > 0.0);
+        assert!(face.rasterize('A').advance > 0.0);
+        assert!(face.rasterize('m').advance > 0.0);
     }
 }

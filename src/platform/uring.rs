@@ -1,11 +1,9 @@
 //! A minimal io_uring submission and completion ring.
 //!
-//! io_uring is two ring buffers shared with the kernel. We push submission
-//! queue entries (SQEs) describing operations and read completion queue entries
-//! (CQEs) carrying their results. Unlike the readiness model, file reads run to
-//! completion in the kernel while this thread does other work, so one thread
-//! drives the Wayland socket, the timers, and the desktop rescan from a single
-//! wait point in io_uring_enter.
+//! io_uring is two ring buffers shared with the kernel. Submission queue entries
+//! (SQEs) describe operations; completion queue entries (CQEs) carry their
+//! results. One io_uring_enter submits a batch and waits for its completions, so
+//! a single thread can have many operations outstanding at once.
 //!
 //! ```text
 //!   prep_*()  ->  [ SQ ring ]  --io_uring_enter-->  kernel runs the op
@@ -13,23 +11,56 @@
 //!   next_cqe() <-  [ CQ ring ]  <----completion-----------+
 //! ```
 //!
-//! Buffers handed to prep_read, prep_openat, and prep_timeout must stay
-//! put and alive until the matching completion arrives: the kernel reads and
-//! writes them asynchronously. In this program they live in the long-lived app
-//! state, which satisfies that.
-
-#![allow(dead_code)]
+//! Buffers handed to prep_read, prep_openat, and prep_timeout must stay put and
+//! alive until the matching completion arrives: the kernel reads and writes them
+//! asynchronously, after the call that submitted them has returned.
+//!
+//! # What this is for, and what it is not for
+//!
+//! The reason to have it at all is that readiness polling cannot help with
+//! files. A regular file is always "ready", so poll and epoll have nothing to
+//! say about one, and a read that misses the page cache simply blocks the thread
+//! that made it. The only ways to overlap many such reads are a thread pool,
+//! which is what async runtimes quietly use for file I/O, or io_uring. In a
+//! program with no allocator, no executor, and no threads, io_uring is the only
+//! door. That is a real capability, and read_files is it.
+//!
+//! It does not follow that using it here is faster, and for the desktop scan it
+//! measurably is not. Reading the couple of hundred desktop files through the
+//! ring collapses about eight hundred syscalls into a dozen submissions, and is
+//! six to fifteen times *slower* than reading them one at a time. Two reasons,
+//! and the second is the one worth remembering:
+//!
+//! - The syscalls were never the cost. An open and a read on a warm page cache
+//!   are a few hundred nanoseconds of transition around a kernel-side path walk
+//!   that io_uring has to do as well. Removing the transition removes the
+//!   smaller half.
+//! - The first file operation a ring performs costs 12 to 20 milliseconds. An
+//!   operation that would block is handed to a kernel worker pool, and standing
+//!   that pool up is expensive. A database amortizes it over millions of
+//!   operations and never thinks about it again. A launcher starts, scans once,
+//!   shows a window, and exits: it pays that in full, on the cold start, and it
+//!   is ten times the scan it was meant to accelerate.
+//!
+//! So the scan reads its files one at a time (see desktop::read_entries), and
+//! `make scan-bench` times both against each other so the claim stays checkable.
+//!
+//! The event loop still waits here, and that costs nothing: a poll and a timeout
+//! never block, so neither is ever handed to a worker, and no pool is ever stood
+//! up. Ring::new itself is 5 us. One wait point serves the socket and the clock
+//! together, and it does it with no thread and no executor behind it, which is
+//! the whole point of the thing.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::syscall::{
-    self, io_uring_cqe, io_uring_params, io_uring_sqe, kernel_timespec, IORING_ENTER_GETEVENTS,
-    IORING_FEAT_SINGLE_MMAP, IORING_OFF_CQ_RING, IORING_OFF_SQES, IORING_OFF_SQ_RING,
-    IORING_OP_CLOSE, IORING_OP_NOP, IORING_OP_OPENAT, IORING_OP_POLL_ADD, IORING_OP_READ,
-    IORING_OP_TIMEOUT, IOSQE_IO_LINK, MAP_POPULATE, MAP_SHARED, PROT_READ, PROT_WRITE,
+use crate::platform::arena::ArrayVec;
+use crate::platform::syscall::{
+    self, io_uring_cqe, io_uring_params, io_uring_sqe, kernel_timespec, CPath, RawFd, AT_FDCWD,
+    IORING_ENTER_GETEVENTS, IORING_FEAT_SINGLE_MMAP, IORING_OFF_CQ_RING, IORING_OFF_SQES,
+    IORING_OFF_SQ_RING, IORING_OP_CLOSE, IORING_OP_NOP, IORING_OP_OPENAT, IORING_OP_POLL_ADD,
+    IORING_OP_READ, IORING_OP_TIMEOUT, IOSQE_IO_LINK, MAP_POPULATE, MAP_SHARED, O_RDONLY,
+    PROT_READ, PROT_WRITE,
 };
-
-type RawFd = i32;
 
 /// An io_uring instance with its mapped rings.
 pub struct Ring {
@@ -69,6 +100,18 @@ impl Ring {
         let fd = syscall::io_uring_setup(entries, &mut params);
         if fd < 0 {
             return Err(-fd);
+        }
+
+        // io_uring_setup takes no open flags, so close-on-exec is set here.
+        // Without it the ring fd rides through fork/exec into every launched
+        // application, which keeps the ring's mappings pinned for as long as
+        // that application runs.
+        let r = syscall::fcntl(fd, syscall::F_SETFD, syscall::FD_CLOEXEC);
+        if r < 0 {
+            // SAFETY: fd is the ring just created, closed once on this error
+            // path before any mapping exists or the Ring is built.
+            unsafe { syscall::close(fd) };
+            return Err(-r);
         }
 
         let sq_ring_bytes =
@@ -261,6 +304,9 @@ impl Ring {
     }
 
     /// Queue a no-op completion. Used as a setup smoke test.
+    // Reached only by the tests and the scan bench. Kept so the measurement in
+    // the module docs stays checkable.
+    #[allow(dead_code)]
     pub fn prep_nop(&mut self, user_data: u64) -> Result<(), ()> {
         let sqe = self.get_sqe().ok_or(())?;
         sqe.opcode = IORING_OP_NOP;
@@ -280,11 +326,20 @@ impl Ring {
         Ok(())
     }
 
-    /// Arm a single relative timer that fires once after ts. ts must outlive the
-    /// op (the kernel reads it asynchronously); keep it in long-lived state. The
-    /// caller re-arms after each fire. A one-shot timeout works on every
-    /// io_uring kernel, unlike multishot timeout (which needs 6.4+).
-    pub fn prep_timeout(&mut self, ts: *const kernel_timespec, user_data: u64) -> Result<(), ()> {
+    /// Arm a single relative timer that fires once after ts. The caller re-arms
+    /// after each fire. A one-shot timeout works on every io_uring kernel,
+    /// unlike multishot timeout (which needs 6.4+).
+    ///
+    /// # Safety
+    ///
+    /// ts is handed to the kernel, which reads it after submit and outside this
+    /// call. It must stay valid and unmoved until the op completes, so it has to
+    /// live somewhere longer-lived than the frame that submits it.
+    pub unsafe fn prep_timeout(
+        &mut self,
+        ts: *const kernel_timespec,
+        user_data: u64,
+    ) -> Result<(), ()> {
         let sqe = self.get_sqe().ok_or(())?;
         sqe.opcode = IORING_OP_TIMEOUT;
         sqe.addr = ts as u64;
@@ -293,10 +348,18 @@ impl Ring {
         Ok(())
     }
 
-    /// Open a path relative to dirfd. The path bytes must outlive the op. When
-    /// link is set, the next prepared entry only runs if this open succeeds,
-    /// which is how an open/read/close chain is built.
-    pub fn prep_openat(
+    /// Open a path relative to dirfd. When link is set, the next prepared entry
+    /// only runs if this open succeeds, which is how an open/read/close chain is
+    /// built.
+    ///
+    /// # Safety
+    ///
+    /// The kernel reads the NUL-terminated path after submit and outside this
+    /// call, so the bytes must stay valid and unmoved until the op completes.
+    // Reached only by the tests and the scan bench. Kept so the measurement in
+    // the module docs stays checkable.
+    #[allow(dead_code)]
+    pub unsafe fn prep_openat(
         &mut self,
         dirfd: RawFd,
         path: *const u8,
@@ -318,15 +381,26 @@ impl Ring {
         Ok(())
     }
 
-    /// Read up to len bytes from fd at the given offset into buf. buf must
-    /// outlive the op. Pass offset 0 (or the actual offset) for regular files.
-    pub fn prep_read(
+    /// Read up to len bytes from fd at the given offset into buf. Pass offset 0
+    /// (or the actual offset) for regular files.
+    ///
+    /// # Safety
+    ///
+    /// The kernel writes through buf after submit and outside this call. It must
+    /// point at len writable bytes that stay valid and unmoved until the op
+    /// completes: a stack buffer that goes out of scope first is memory
+    /// corruption the caller cannot see.
+    // Reached only by the tests and the scan bench. Kept so the measurement in
+    // the module docs stays checkable.
+    #[allow(dead_code)]
+    pub unsafe fn prep_read(
         &mut self,
         fd: RawFd,
         buf: *mut u8,
         len: u32,
         offset: u64,
         user_data: u64,
+        link: bool,
     ) -> Result<(), ()> {
         let sqe = self.get_sqe().ok_or(())?;
         sqe.opcode = IORING_OP_READ;
@@ -335,10 +409,16 @@ impl Ring {
         sqe.len = len;
         sqe.off = offset;
         sqe.user_data = user_data;
+        if link {
+            sqe.flags |= IOSQE_IO_LINK;
+        }
         Ok(())
     }
 
     /// Close a file descriptor through the ring.
+    // Reached only by the tests and the scan bench. Kept so the measurement in
+    // the module docs stays checkable.
+    #[allow(dead_code)]
     pub fn prep_close(&mut self, fd: RawFd, user_data: u64) -> Result<(), ()> {
         let sqe = self.get_sqe().ok_or(())?;
         sqe.opcode = IORING_OP_CLOSE;
@@ -347,6 +427,114 @@ impl Ring {
         Ok(())
     }
 }
+
+/// Read the first `stride` bytes of many files, all at once.
+///
+/// Slot i of `bufs` is `bufs[i * stride..][..stride]`, and `lens[i]` says how
+/// many bytes landed in it. A file that could not be opened or read gets zero,
+/// which the caller reads as "skip this one".
+///
+/// This is what the ring is here for, and the one thing nothing else on Linux
+/// does. A regular file is always "ready", so poll and epoll have nothing to
+/// tell you about one: a read that misses the page cache simply blocks the
+/// thread that made it. The only ways to overlap many such reads are a thread
+/// pool, which is what async runtimes quietly use for file I/O, or this. Here
+/// the whole batch goes to the kernel in one call and comes back in one call,
+/// with no threads and no executor.
+///
+/// The batch must fit the ring: it takes one submission per file to open, then
+/// two per opened file to read and close, so a ring of N entries handles N/2
+/// files at a time. The caller chunks.
+///
+/// # Safety
+///
+/// The paths and the buffers are borrowed for the whole call, and both waits
+/// below block until every operation the kernel was given has reported back. So
+/// nothing the kernel holds a pointer to can go away underneath it, which is the
+/// obligation the prep functions carry.
+#[allow(dead_code)]
+pub fn read_files(
+    ring: &mut Ring,
+    paths: &[CPath],
+    bufs: &mut [u8],
+    stride: usize,
+    lens: &mut [usize],
+) -> Result<(), ()> {
+    // The fd table below is one slot per path, so a batch past its capacity
+    // would open descriptors it then has no slot to close. The caller chunks.
+    if paths.len() > MAX_BATCH || paths.len() > lens.len() || paths.len() * stride > bufs.len() {
+        return Err(());
+    }
+    for len in lens.iter_mut() {
+        *len = 0;
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    // Open everything. The kernel does the path walks; we make one call.
+    for (i, path) in paths.iter().enumerate() {
+        // SAFETY: paths outlives the wait below, so the kernel reads a live
+        // NUL-terminated path.
+        unsafe { ring.prep_openat(AT_FDCWD, path.as_ptr(), O_RDONLY, 0, i as u64, false)? };
+    }
+    ring.submit_and_wait(paths.len() as u32).map_err(|_| ())?;
+
+    let mut fds: ArrayVec<RawFd, MAX_BATCH> = ArrayVec::new();
+    for _ in 0..paths.len() {
+        let _ = fds.push(-1);
+    }
+    while let Some(cqe) = ring.next_cqe() {
+        let i = cqe.user_data as usize;
+        if let Some(slot) = fds.get_mut(i) {
+            *slot = cqe.res; // negative is a negated errno: the open failed
+        }
+    }
+
+    // Read each open file and close it. The two are linked, because io_uring
+    // orders nothing between unlinked operations: an independent close could run
+    // before its own read and pull the descriptor out from under it.
+    let mut queued = 0u32;
+    for (i, &fd) in fds.iter().enumerate() {
+        if fd < 0 {
+            continue;
+        }
+        let slot = &mut bufs[i * stride..(i + 1) * stride];
+        // SAFETY: bufs outlives the wait below, and each slot is a distinct,
+        // non-overlapping run of `stride` writable bytes, which is exactly the
+        // length handed to the kernel.
+        unsafe { ring.prep_read(fd, slot.as_mut_ptr(), stride as u32, 0, i as u64, true)? };
+        ring.prep_close(fd, CLOSE_TAG)?;
+        queued += 2;
+    }
+    if queued == 0 {
+        return Ok(());
+    }
+    ring.submit_and_wait(queued).map_err(|_| ())?;
+
+    while let Some(cqe) = ring.next_cqe() {
+        if cqe.user_data == CLOSE_TAG {
+            continue;
+        }
+        let i = cqe.user_data as usize;
+        if cqe.res > 0 {
+            if let Some(len) = lens.get_mut(i) {
+                *len = cqe.res as usize;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// user_data for the closes, which have no result worth reading. Real slots are
+/// indices, so no index can collide with it.
+#[allow(dead_code)]
+const CLOSE_TAG: u64 = u64::MAX;
+
+/// Most files one read_files call handles. The ring is sized for twice this,
+/// since an opened file costs a read and a close.
+#[allow(dead_code)]
+pub const MAX_BATCH: usize = 64;
 
 impl Drop for Ring {
     fn drop(&mut self) {
@@ -395,36 +583,36 @@ mod tests {
             Err(_) => return,
         };
         let mut fds = [0i32; 2];
-        if crate::syscall::pipe2(&mut fds, 0) != 0 {
+        if crate::platform::syscall::pipe2(&mut fds, 0) != 0 {
             return;
         }
         let (rd, wr) = (fds[0], fds[1]);
         let byte = [7u8];
-        let _ = crate::syscall::write_fd(wr, &byte);
+        let _ = crate::platform::syscall::write_fd(wr, &byte);
 
         assert_eq!(
-            ring.prep_poll_add(rd, crate::syscall::POLLIN as u32, 42),
+            ring.prep_poll_add(rd, crate::platform::syscall::POLLIN as u32, 42),
             Ok(())
         );
         ring.submit_and_wait(1).expect("enter");
         let cqe = ring.next_cqe().expect("poll completion");
         assert_eq!(cqe.user_data, 42);
         assert!(
-            cqe.res > 0 && cqe.res as u32 & crate::syscall::POLLIN as u32 != 0,
+            cqe.res > 0 && cqe.res as u32 & crate::platform::syscall::POLLIN as u32 != 0,
             "POLLIN should be set, got {}",
             cqe.res
         );
 
         // SAFETY: both fds are live and closed once here.
         unsafe {
-            crate::syscall::close(rd);
-            crate::syscall::close(wr);
+            crate::platform::syscall::close(rd);
+            crate::platform::syscall::close(wr);
         }
     }
 
-    // Reading a real file through the ring (openat, then read, then close) is
-    // exactly the rescan pipeline's inner loop. This proves those three ops
-    // round-trip against the kernel with the right fields.
+    // openat, then read, then close, against a real file: the three operations
+    // read_files is built out of. This proves each round-trips through the ring
+    // with the right fields, one at a time, before read_files batches them.
     #[test]
     fn openat_read_close_roundtrips_a_file() {
         let mut ring = match Ring::new(8) {
@@ -442,14 +630,18 @@ mod tests {
             .expect("utf8 path");
         cpath.push('\0');
 
-        ring.prep_openat(
-            crate::syscall::AT_FDCWD,
-            cpath.as_ptr(),
-            crate::syscall::O_RDONLY,
-            0,
-            1,
-            false,
-        )
+        // SAFETY: cpath lives until the end of this test, past the completion
+        // of the open op below.
+        unsafe {
+            ring.prep_openat(
+                crate::platform::syscall::AT_FDCWD,
+                cpath.as_ptr(),
+                crate::platform::syscall::O_RDONLY,
+                0,
+                1,
+                false,
+            )
+        }
         .expect("queue openat");
         ring.submit_and_wait(1).expect("enter");
         let open = ring.next_cqe().expect("openat completion");
@@ -458,7 +650,9 @@ mod tests {
         let fd = open.res;
 
         let mut buf = [0u8; 64];
-        ring.prep_read(fd, buf.as_mut_ptr(), buf.len() as u32, 0, 2)
+        // SAFETY: buf outlives the read op, which is waited on below before the
+        // buffer is read or dropped.
+        unsafe { ring.prep_read(fd, buf.as_mut_ptr(), buf.len() as u32, 0, 2, false) }
             .expect("queue read");
         ring.submit_and_wait(1).expect("enter");
         let read = ring.next_cqe().expect("read completion");
@@ -471,6 +665,75 @@ mod tests {
         assert_eq!(ring.next_cqe().expect("close completion").user_data, 3);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// read_files against real files: every one comes back with its own bytes in
+    /// its own slot, and a path that does not exist reports zero rather than
+    /// taking the batch down with it.
+    #[test]
+    fn read_files_fills_a_slot_per_file() {
+        let mut ring = match Ring::new(16) {
+            Ok(r) => r,
+            // A sandbox or a seccomp policy can refuse io_uring outright, which
+            // is why every caller keeps a path that does not need it.
+            Err(_) => return,
+        };
+
+        let dir = std::env::temp_dir().join(format!("bnk_readfiles_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let bodies = ["first file", "second file, a bit longer", ""];
+        let mut cpaths: ArrayVec<CPath, 4> = ArrayVec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            let path = dir.join(format!("f{i}"));
+            std::fs::write(&path, body).expect("write");
+            let cp = CPath::new(path.to_str().expect("utf8")).expect("cpath");
+            let _ = cpaths.push(cp);
+        }
+        // A path that is not there: it must report zero, not derail the rest.
+        let missing = dir.join("nope");
+        let _ = cpaths.push(CPath::new(missing.to_str().expect("utf8")).expect("cpath"));
+
+        const SLOT: usize = 64;
+        let mut bufs = [0u8; SLOT * 4];
+        let mut lens = [0usize; 4];
+        read_files(&mut ring, &cpaths, &mut bufs, SLOT, &mut lens).expect("read_files");
+
+        for (i, body) in bodies.iter().enumerate() {
+            assert_eq!(lens[i], body.len(), "length of file {i}");
+            assert_eq!(
+                &bufs[i * SLOT..i * SLOT + body.len()],
+                body.as_bytes(),
+                "contents of file {i}"
+            );
+        }
+        assert_eq!(lens[3], 0, "a missing file reads as nothing");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A batch bigger than the fd table is refused. Without the check the
+    /// surplus files would open with no slot to record them in, so nothing
+    /// would ever close those descriptors.
+    #[test]
+    fn read_files_refuses_a_batch_past_what_it_can_track() {
+        let mut ring = match Ring::new(MAX_BATCH as u32 * 2) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        // Paths that do not exist: every open fails, so this exercises the
+        // bounds and nothing else. The other two bounds are satisfied, which
+        // leaves the batch size as the only thing that can refuse it.
+        let mut paths: ArrayVec<CPath, { MAX_BATCH + 1 }> = ArrayVec::new();
+        for _ in 0..MAX_BATCH + 1 {
+            let _ = paths.push(CPath::new("/nonexistent/bnklaunch").expect("cpath"));
+        }
+        let mut bufs = [0u8; MAX_BATCH + 1];
+        let mut lens = [0usize; MAX_BATCH + 1];
+        assert!(read_files(&mut ring, &paths, &mut bufs, 1, &mut lens).is_err());
+
+        // A full batch is still accepted, so the bound is MAX_BATCH and not
+        // something quietly smaller.
+        assert!(read_files(&mut ring, &paths[..MAX_BATCH], &mut bufs, 1, &mut lens).is_ok());
     }
 
     // A short one-shot timeout posts a completion tagged with its user_data,
@@ -486,7 +749,8 @@ mod tests {
             tv_sec: 0,
             tv_nsec: 2_000_000,
         };
-        if ring.prep_timeout(&ts, 7).is_err() || ring.submit_and_wait(1).is_err() {
+        // SAFETY: ts outlives the timeout op, which is waited on below.
+        if unsafe { ring.prep_timeout(&ts, 7) }.is_err() || ring.submit_and_wait(1).is_err() {
             return;
         }
         if let Some(cqe) = ring.next_cqe() {

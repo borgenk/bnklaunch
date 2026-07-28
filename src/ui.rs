@@ -1,27 +1,33 @@
 //! Software rendering of the launcher: theme, layout, and the draw routines
 //! that composite the input field and result rows into the pixel buffer.
 
-use crate::app::{normalize_url, parse_action, AppState, InputAction, URL_CAP};
-use crate::client::Client;
+use crate::app::{normalize_url, parse_action, AppState, InputAction};
 use crate::desktop::{self, DesktopEntry};
-use crate::{arena, font, shm};
-use crate::{MAX_RESULTS, WINDOW_WIDTH};
+use crate::launch::URL_CAP;
+use crate::platform::arena;
+use crate::{font, shm};
 
 const fn argb(a: u8, r: u8, g: u8, b: u8) -> u32 {
     ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-// UI colours, mirroring bnksound's dark palette. Everything sits on the
-// titlebar shade; the selected row picks up the same wash bnksound paints on
-// the titlebar profile button.
+// A dark palette. Everything sits on one flat background shade; the selected row
+// is the only part that lifts off it, by a few percent of white.
 const BODY_BG: u32 = argb(255, 0x29, 0x2b, 0x30);
 const TEXT_COLOR: u32 = argb(255, 0xec, 0xec, 0xec);
 const SUBTITLE_COLOR: u32 = argb(255, 0x88, 0x88, 0x88);
 const CURSOR_COLOR: u32 = argb(255, 0xff, 0x00, 0xaa);
-// White at 4% composited over the titlebar shade (the profile button's fill).
+// White at 4%, composited over the background.
 const SELECTED_BG: u32 = argb(255, 50, 51, 56);
-// Muted brand accent behind selected input text.
+// A muted accent behind selected input text.
 const SELECTION_COLOR: u32 = argb(255, 96, 40, 82);
+
+/// Width of the launcher window in pixels.
+pub(crate) const WINDOW_WIDTH: u32 = 800;
+
+/// Result rows drawn under the input. The window grows and shrinks with the
+/// number of rows, up to this many.
+pub(crate) const MAX_RESULTS: usize = 5;
 
 /// Y position where the input field starts
 pub(crate) const INPUT_START_Y: u32 = 0;
@@ -37,6 +43,11 @@ const FIELD_W: u32 = WINDOW_WIDTH - MARGIN_X * 2;
 
 /// X position where text starts (gutter plus inner padding)
 pub(crate) const TEXT_X: u32 = MARGIN_X + 15;
+
+/// Right edge of every text run, as a width from TEXT_X. The trailing gutter is
+/// the wider of the two, so a name that fills the row stops well short of the
+/// window edge.
+const TEXT_W: u32 = WINDOW_WIDTH - TEXT_X - 115;
 
 /// Y position where results start, flush under the input field
 const RESULTS_START_Y: u32 = INPUT_START_Y + INPUT_BOX_H;
@@ -57,24 +68,50 @@ pub(crate) fn calculate_height(num_results: usize) -> u32 {
     }
 }
 
-/// Draw the full UI
+/// The result row a pointer position falls in, given how many rows are drawn.
+/// None for a position above the list, past the last row, or outside the field
+/// horizontally. The same arithmetic draw_ui lays the rows out with, read
+/// backwards, so the two cannot disagree about where a row is.
+pub(crate) fn row_at(x: f64, y: f64, num_results: usize) -> Option<usize> {
+    let rows = num_results.min(MAX_RESULTS);
+    if x < MARGIN_X as f64 || x >= (MARGIN_X + FIELD_W) as f64 {
+        return None;
+    }
+    let offset = y - RESULTS_START_Y as f64;
+    if offset < 0.0 {
+        return None;
+    }
+    let row = (offset / RESULT_HEIGHT as f64) as usize;
+    (row < rows).then_some(row)
+}
+
+/// What the caret and the selection look like this frame.
+pub(crate) struct Caret {
+    /// Char offset of the caret in the input text.
+    pub offset: usize,
+    /// The selected range, as char offsets.
+    pub selection: Option<(usize, usize)>,
+    /// The caret is solid for half its blink period and hidden for the other.
+    pub visible: bool,
+}
+
+/// Draw the whole launcher into a pixel buffer.
+///
+/// It takes the buffer and the caret rather than the client, so drawing a frame
+/// needs no compositor: the same call renders into an offscreen buffer.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_ui(
-    client: &mut Client,
+    pixels: &mut shm::PixelBuffer,
     input_text: &str,
     state: &AppState,
     results: &[&DesktopEntry],
     font: &font::Font,
     search_enabled: bool,
-    cursor_visible: bool,
+    caret: &Caret,
 ) {
-    // Extract cursor/selection before borrowing pixels
-    let cursor = client.cursor;
-    let selection = client.selection_range();
-
-    let pixels = match client.pixels() {
-        Some(p) => p,
-        None => return,
-    };
+    let cursor = caret.offset;
+    let selection = caret.selection;
+    let cursor_visible = caret.visible;
 
     // A single flat surface; the selected row is the only part that washes.
     pixels.fill(BODY_BG);
@@ -107,7 +144,7 @@ pub(crate) fn draw_ui(
             text_y,
             input_text,
             TEXT_COLOR,
-            670,
+            TEXT_W,
             font,
             font::INPUT_SIZE,
         );
@@ -151,8 +188,8 @@ pub(crate) fn draw_ui(
 }
 
 /// Draw a result row: title over subtitle, the two lines vertically centered as
-/// a block in the row starting at y. The subtitle is clamped so a long command
-/// line cannot run off the row.
+/// a block in the row starting at y. Both lines stop at TEXT_W, so a long name
+/// or command line cannot run off the row.
 fn draw_row(pixels: &mut shm::PixelBuffer, y: u32, title: &str, subtitle: &str, font: &font::Font) {
     let title_h = font.text_height(font::NAME_SIZE);
     let subtitle_h = font.text_height(font::SUBTITLE_SIZE);
@@ -165,25 +202,16 @@ fn draw_row(pixels: &mut shm::PixelBuffer, y: u32, title: &str, subtitle: &str, 
         top as u32,
         title,
         TEXT_COLOR,
-        670,
+        TEXT_W,
         font,
         font::NAME_SIZE,
     );
-
-    // Clamp to 80 characters on a char boundary so a long command line cannot
-    // run off the row; draw_text clips further by width.
-    let cut = subtitle
-        .char_indices()
-        .nth(80)
-        .map(|(i, _)| i)
-        .unwrap_or(subtitle.len());
-    let truncated = &subtitle[..cut];
     pixels.draw_text(
         TEXT_X,
         (top + title_h + gap) as u32,
-        truncated,
+        subtitle,
         SUBTITLE_COLOR,
-        670,
+        TEXT_W,
         font,
         font::SUBTITLE_SIZE,
     );
@@ -194,4 +222,66 @@ fn draw_preview_row(pixels: &mut shm::PixelBuffer, title: &str, subtitle: &str, 
     let y = RESULTS_START_Y;
     pixels.fill_rect(MARGIN_X, y, FIELD_W, RESULT_HEIGHT, SELECTED_BG);
     draw_row(pixels, y, title, subtitle, font);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A point comfortably inside the field horizontally, which is what every
+    /// vertical case below wants to hold still.
+    const MID_X: f64 = (MARGIN_X + FIELD_W / 2) as f64;
+
+    #[test]
+    fn row_at_maps_a_position_to_the_row_drawn_there() {
+        let top = RESULTS_START_Y as f64;
+        assert_eq!(row_at(MID_X, top, 3), Some(0));
+        assert_eq!(row_at(MID_X, top + RESULT_HEIGHT as f64, 3), Some(1));
+        assert_eq!(row_at(MID_X, top + 2.0 * RESULT_HEIGHT as f64, 3), Some(2));
+    }
+
+    #[test]
+    fn a_row_boundary_belongs_to_the_row_below_it() {
+        // The rows butt up against each other, so the pixel a row starts on is
+        // that row's and the one before it ends a pixel short.
+        let boundary = (RESULTS_START_Y + RESULT_HEIGHT) as f64;
+        assert_eq!(row_at(MID_X, boundary - 0.5, 3), Some(0));
+        assert_eq!(row_at(MID_X, boundary, 3), Some(1));
+    }
+
+    #[test]
+    fn row_at_ignores_everything_that_is_not_a_row() {
+        let top = RESULTS_START_Y as f64;
+        // The input field sits above the list.
+        assert_eq!(row_at(MID_X, top - 1.0, 3), None);
+        assert_eq!(row_at(MID_X, INPUT_START_Y as f64, 3), None);
+        // Past the last row drawn, which is not the same as past the window: a
+        // shorter list leaves the rows below it undrawn.
+        assert_eq!(row_at(MID_X, top + 3.0 * RESULT_HEIGHT as f64, 3), None);
+        assert_eq!(row_at(MID_X, top + RESULT_HEIGHT as f64, 1), None);
+        // No results at all means no row anywhere.
+        assert_eq!(row_at(MID_X, top, 0), None);
+    }
+
+    #[test]
+    fn row_at_stops_at_the_edges_of_the_field() {
+        let top = RESULTS_START_Y as f64;
+        assert_eq!(row_at(MARGIN_X as f64, top, 3), Some(0));
+        assert_eq!(row_at(MARGIN_X as f64 - 1.0, top, 3), None);
+        assert_eq!(row_at((MARGIN_X + FIELD_W - 1) as f64, top, 3), Some(0));
+        assert_eq!(row_at((MARGIN_X + FIELD_W) as f64, top, 3), None);
+    }
+
+    #[test]
+    fn row_at_never_points_past_what_the_list_draws() {
+        // draw_ui paints at most MAX_RESULTS rows, whatever the count says, so
+        // the hit test must not hand back an index into a row nothing painted.
+        let top = RESULTS_START_Y as f64;
+        let past = top + (MAX_RESULTS as f64) * RESULT_HEIGHT as f64;
+        assert_eq!(row_at(MID_X, past, MAX_RESULTS + 5), None);
+        assert_eq!(
+            row_at(MID_X, past - 1.0, MAX_RESULTS + 5),
+            Some(MAX_RESULTS - 1)
+        );
+    }
 }

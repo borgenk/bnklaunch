@@ -5,11 +5,9 @@
 //! environ walk. The returned value borrows the process environment, which is
 //! stable for the program's lifetime since nothing here sets variables.
 
-#![allow(dead_code)]
-
 use core::ffi::c_char;
 
-use crate::arena::ArrayString;
+use crate::platform::arena::ArrayString;
 
 /// Longest variable name looked up; the names here (XDG_*, HOME, ...) are short.
 const NAME_CAP: usize = 128;

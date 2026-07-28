@@ -1,9 +1,21 @@
 //! Raw Linux syscall wrappers.
 //!
 //! Direct syscall access for x86_64 Linux.
+//!
+//! The lowest layer in the crate: inline assembly that issues the syscall
+//! instruction, and thin typed wrappers over it that everything above trusts to
+//! be correct. Most of those wrappers are themselves safe. They take a slice, a
+//! reference, or a checked CPath, derive the raw pointer inside, and keep the
+//! unsafe in one block, so the filesystem, cache, clipboard, time and stderr
+//! paths that call them carry no unsafe at all. What is left here is the
+//! assembly plus the few wrappers that still hand back a raw pointer or a
+//! mapping.
 
 #![allow(dead_code)]
 #![allow(non_camel_case_types)]
+
+use crate::platform::arena::ArrayVec;
+use crate::platform::error::{Error, Result};
 
 /// A raw file descriptor.
 pub type RawFd = i32;
@@ -57,7 +69,9 @@ impl CPath {
         Some(CPath { buf })
     }
 
-    fn as_ptr(&self) -> *const u8 {
+    /// The NUL-terminated bytes, for a caller that hands the kernel a raw path
+    /// pointer of its own (the ring's openat does).
+    pub fn as_ptr(&self) -> *const u8 {
         self.buf.as_ptr()
     }
 }
@@ -67,6 +81,7 @@ mod nr {
     pub const READ: usize = 0;
     pub const WRITE: usize = 1;
     pub const CLOSE: usize = 3;
+    pub const FSTAT: usize = 5;
     pub const LSEEK: usize = 8;
     pub const POLL: usize = 7;
     pub const MMAP: usize = 9;
@@ -91,11 +106,9 @@ mod nr {
     pub const MEMFD_CREATE: usize = 319;
     pub const IO_URING_SETUP: usize = 425;
     pub const IO_URING_ENTER: usize = 426;
-}
-
-// Pipe2 syscall
-mod nr_extra {
+    pub const RT_SIGACTION: usize = 13;
     pub const PIPE2: usize = 293;
+    pub const SOCKETPAIR: usize = 53;
 }
 
 // Constants
@@ -113,6 +126,10 @@ pub const SCM_RIGHTS: i32 = 0x01;
 /// msg_flags bit set by recvmsg when the ancillary buffer was too small to
 /// hold the passed fds.
 pub const MSG_CTRUNC: i32 = 0x8;
+/// sendmsg flag: report a write to a hung-up peer as EPIPE instead of raising
+/// SIGPIPE, whose default action would kill the process before any error path
+/// in this program runs.
+pub const MSG_NOSIGNAL: i32 = 0x4000;
 
 /// errno for a syscall interrupted by a signal; retry it.
 pub const EINTR: i32 = 4;
@@ -120,12 +137,23 @@ pub const EINTR: i32 = 4;
 /// errno returned by a non-blocking read with no data available; retry it.
 pub const EAGAIN: i32 = 11;
 
+/// errno for a write whose reader has hung up. Reachable only because SIGPIPE
+/// is ignored; its default action would have killed the process first.
+pub const EPIPE: i32 = 32;
+
 /// errno returned by mkdir when the directory already exists; not an error for
 /// a make-parents walk.
 pub const EEXIST: i32 = 17;
 
+/// errno for an argument the kernel rejects.
+pub const EINVAL: i32 = 22;
+
+/// Control-message buffer size, large enough for the fds passed either way.
+const CMSG_BUF: usize = 256;
+
 /// poll event bits.
 pub const POLLIN: i16 = 0x001;
+pub const POLLOUT: i16 = 0x004;
 
 // flock operations
 pub const LOCK_EX: i32 = 2; // Exclusive lock
@@ -165,6 +193,12 @@ pub const SOCK_CLOEXEC: i32 = O_CLOEXEC;
 // fcntl commands for toggling non-blocking mode on the socket.
 pub const F_GETFL: i32 = 3;
 pub const F_SETFL: i32 = 4;
+
+/// fcntl command for the descriptor flags, and the only flag there. io_uring
+/// hands back a descriptor that openat's O_CLOEXEC cannot reach, so its
+/// close-on-exec is set after the fact.
+pub const F_SETFD: i32 = 2;
+pub const FD_CLOEXEC: i32 = 1;
 
 /// A Unix-domain socket address. sun_path holds the filesystem path, and the
 /// passed addrlen covers only the family plus the used path bytes and its NUL.
@@ -281,9 +315,9 @@ pub struct stat_timespec {
     pub tv_nsec: i64,
 }
 
-/// The x86_64 struct stat filled by newfstatat. Only st_mode (for the file
-/// kind) and st_mtime (for the cache fingerprint) are read; the rest is laid
-/// out to match the kernel ABI.
+/// The x86_64 struct stat filled by newfstatat and fstat. st_mode (the file
+/// kind), st_mtime (the cache fingerprint), and st_size (a mapping's length)
+/// are read; the rest is laid out to match the kernel ABI.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct stat {
@@ -608,6 +642,61 @@ pub unsafe fn munmap(addr: *mut c_void, length: usize) -> i32 {
     syscall2(nr::MUNMAP, addr as usize, length) as i32
 }
 
+/// A read-only mapping of a file, unmapped when dropped.
+pub struct Mapped {
+    ptr: *mut c_void,
+    len: usize,
+}
+
+impl Mapped {
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: ptr and len are the mapping made in read_mapped, which is
+        // alive for as long as self is, and PROT_READ makes the bytes readable.
+        // The borrow ties the slice to self, so it cannot outlive the unmap.
+        unsafe { core::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        // SAFETY: ptr and len are exactly what mmap returned and was given, and
+        // Drop runs once, so the region is unmapped exactly once.
+        unsafe { munmap(self.ptr, self.len) };
+    }
+}
+
+/// Map len bytes of a file read-only.
+///
+/// The keyboard keymap arrives as a file descriptor whose seek position is
+/// shared with the compositor's own file-table entry, and not every compositor
+/// rewinds it before passing it on. A mapping sidesteps the offset entirely and
+/// costs no copy.
+pub fn read_mapped(fd: RawFd, len: usize) -> Result<Mapped> {
+    if len == 0 {
+        return Err(Error::msg("cannot map an empty file"));
+    }
+    // `len` is the sender's claim about a file the compositor owns, not one we
+    // made. mmap maps past the end of a short file, and the first read of a page
+    // beyond its last byte raises SIGBUS, which no `Result` can catch. Measure
+    // the file (with fstat, which unlike a seek leaves the shared offset alone)
+    // and refuse a claim that runs past it.
+    match fstat(fd) {
+        Some(st) if len as u64 > st.st_size as u64 => {
+            return Err(Error::msg("keymap fd is shorter than the sender claimed"));
+        }
+        None => return Err(Error::msg("could not stat the keymap fd")),
+        Some(_) => {}
+    }
+    // SAFETY: a null hint lets the kernel choose the address, and the result is
+    // checked with mmap_failed before it is used or stored. The mapping is
+    // private and read-only, so nothing else can be affected through it.
+    let ptr = unsafe { mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0) };
+    if mmap_failed(ptr) {
+        return Err(Error::from_errno(mmap_errno(ptr)));
+    }
+    Ok(Mapped { ptr, len })
+}
+
 /// Send a message on a socket.
 pub unsafe fn sendmsg(sockfd: RawFd, msg: *const msghdr, flags: i32) -> isize {
     syscall3(nr::SENDMSG, sockfd as usize, msg as usize, flags as usize)
@@ -618,23 +707,76 @@ pub unsafe fn recvmsg(sockfd: RawFd, msg: *mut msghdr, flags: i32) -> isize {
     syscall3(nr::RECVMSG, sockfd as usize, msg as usize, flags as usize)
 }
 
+/// The kernel's sigaction, which is not glibc's: the field order here (handler,
+/// flags, restorer, mask) is what rt_sigaction reads on x86_64.
+#[repr(C)]
+struct kernel_sigaction {
+    sa_handler: usize,
+    sa_flags: u64,
+    sa_restorer: usize,
+    /// The kernel's sigset_t, 64 bits on x86_64.
+    sa_mask: u64,
+}
+
+pub const SIGPIPE: i32 = 13;
+/// Signal dispositions, as the integer values the kernel reads for them.
+pub const SIG_DFL: usize = 0;
+pub const SIG_IGN: usize = 1;
+
+/// Set a signal's disposition to SIG_DFL or SIG_IGN. Returns 0 or a negated
+/// errno.
+///
+/// Only these two dispositions are offered. Installing a real handler would
+/// need a restorer trampoline (x86_64 rejects a handler without SA_RESTORER at
+/// delivery time), and neither disposition here is ever delivered.
+pub fn signal_disposition(signum: i32, disposition: usize) -> i32 {
+    let act = kernel_sigaction {
+        sa_handler: disposition,
+        sa_flags: 0,
+        sa_restorer: 0,
+        sa_mask: 0,
+    };
+    // SAFETY: act is a fully initialized kernel_sigaction laid out as the kernel
+    // expects and lives across the call; the old-action pointer is null, which
+    // the kernel reads as "do not report the previous disposition". The last
+    // argument is the size of the kernel's sigset_t, which the syscall requires.
+    unsafe {
+        syscall4(
+            nr::RT_SIGACTION,
+            signum as usize,
+            &act as *const kernel_sigaction as usize,
+            0,
+            core::mem::size_of::<u64>(),
+        ) as i32
+    }
+}
+
 /// Create a pipe, writing the read and write fds into pipefd. Returns 0 or a
 /// negated errno.
 pub fn pipe2(pipefd: &mut [i32; 2], flags: i32) -> i32 {
     // SAFETY: pipefd is a valid writable array of two ints the kernel fills.
-    unsafe {
-        syscall2(
-            nr_extra::PIPE2,
-            pipefd.as_mut_ptr() as usize,
-            flags as usize,
-        ) as i32
-    }
+    unsafe { syscall2(nr::PIPE2, pipefd.as_mut_ptr() as usize, flags as usize) as i32 }
 }
 
 /// Create a socket. Returns a new fd or a negated errno.
 pub fn socket(domain: i32, ty: i32, protocol: i32) -> RawFd {
     // SAFETY: no pointer crosses the boundary.
     unsafe { syscall3(nr::SOCKET, domain as usize, ty as usize, protocol as usize) as RawFd }
+}
+
+/// Create a connected pair of sockets, writing both fds into sv. Returns 0 or a
+/// negated errno. Used by the connection tests to stand in for a compositor.
+pub fn socketpair(domain: i32, ty: i32, protocol: i32, sv: &mut [i32; 2]) -> i32 {
+    // SAFETY: sv is a valid writable array of two ints the kernel fills.
+    unsafe {
+        syscall4(
+            nr::SOCKETPAIR,
+            domain as usize,
+            ty as usize,
+            protocol as usize,
+            sv.as_mut_ptr() as usize,
+        ) as i32
+    }
 }
 
 /// Connect a socket to an address. addrlen bounds the kernel's read of addr.
@@ -795,6 +937,21 @@ pub fn mkdir(path: &CPath, mode: u32) -> i32 {
     unsafe { syscall2(nr::MKDIR, path.as_ptr() as usize, mode as usize) as i32 }
 }
 
+/// Stat an open descriptor, or None on error. Unlike a seek to the end, this
+/// measures the file without touching the offset the compositor shares with us
+/// through the passed keymap fd, so it is the safe way to size that mapping.
+pub fn fstat(fd: RawFd) -> Option<stat> {
+    // SAFETY: stat is a plain integer struct, so zeroed is a valid value the
+    // kernel then fills; the pointer is exclusively borrowed for this call.
+    let mut st: stat = unsafe { core::mem::zeroed() };
+    let r = unsafe { syscall2(nr::FSTAT, fd as usize, &mut st as *mut stat as usize) as i32 };
+    if r < 0 {
+        None
+    } else {
+        Some(st)
+    }
+}
+
 /// Stat a path relative to dirfd, or None on error.
 pub fn newfstatat(dirfd: RawFd, path: &CPath, flags: i32) -> Option<stat> {
     // SAFETY: stat is a plain integer struct, so zeroed is a valid value the
@@ -887,15 +1044,141 @@ pub unsafe fn cmsg_firsthdr(msg: *const msghdr) -> *mut cmsghdr {
 
 /// Get pointer to the next cmsghdr.
 /// Equivalent to CMSG_NXTHDR macro.
+///
+/// The bounds test is done on integers, not pointers. Forming the one-past
+/// address of a candidate header and comparing it is undefined behaviour when
+/// that address lands outside the control buffer, which is exactly the case this
+/// has to detect.
 #[inline]
 pub unsafe fn cmsg_nxthdr(msg: *const msghdr, cmsg: *const cmsghdr) -> *mut cmsghdr {
-    let next = (cmsg as *const u8).add(cmsg_align((*cmsg).cmsg_len)) as *mut cmsghdr;
-    let end = ((*msg).msg_control as *const u8).add((*msg).msg_controllen);
+    let header = core::mem::size_of::<cmsghdr>();
+    // A record shorter than its own header is malformed; the kernel does not
+    // produce one, and trusting it would run the walk off into the buffer.
+    if (*cmsg).cmsg_len < header {
+        return core::ptr::null_mut();
+    }
 
-    if (next as *const u8).add(core::mem::size_of::<cmsghdr>()) > end {
-        core::ptr::null_mut()
-    } else {
-        next
+    let base = (*msg).msg_control as usize;
+    let len = (*msg).msg_controllen;
+    let offset = (cmsg as usize) - base + cmsg_align((*cmsg).cmsg_len);
+
+    // The next header must fit whole inside the control buffer.
+    if offset.saturating_add(header) > len {
+        return core::ptr::null_mut();
+    }
+    (base + offset) as *mut cmsghdr
+}
+
+/// Send data with file descriptors attached as SCM_RIGHTS ancillary data.
+/// Returns the bytes sent, or a negated errno.
+///
+/// The fds ride with the first byte of the message, so a short send leaves the
+/// caller to write the remainder as plain bytes.
+pub fn send_with_fds(fd: RawFd, data: &[u8], fds: &[RawFd]) -> isize {
+    let mut iov = iovec {
+        iov_base: data.as_ptr() as *mut c_void,
+        iov_len: data.len(),
+    };
+    let mut cmsg_buf = [0u8; CMSG_BUF];
+    let control_len = cmsg_space(core::mem::size_of_val(fds));
+
+    // SAFETY: msg is zeroed, then given one iovec covering data and a control
+    // buffer of control_len bytes, both live for the call. control_len is what
+    // cmsg_space computes for these fds and cmsg_buf is larger (checked below),
+    // so the header and the fd array written through the cmsg pointers stay
+    // inside cmsg_buf. MSG_NOSIGNAL keeps a hung-up peer from raising SIGPIPE.
+    unsafe {
+        if control_len > cmsg_buf.len() {
+            return -(EINVAL as isize);
+        }
+        let mut msg: msghdr = core::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut c_void;
+        msg.msg_controllen = control_len;
+
+        let cmsg = cmsg_firsthdr(&msg);
+        if !cmsg.is_null() {
+            (*cmsg).cmsg_level = SOL_SOCKET;
+            (*cmsg).cmsg_type = SCM_RIGHTS;
+            (*cmsg).cmsg_len = cmsg_len(core::mem::size_of_val(fds));
+            let fd_ptr = cmsg_data(cmsg) as *mut RawFd;
+            for (i, &fd) in fds.iter().enumerate() {
+                core::ptr::write(fd_ptr.add(i), fd);
+            }
+        }
+        sendmsg(fd, &msg, MSG_NOSIGNAL)
+    }
+}
+
+/// Receive into buf, appending any file descriptors passed as SCM_RIGHTS to fds
+/// in arrival order. Returns the bytes read (0 means the peer closed), or a
+/// negated errno.
+///
+/// Err when the kernel had to truncate the ancillary data, or when more fds
+/// arrive than the queue holds. Both are fatal rather than skippable: fds are
+/// matched to messages by arrival order, so one dropped fd misaligns every fd
+/// after it.
+pub fn recv_with_fds<const N: usize>(
+    fd: RawFd,
+    buf: &mut [u8],
+    fds: &mut ArrayVec<Fd, N>,
+) -> Result<isize> {
+    let mut iov = iovec {
+        iov_base: buf.as_mut_ptr() as *mut c_void,
+        iov_len: buf.len(),
+    };
+    let mut cmsg_buf = [0u8; CMSG_BUF];
+
+    // SAFETY: msg is zeroed, then given one iovec covering buf and the whole of
+    // cmsg_buf as its control buffer, both live for the call. The kernel writes
+    // no more than msg_controllen bytes of ancillary data, and the cmsg walk
+    // below stays inside what it reports back.
+    unsafe {
+        let mut msg: msghdr = core::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut c_void;
+
+        let n = loop {
+            // recvmsg overwrites these, so reset them per attempt: each retry
+            // has to offer the full ancillary buffer.
+            msg.msg_controllen = cmsg_buf.len();
+            msg.msg_flags = 0;
+            let r = recvmsg(fd, &mut msg, 0);
+            if r == -(EINTR as isize) {
+                continue;
+            }
+            break r;
+        };
+        if n < 0 {
+            return Ok(n);
+        }
+        if msg.msg_flags & MSG_CTRUNC != 0 {
+            return Err(Error::msg(
+                "received message truncated its passed file descriptors",
+            ));
+        }
+
+        let mut cmsg = cmsg_firsthdr(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == SOL_SOCKET && (*cmsg).cmsg_type == SCM_RIGHTS {
+                let header = cmsg_align(core::mem::size_of::<cmsghdr>());
+                let data_len = (*cmsg).cmsg_len.saturating_sub(header);
+                let count = data_len / core::mem::size_of::<RawFd>();
+                let fd_ptr = cmsg_data(cmsg) as *const RawFd;
+                for i in 0..count {
+                    let passed = Fd::new(core::ptr::read(fd_ptr.add(i)));
+                    if fds.push(passed).is_err() {
+                        return Err(Error::msg(
+                            "received more file descriptors than the queue holds",
+                        ));
+                    }
+                }
+            }
+            cmsg = cmsg_nxthdr(&msg, cmsg);
+        }
+        Ok(n)
     }
 }
 
@@ -909,6 +1192,55 @@ pub unsafe fn cmsg_data(cmsg: *const cmsghdr) -> *mut u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ignoring_sigpipe_turns_a_broken_pipe_write_into_epipe() {
+        // The kernel takes the struct as laid out here for both dispositions.
+        // SIG_DFL is what the forked child restores before exec, so it has to be
+        // accepted too; it is set back to ignore immediately, since a default
+        // SIGPIPE would kill this whole test process on the write below.
+        assert_eq!(signal_disposition(SIGPIPE, SIG_DFL), 0);
+        assert_eq!(signal_disposition(SIGPIPE, SIG_IGN), 0);
+
+        let mut fds = [0i32; 2];
+        assert_eq!(pipe2(&mut fds, O_CLOEXEC), 0);
+        let (read_end, write_end) = (Fd::new(fds[0]), Fd::new(fds[1]));
+        drop(read_end); // hang up the reader
+
+        // Ignored, so the write reports the hangup instead of raising a signal.
+        let n = write_fd(write_end.as_raw_fd(), b"data");
+        assert_eq!(n, -(EPIPE as isize), "expected EPIPE, got {n}");
+    }
+
+    /// The length handed to `read_mapped` is the compositor's claim about a file
+    /// it owns. A claim past the end of the file must be refused: mapping it
+    /// succeeds, and reading the bytes beyond the end raises SIGBUS, killing the
+    /// process where no `Result` can intervene.
+    #[test]
+    fn read_mapped_refuses_a_length_past_the_end_of_the_file() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        let path =
+            std::env::temp_dir().join(format!("bnklaunch-read-mapped-{}", std::process::id()));
+        let mut f = std::fs::File::create(&path).expect("create fixture");
+        f.write_all(b"keymap").expect("write fixture");
+        drop(f);
+        let file = std::fs::File::open(&path).expect("open fixture");
+        let fd = file.as_raw_fd();
+
+        assert_eq!(
+            read_mapped(fd, 6).expect("exact length").as_slice(),
+            b"keymap"
+        );
+        assert_eq!(read_mapped(fd, 3).expect("short length").as_slice(), b"key");
+        assert!(
+            read_mapped(fd, 4096).is_err(),
+            "a length past the end must be refused"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
 
     #[test]
     fn test_cmsg_space() {

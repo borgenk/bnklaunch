@@ -2,34 +2,25 @@
 #![cfg_attr(not(test), no_main)]
 
 mod app;
-mod arena;
 mod cache;
 mod client;
 mod clipboard;
 mod config;
 mod denylist;
 mod desktop;
-mod env;
-mod error;
+mod editor;
 mod font;
-mod freetype;
-mod fs;
 mod launch;
-mod protocol;
+#[cfg(test)]
+mod perf;
+mod platform;
+mod present;
 mod shm;
-mod socket;
-mod syscall;
-mod time;
 mod ui;
-mod uring;
-mod wire;
-mod xkb;
 
-/// Maximum number of results to display
-const MAX_RESULTS: usize = 5;
-
-/// Window width
-const WINDOW_WIDTH: u32 = 800;
+// Only the C entry point below logs, and the test harness cfgs it out.
+#[cfg(not(test))]
+use crate::platform::error::elog;
 
 /// C entry point for the no_std build. The C runtime (crt0, pulled in with
 /// libc) calls this; it runs the launcher and maps the result to an exit code.
@@ -54,7 +45,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8) -> i32 {
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    syscall::exit_group(101)
+    platform::syscall::exit_group(101)
 }
 
 /// Under the test harness the C entry point is cfg'd out, so reference the real

@@ -1,9 +1,13 @@
 //! Binary cache of discovered desktop entries plus recent launches.
 //!
-//! The launcher loads this to paint instantly, then a background rescan
-//! refreshes it. The file is disposable: load returns None on any problem with
-//! the header or entries (missing, wrong magic, wrong version, truncated, bad
-//! utf-8) and the caller falls back to a fresh scan.
+//! Scanning the application directories takes milliseconds; decoding this takes
+//! microseconds. So a start reads the cache, compares the fingerprint it carries
+//! against the directories, and only walks them again when the two disagree,
+//! which means an application was installed or removed since last time.
+//!
+//! The file is disposable. load returns None on any problem with it at all
+//! (missing, wrong magic, wrong version, truncated, bad utf-8), and the caller
+//! simply scans instead. Nothing here needs to be repaired, only rebuilt.
 //!
 //! Two sections, two write paths. The entries section changes only when the set
 //! of installed apps changes, and is written whole through a temp file and
@@ -25,17 +29,22 @@
 //!   per entry:   u16 name len + utf-8, then u16 exec len + utf-8
 //!   recents:     u16 count, then per name u16 len + utf-8
 
-use crate::arena::{ArrayString, ArrayVec};
 use crate::desktop::{Catalog, DesktopEntry, NAME_CAP, RESULT_CAP};
-use crate::error::{Error, Result};
-use crate::syscall::{self, Fd, AT_FDCWD, O_WRONLY, SEEK_SET};
-use crate::{env, fs};
+use crate::platform::arena::{ArrayString, ArrayVec};
+use crate::platform::bytes::Cursor;
+use crate::platform::error::{Error, Result};
+use crate::platform::syscall::{self, Fd, AT_FDCWD, O_CLOEXEC, O_WRONLY, SEEK_SET};
+use crate::platform::{env, fs};
 
 const MAGIC: &[u8; 4] = b"BNKL";
 const VERSION: u8 = 2;
 
-/// Largest cache file read. Comfortably above a realistic catalog; a larger
-/// file fails to read and falls back to a fresh scan.
+/// Largest cache file, on the read side and the write side alike. Comfortably
+/// above a realistic catalog (a full thousand entries average well under a
+/// hundred bytes each), but under the 1.3 MB the field caps technically allow,
+/// so encode checks every write and a pathological catalog is left uncached
+/// rather than half written. A larger file on disk fails to read and falls back
+/// to a fresh scan.
 const CACHE_MAX: usize = 512 * 1024;
 
 /// Most number of recent launches kept.
@@ -107,7 +116,7 @@ fn save_to(
     if let Some((parent, _)) = path.rsplit_once('/') {
         fs::mkdir_p(parent)?;
     }
-    let (bytes, recents_offset) = encode(entries, fingerprint, recents);
+    let (bytes, recents_offset) = encode(entries, fingerprint, recents)?;
     // Write to a temp file and rename over the target so a crash leaves the old
     // cache intact.
     let mut tmp: ArrayString<{ fs::PATH_CAP }> = ArrayString::new();
@@ -130,9 +139,11 @@ pub fn record(recents_offset: u64, recents: &mut Recents, name: &str) -> Result<
 }
 
 fn record_to(path: &str, recents_offset: u64, recents: &[ArrayString<NAME_CAP>]) -> Result<()> {
-    let block = encode_recents(recents);
+    let block = encode_recents(recents)?;
     let cp = fs::cpath(path)?;
-    let fd = syscall::openat(AT_FDCWD, &cp, O_WRONLY, 0);
+    // O_CLOEXEC so a launched app never inherits this descriptor, whatever
+    // order a caller does the launch and the record in.
+    let fd = syscall::openat(AT_FDCWD, &cp, O_WRONLY | O_CLOEXEC, 0);
     if fd < 0 {
         return Err(Error::from_errno(-fd));
     }
@@ -190,44 +201,54 @@ pub fn resolve<'a>(
 /// Encoded recents section: bounded by the recents count, never the full cache.
 const RECENTS_ENC_CAP: usize = RECENT_CAP * (2 + NAME_CAP) + 2;
 
-fn encode(
+/// Encode the whole file and report where the recents section starts.
+///
+/// Every write is checked. A catalog whose encoding exceeds CACHE_MAX is an
+/// error, not a truncation: save renames its output over the live cache, and a
+/// half-written record there would fail decode on every subsequent start, which
+/// rescans and writes the same broken file again.
+pub(crate) fn encode(
     entries: &[DesktopEntry],
     fingerprint: u64,
     recents: &[ArrayString<NAME_CAP>],
-) -> (ArrayVec<u8, CACHE_MAX>, u64) {
-    // Capacity-bounded name/exec always fit the u16 length prefix.
+) -> Result<(ArrayVec<u8, CACHE_MAX>, u64)> {
     let mut out: ArrayVec<u8, CACHE_MAX> = ArrayVec::new();
-    let _ = out.extend_from_slice(MAGIC);
-    let _ = out.push(VERSION);
-    let _ = out.extend_from_slice(&fingerprint.to_le_bytes());
-    let _ = out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    write_bytes(&mut out, MAGIC)?;
+    write_bytes(&mut out, &[VERSION])?;
+    write_bytes(&mut out, &fingerprint.to_le_bytes())?;
+    write_bytes(&mut out, &(entries.len() as u32).to_le_bytes())?;
     for entry in entries {
-        write_string(&mut out, &entry.name);
-        write_string(&mut out, &entry.exec);
+        write_string(&mut out, &entry.name)?;
+        write_string(&mut out, &entry.exec)?;
     }
     let recents_offset = out.len() as u64;
-    let _ = out.extend_from_slice(&encode_recents(recents));
-    (out, recents_offset)
+    write_bytes(&mut out, &encode_recents(recents)?)?;
+    Ok((out, recents_offset))
 }
 
-fn encode_recents(recents: &[ArrayString<NAME_CAP>]) -> ArrayVec<u8, RECENTS_ENC_CAP> {
+fn encode_recents(recents: &[ArrayString<NAME_CAP>]) -> Result<ArrayVec<u8, RECENTS_ENC_CAP>> {
     let count = recents.len().min(RECENT_CAP);
 
     let mut out: ArrayVec<u8, RECENTS_ENC_CAP> = ArrayVec::new();
-    let _ = out.extend_from_slice(&(count as u16).to_le_bytes());
+    write_bytes(&mut out, &(count as u16).to_le_bytes())?;
     for name in recents.iter().take(RECENT_CAP) {
-        write_string(&mut out, name);
+        write_string(&mut out, name)?;
     }
-    out
+    Ok(out)
 }
 
-fn write_string<const N: usize>(out: &mut ArrayVec<u8, N>, s: &str) {
+fn write_bytes<const N: usize>(out: &mut ArrayVec<u8, N>, bytes: &[u8]) -> Result<()> {
+    out.extend_from_slice(bytes)
+        .map_err(|_| Error::msg("cache too large to encode"))
+}
+
+fn write_string<const N: usize>(out: &mut ArrayVec<u8, N>, s: &str) -> Result<()> {
     // A capacity-bounded string always fits the u16 length prefix.
-    let _ = out.extend_from_slice(&(s.len() as u16).to_le_bytes());
-    let _ = out.extend_from_slice(s.as_bytes());
+    write_bytes(out, &(s.len() as u16).to_le_bytes())?;
+    write_bytes(out, s.as_bytes())
 }
 
-fn decode(data: &[u8]) -> Option<Cached> {
+pub(crate) fn decode(data: &[u8]) -> Option<Cached> {
     let mut r = Reader::new(data);
     if r.take(MAGIC.len())? != MAGIC {
         return None;
@@ -247,12 +268,12 @@ fn decode(data: &[u8]) -> Option<Cached> {
         let exec = r.string()?;
         // A stored field longer than an entry can hold is dropped, not
         // truncated; the record is still consumed so the stream stays aligned.
-        if let Some(entry) = DesktopEntry::new(name, exec, "") {
+        if let Some(entry) = DesktopEntry::new(name, exec) {
             let _ = entries.push(entry);
         }
     }
 
-    let recents_offset = r.pos as u64;
+    let recents_offset = r.cur.pos() as u64;
     // The recents tail is rewritten in place on launch, outside the atomic
     // temp-and-rename. A torn write there must not cost the entries, so parse it
     // leniently: any problem yields empty recents, never None.
@@ -280,21 +301,23 @@ fn decode_recents(r: &mut Reader) -> Option<Recents> {
     Some(out)
 }
 
+/// The cache's little-endian decoder, layered on the shared byte cursor: the
+/// cursor does the bounds checks and hands out sub-slices, this adds the
+/// endianness. The wire codec layers its own native-endian decoding on the same
+/// cursor.
 struct Reader<'a> {
-    data: &'a [u8],
-    pos: usize,
+    cur: Cursor<'a>,
 }
 
 impl<'a> Reader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+        Self {
+            cur: Cursor::new(data),
+        }
     }
 
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(n)?;
-        let slice = self.data.get(self.pos..end)?;
-        self.pos = end;
-        Some(slice)
+        self.cur.take(n)
     }
 
     fn u8(&mut self) -> Option<u8> {
@@ -331,7 +354,7 @@ mod tests {
     use super::*;
 
     fn entry(name: &str, exec: &str) -> DesktopEntry {
-        DesktopEntry::new(name, exec, "").unwrap()
+        DesktopEntry::new(name, exec).unwrap()
     }
 
     fn bytes(
@@ -339,7 +362,7 @@ mod tests {
         fingerprint: u64,
         recents: &[ArrayString<NAME_CAP>],
     ) -> ArrayVec<u8, CACHE_MAX> {
-        encode(entries, fingerprint, recents).0
+        encode(entries, fingerprint, recents).expect("encode").0
     }
 
     fn names(list: &[&str]) -> Recents {
@@ -428,10 +451,10 @@ mod tests {
         let _ = data.push(VERSION);
         let _ = data.extend_from_slice(&1u64.to_le_bytes()); // fingerprint
         let _ = data.extend_from_slice(&2u32.to_le_bytes()); // count
-        write_string(&mut data, "Keep");
-        write_string(&mut data, "ok");
-        write_string(&mut data, &long);
-        write_string(&mut data, "exec");
+        write_string(&mut data, "Keep").unwrap();
+        write_string(&mut data, "ok").unwrap();
+        write_string(&mut data, &long).unwrap();
+        write_string(&mut data, "exec").unwrap();
         let _ = data.extend_from_slice(&0u16.to_le_bytes()); // no recents
 
         let decoded = decode(&data).expect("decode");
@@ -448,7 +471,7 @@ mod tests {
         let _ = data.extend_from_slice(&0u32.to_le_bytes()); // no entries
         let _ = data.extend_from_slice(&50u16.to_le_bytes()); // recents count claims 50
         for i in 0..50 {
-            write_string(&mut data, &format!("App{}", i));
+            write_string(&mut data, &format!("App{}", i)).unwrap();
         }
         let decoded = decode(&data).expect("decode");
         assert_eq!(decoded.recents.len(), RECENT_CAP);
@@ -458,13 +481,63 @@ mod tests {
     fn torn_recents_keep_entries() {
         let entries = vec![entry("Firefox", "firefox")];
         let recents = names(&["Firefox"]);
-        let (mut b, offset) = encode(&entries, 7, &recents);
+        let (mut b, offset) = encode(&entries, 7, &recents).expect("encode");
         // Chop mid-name in the recents tail: count is intact, the name is not.
         b.truncate(offset as usize + 3);
         let decoded = decode(&b).expect("entries still decode");
         assert_eq!(decoded.fingerprint, 7);
         assert_same(&decoded.entries, &entries);
         assert!(decoded.recents.is_empty());
+    }
+
+    /// One entry whose name and exec sit at their field caps: 1284 encoded
+    /// bytes, so 409 of them overflow CACHE_MAX.
+    fn max_entry(i: usize) -> DesktopEntry {
+        let mut name = format!("{:04}", i);
+        name.push_str(&"n".repeat(crate::desktop::NAME_CAP - name.len()));
+        let exec = "e".repeat(crate::desktop::EXEC_CAP);
+        entry(&name, &exec)
+    }
+
+    #[test]
+    fn encode_at_the_cap_still_round_trips() {
+        let mut entries: Vec<DesktopEntry> = Vec::new();
+        let mut encoded = 17; // magic, version, fingerprint, count
+        while encoded + 1284 + RECENTS_ENC_CAP <= CACHE_MAX {
+            entries.push(max_entry(entries.len()));
+            encoded += 1284;
+        }
+        let recents = names(&["0000"]);
+        let decoded = decode(&bytes(&entries, 1, &recents)).expect("decode");
+        assert_same(&decoded.entries, &entries);
+    }
+
+    #[test]
+    fn encode_over_the_cap_fails_instead_of_truncating() {
+        // The field caps allow a catalog that does not fit CACHE_MAX. Encoding
+        // one must be an error: a truncated buffer renamed over the live cache
+        // fails decode forever after.
+        let entries: Vec<DesktopEntry> = (0..500).map(max_entry).collect();
+        assert!(encode(&entries, 1, &[]).is_err());
+    }
+
+    #[test]
+    fn save_over_the_cap_leaves_the_old_cache_alone() {
+        let dir = temp_dir("overflow");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = format!("{}/apps.bin", dir);
+
+        let good = vec![entry("Firefox", "firefox")];
+        save_to(&path, &good, 1, &[]).expect("first save");
+
+        let huge: Vec<DesktopEntry> = (0..500).map(max_entry).collect();
+        assert!(save_to(&path, &huge, 2, &[]).is_err());
+
+        // The old cache is untouched and still decodes.
+        let decoded = load_from(&path).expect("old cache survives");
+        assert_eq!(decoded.fingerprint, 1);
+        assert_same(&decoded.entries, &good);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -559,7 +632,8 @@ mod tests {
         let loaded = load_from(&path).expect("load");
         assert_eq!(loaded.recents, names(&["X"]));
         let len = std::fs::metadata(&path).expect("metadata").len();
-        assert_eq!(len, offset + encode_recents(&names(&["X"])).len() as u64);
+        let block = encode_recents(&names(&["X"])).expect("encode recents");
+        assert_eq!(len, offset + block.len() as u64);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

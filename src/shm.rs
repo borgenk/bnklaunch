@@ -6,8 +6,8 @@
 
 use core::ptr::NonNull;
 
-use crate::error::{Error, Result};
-use crate::syscall::{self as sys, Fd, RawFd};
+use crate::platform::error::{Error, Result};
+use crate::platform::syscall::{self as sys, Fd, RawFd};
 
 /// A memory-mapped buffer for pixel data.
 pub struct PixelBuffer {
@@ -153,9 +153,6 @@ impl Drop for PixelBuffer {
     }
 }
 
-// SAFETY: The buffer is not accessed from multiple threads simultaneously
-unsafe impl Send for PixelBuffer {}
-
 /// Create an anonymous file using memfd_create. The name is a fixed program
 /// constant, checked into a CPath for the syscall.
 fn memfd_create(name: &str) -> Result<Fd> {
@@ -175,9 +172,9 @@ mod tests {
     fn expect_overflow(width: u32, height: u32) {
         match PixelBuffer::new(width, height) {
             Ok(_) => panic!("expected an overflow error for {width}x{height}"),
-            // The dimension math fails before any syscall, so this is a
-            // message error rather than an errno.
-            Err(e) => assert_eq!(e.errno(), 0),
+            // The dimension math fails before any syscall is attempted, so it is
+            // this error and not an errno from ftruncate or mmap.
+            Err(e) => assert_eq!(e, Error::msg("buffer dimensions too large")),
         }
     }
 

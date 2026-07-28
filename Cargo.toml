@@ -13,3 +13,11 @@ strip = true           # Strip symbols
 [profile.release-small]
 inherits = "release"
 opt-level = "z"        # Optimize for size over speed
+
+# The performance gate runs under the test harness, which needs unwinding, but
+# timing a debug build says nothing about the binary anyone runs. So: release
+# optimizations, unwinding panics.
+[profile.perf]
+inherits = "release"
+panic = "unwind"
+strip = false

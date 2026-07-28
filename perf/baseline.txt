@@ -1,0 +1,7 @@
+# Best-of-5 nanoseconds per iteration, written by `make perf-update`.
+# Machine-specific: a number from another box means nothing. What the
+# gate checks is the ratio against these, on the box that wrote them.
+desktop_parse 33046
+search_1024 7397
+cache_decode 115513
+frame_draw 29200

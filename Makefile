@@ -1,4 +1,4 @@
-.PHONY: fmt clippy build build-release build-small build-linux install run test check bump clean
+.PHONY: fmt clippy build build-release build-small build-linux install run test perf perf-update scan-bench check bump clean
 
 APP_NAME := bnklaunch
 TARGET := x86_64-unknown-linux-gnu
@@ -22,8 +22,13 @@ TEST_ENV := CARGO_ENCODED_RUSTFLAGS="" RUST_MIN_STACK=16777216 CARGO_UNSTABLE_BU
 fmt:
 	cargo fmt --all
 
+# Lint twice, because the two builds see different code. The test build has
+# cfg(test) on, so anything only a test uses still counts as used; the binary
+# build is what actually ships, and it is the one that finds code nothing calls.
+# Neither pass alone catches everything.
 clippy:
 	$(TEST_ENV) cargo clippy --all --benches --tests --examples --all-features -- -D warnings
+	cargo clippy --all-features -- -D warnings
 
 build:
 	cargo build
@@ -71,6 +76,24 @@ run:
 
 test:
 	$(TEST_ENV) cargo test
+
+# The performance gate: the scenarios in src/perf.rs, timed and compared against
+# perf/baseline.txt. Built with optimizations, since timing a debug build says
+# nothing about the binary anyone runs. Single-threaded, so the samples are not
+# competing with each other for the machine.
+perf:
+	$(TEST_ENV) cargo test --profile perf -- --ignored --nocapture --test-threads=1 perf_gate
+
+# Rewrite the baseline from this machine's numbers. Do this only for a change
+# whose cost is deliberate, and say in the commit message what moved and why.
+perf-update:
+	BNKLAUNCH_PERF_UPDATE=1 $(TEST_ENV) cargo test --profile perf -- --ignored --nocapture --test-threads=1 perf_gate
+
+# Where a cold start's time actually goes, measured against this machine's own
+# application directories. Prints, never fails: the numbers are specific to what
+# is installed here.
+scan-bench:
+	$(TEST_ENV) cargo test --profile perf -- --ignored --nocapture --test-threads=1 startup_stages
 
 check: fmt clippy test
 
