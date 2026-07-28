@@ -9,7 +9,7 @@
 
 use core::ffi::c_char;
 
-use crate::arena::ArrayString;
+use crate::platform::arena::ArrayString;
 
 /// Longest variable name looked up; the names here (XDG_*, HOME, ...) are short.
 const NAME_CAP: usize = 128;

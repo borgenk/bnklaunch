@@ -1,11 +1,13 @@
 //! Software rendering of the launcher: theme, layout, and the draw routines
 //! that composite the input field and result rows into the pixel buffer.
 
-use crate::app::{normalize_url, parse_action, AppState, InputAction, URL_CAP};
+use crate::app::{normalize_url, parse_action, AppState, InputAction};
 use crate::client::Client;
+use crate::config::{MAX_RESULTS, WINDOW_WIDTH};
 use crate::desktop::{self, DesktopEntry};
-use crate::{arena, font, shm};
-use crate::{MAX_RESULTS, WINDOW_WIDTH};
+use crate::launch::URL_CAP;
+use crate::platform::arena;
+use crate::{font, shm};
 
 const fn argb(a: u8, r: u8, g: u8, b: u8) -> u32 {
     ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
@@ -68,8 +70,8 @@ pub(crate) fn draw_ui(
     cursor_visible: bool,
 ) {
     // Extract cursor/selection before borrowing pixels
-    let cursor = client.cursor;
-    let selection = client.selection_range();
+    let cursor = client.editor.cursor();
+    let selection = client.editor.selection();
 
     let pixels = match client.pixels() {
         Some(p) => p,

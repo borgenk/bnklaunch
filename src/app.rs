@@ -1,14 +1,17 @@
 //! The launcher application: single-instance lock, desktop-entry resolution,
 //! the io_uring event loop, and input handling.
 
-use crate::client::{Client, ClipboardOp, PendingAction};
+use crate::client::{Client, PendingAction};
+use crate::clipboard;
+use crate::config::{MAX_RESULTS, WINDOW_WIDTH};
 use crate::desktop::{self, DesktopEntry};
-use crate::elog;
-use crate::error::{Error, Result};
-use crate::time::Instant;
+use crate::platform::error::elog;
+use crate::platform::error::{Error, Result};
+use crate::platform::time::Instant;
+use crate::platform::xkb::{keycode, Xkb};
+use crate::platform::{arena, env, fs, syscall, uring};
 use crate::ui::{calculate_height, draw_ui};
-use crate::{arena, cache, config, denylist, env, font, fs, launch, syscall, ui, uring};
-use crate::{MAX_RESULTS, WINDOW_WIDTH};
+use crate::{cache, config, denylist, font, launch, ui};
 
 /// Caret blink half-period in milliseconds: solid this long, then hidden this
 /// long.
@@ -25,6 +28,75 @@ const TICK_NANOS: i64 = 33_000_000;
 /// io_uring user_data tags identifying which submission a completion belongs to.
 const K_WAYLAND: u64 = 1;
 const K_TIMER: u64 = 2;
+
+/// What a key press means to the launcher.
+///
+/// The platform layer answers only machine questions (which character does this
+/// key type under these modifiers), so the meaning is assigned here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KeyAction {
+    Char(char),
+    Backspace,
+    Delete,
+    Enter,
+    Escape,
+    Tab,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    SelectAll,
+    Copy,
+    Cut,
+    Paste,
+    None,
+}
+
+/// Read a key press as the action it stands for.
+///
+/// The editing keys and the Ctrl shortcuts dispatch on the physical evdev
+/// keycode, not on the character the key would type. That is the convention
+/// every other Linux app follows: Ctrl+V is the V-position key, whatever the
+/// user's layout makes that key type. Only ordinary text input goes through the
+/// layout, by asking xkb what the key produces.
+pub(crate) fn key_action(xkb: &Xkb, keycode: u32) -> KeyAction {
+    use keycode::*;
+
+    match keycode {
+        // A modifier on its own is not an action.
+        KEY_LEFTSHIFT | KEY_RIGHTSHIFT | KEY_LEFTCTRL | KEY_RIGHTCTRL | KEY_LEFTALT
+        | KEY_RIGHTALT | KEY_CAPSLOCK => return KeyAction::None,
+        KEY_ENTER => return KeyAction::Enter,
+        KEY_ESC => return KeyAction::Escape,
+        KEY_TAB => return KeyAction::Tab,
+        KEY_BACKSPACE => return KeyAction::Backspace,
+        KEY_DELETE => return KeyAction::Delete,
+        KEY_UP => return KeyAction::Up,
+        KEY_DOWN => return KeyAction::Down,
+        KEY_LEFT => return KeyAction::Left,
+        KEY_RIGHT => return KeyAction::Right,
+        KEY_HOME => return KeyAction::Home,
+        KEY_END => return KeyAction::End,
+        _ => {}
+    }
+
+    if xkb.ctrl_active() {
+        return match keycode {
+            KEY_A => KeyAction::SelectAll,
+            KEY_C => KeyAction::Copy,
+            KEY_X => KeyAction::Cut,
+            KEY_V => KeyAction::Paste,
+            _ => KeyAction::None,
+        };
+    }
+
+    match xkb.key_char(keycode) {
+        Some(c) => KeyAction::Char(c),
+        None => KeyAction::None,
+    }
+}
 
 /// What the current input text resolves to when launched.
 pub(crate) enum InputAction<'a> {
@@ -50,8 +122,7 @@ pub(crate) fn parse_action(input: &str, search_enabled: bool) -> InputAction<'_>
     }
 }
 
-/// Byte capacity of a URL the launcher handles.
-pub(crate) const URL_CAP: usize = 2048;
+use crate::launch::URL_CAP;
 
 /// Prepend https:// if the URL has no scheme, into out.
 pub(crate) fn normalize_url(url: &str, out: &mut arena::ArrayString<URL_CAP>) {
@@ -116,6 +187,18 @@ fn record_launch(
 /// The launcher's entry logic. Wrapped by the C entry point in main.rs in the
 /// real build; called directly by tests through the std harness.
 pub(crate) fn run() -> Result<()> {
+    // Writing to a pipe or socket whose peer has hung up raises SIGPIPE, and its
+    // default action kills the process before any error path here runs. The
+    // compositor socket takes MSG_NOSIGNAL on every send, but the clipboard
+    // pipe is a pipe: an app that asks for the selection and then goes away
+    // mid-transfer would take the launcher down with it. Ignoring the signal
+    // turns both into an EPIPE the code already handles.
+    //
+    // The disposition survives exec, so launch.rs puts it back to default in the
+    // forked child; a launched application must keep the SIGPIPE its own
+    // pipelines rely on.
+    syscall::signal_disposition(syscall::SIGPIPE, syscall::SIG_IGN);
+
     // Single instance check - exit silently if another instance is running
     let _lock = match try_acquire_lock() {
         Ok(lock) => lock,
@@ -145,8 +228,10 @@ pub(crate) fn run() -> Result<()> {
             recents_offset = Some(c.recents_offset);
         }
         None => {
+            // The catalog stays empty here. A missing cache has no fingerprint
+            // to match, so the refresh below always discovers; scanning here as
+            // well would walk every application directory twice on a cold start.
             entries = desktop::Catalog::new();
-            desktop::discover_entries(&mut entries);
             recents = cache::Recents::new();
             recents_offset = None;
         }
@@ -199,13 +284,7 @@ pub(crate) fn run() -> Result<()> {
     // (no output available, or an output destroyed mid-resize), which sets
     // running false; bail out then rather than blocking on a configure that
     // will never come.
-    while client.running
-        && !client
-            .surface
-            .as_ref()
-            .map(|s| s.configured)
-            .unwrap_or(false)
-    {
+    while client.running && !client.surface_configured() {
         client.dispatch()?;
     }
     if !client.running {
@@ -223,24 +302,17 @@ pub(crate) fn run() -> Result<()> {
     let mut cursor_visible = true;
     let mut last_blink = Instant::now();
 
+    // The query the current result list was built from, so an edit to the text
+    // can be told apart from a cursor move or a click, which leave it standing.
+    let mut last_query = client.editor.text_owned();
+
     // Initial draw of the empty-input view (recents). The result list borrows
     // state, so scope it to this block: it must not hold that borrow across the
     // loop, where state is mutated.
-    let mut current_results_len = {
-        let initial_results = cache::resolve(&state.recents, &state.entries);
-        let len = initial_results.len().min(MAX_RESULTS);
-        draw_ui(
-            &mut client,
-            "",
-            &state,
-            &initial_results,
-            &font,
-            search_enabled,
-            cursor_visible,
-        );
-        client.render()?;
-        len
-    };
+    let mut current_results_len = cache::resolve(&state.recents, &state.entries)
+        .len()
+        .min(MAX_RESULTS);
+    repaint(&mut client, &state, &font, search_enabled, cursor_visible)?;
 
     // Non-blocking socket: a poll readiness wakeup then drains every queued
     // message in one pass without blocking on the final partial read.
@@ -250,14 +322,24 @@ pub(crate) fn run() -> Result<()> {
     // the loop the instant the compositor sends events; a one-shot timer paces
     // key repeat and the caret blink. Each is re-armed after it fires. Between
     // wakeups the thread is parked in io_uring_enter rather than sleep-polling.
-    let wl_fd = client.socket.as_raw_fd();
-    let mut ring = uring::Ring::new(RING_ENTRIES).map_err(Error::from_errno)?;
+    let wl_fd = client.socket.fd();
+    // tick is declared ahead of the ring so it is dropped after it: the kernel
+    // reads the timespec asynchronously, and the ring must be gone (its ops
+    // cancelled) before the memory behind that pointer goes away.
     let tick = syscall::kernel_timespec {
         tv_sec: 0,
         tv_nsec: TICK_NANOS,
     };
-    let _ = ring.prep_poll_add(wl_fd, syscall::POLLIN as u32, K_WAYLAND);
-    let _ = ring.prep_timeout(&tick, K_TIMER);
+    let mut ring = uring::Ring::new(RING_ENTRIES).map_err(Error::from_errno)?;
+    // Both submissions are one-shot and re-armed as they complete. A failed
+    // re-arm is fatal: the loop parks in io_uring_enter waiting for a
+    // completion that nothing will ever produce.
+    let arm_failed = || Error::msg("io_uring submission queue full");
+    ring.prep_poll_add(wl_fd, syscall::POLLIN as u32, K_WAYLAND)
+        .map_err(|_| arm_failed())?;
+    // SAFETY: tick outlives the ring (see above), so the timespec the kernel
+    // reads stays valid for as long as any timeout op can be in flight.
+    unsafe { ring.prep_timeout(&tick, K_TIMER) }.map_err(|_| arm_failed())?;
 
     // Event loop
     while client.running {
@@ -270,7 +352,8 @@ pub(crate) fn run() -> Result<()> {
             match cqe.user_data {
                 K_WAYLAND => {
                     // Re-arm the one-shot poll for the next readiness.
-                    let _ = ring.prep_poll_add(wl_fd, syscall::POLLIN as u32, K_WAYLAND);
+                    ring.prep_poll_add(wl_fd, syscall::POLLIN as u32, K_WAYLAND)
+                        .map_err(|_| arm_failed())?;
                     // Readiness means at least one message; drain them all.
                     loop {
                         match client.dispatch() {
@@ -282,7 +365,8 @@ pub(crate) fn run() -> Result<()> {
                 }
                 K_TIMER => {
                     // Re-arm the one-shot timer for the next tick.
-                    let _ = ring.prep_timeout(&tick, K_TIMER);
+                    // SAFETY: tick outlives the ring, as above.
+                    unsafe { ring.prep_timeout(&tick, K_TIMER) }.map_err(|_| arm_failed())?;
                     timer_fired = true;
                 }
                 _ => {}
@@ -318,90 +402,54 @@ pub(crate) fn run() -> Result<()> {
         }
 
         // Handle clipboard operations
-        if !matches!(client.clipboard_op, ClipboardOp::None) {
+        if !matches!(client.clipboard_op, clipboard::Op::None) {
             client.process_clipboard();
         }
 
         // Handle pointer click/drag in the input box
         handle_pointer_input(&mut client, &font);
 
-        // Handle input changes
+        // Repaint on any of three triggers: the input changed, the selection
+        // moved, or the caret blinked. They differ only in what they settle
+        // first; the drawing itself is one path.
         if client.input_changed {
             client.input_changed = false;
             // Activity keeps the caret solid; restart the blink from now.
             cursor_visible = true;
             last_blink = Instant::now();
 
-            let text = client.input_text;
-            let (results, total_rows) =
-                resolve_results(&text, search_enabled, &state.entries, &state.recents);
+            let text = client.editor.text_owned();
+            let query_changed = text != last_query;
+            last_query = text;
+            let total_rows =
+                resolve_results(&text, search_enabled, &state.entries, &state.recents).1;
             current_results_len = total_rows;
 
-            // Reset selection if it's out of bounds
-            if state.selected >= total_rows && total_rows > 0 {
-                state.selected = total_rows - 1;
-            }
-            if total_rows == 0 {
+            // A new query is a new list. An index carried over from the previous
+            // one points at a row the user never scanned, and Enter would launch
+            // it. The bounds check covers the rest (a cursor move or a click
+            // leaves the query, and so the selection, alone).
+            if query_changed || state.selected >= total_rows {
                 state.selected = 0;
             }
 
-            // Resize window based on row count
-            let new_height = calculate_height(total_rows);
-            client.resize_surface(WINDOW_WIDTH, new_height)?;
-
-            // Redraw
-            draw_ui(
-                &mut client,
-                &text,
-                &state,
-                &results,
-                &font,
-                search_enabled,
-                cursor_visible,
-            );
-            client.render()?;
+            // The window grows and shrinks with the row count.
+            client.resize_surface(WINDOW_WIDTH, calculate_height(total_rows))?;
+            repaint(&mut client, &state, &font, search_enabled, cursor_visible)?;
         } else if selection_moved {
-            // The result-list selection moved. Repaint the highlight at the
-            // current caret phase, leaving the blink timer and window size as
-            // they are so the caret keeps blinking through navigation.
-            let text = client.input_text;
-            let (results, _) =
-                resolve_results(&text, search_enabled, &state.entries, &state.recents);
-            draw_ui(
-                &mut client,
-                &text,
-                &state,
-                &results,
-                &font,
-                search_enabled,
-                cursor_visible,
-            );
-            client.render()?;
+            // The highlight moved. The caret keeps its phase and the window its
+            // size, so navigation does not disturb the blink.
+            repaint(&mut client, &state, &font, search_enabled, cursor_visible)?;
         } else if last_blink.elapsed_ms() >= CURSOR_BLINK_MS {
-            // Idle: flip the caret and repaint. The row set is unchanged, so
-            // this recomputes the same results purely to composite the caret.
             cursor_visible = !cursor_visible;
             last_blink = Instant::now();
-
-            let text = client.input_text;
-            let (results, _) =
-                resolve_results(&text, search_enabled, &state.entries, &state.recents);
-            draw_ui(
-                &mut client,
-                &text,
-                &state,
-                &results,
-                &font,
-                search_enabled,
-                cursor_visible,
-            );
-            client.render()?;
+            repaint(&mut client, &state, &font, search_enabled, cursor_visible)?;
         }
     }
 
     // Check if we should launch something
     if client.pending_action == PendingAction::Launch {
-        match parse_action(&client.input_text, search_enabled) {
+        match parse_action(client.editor.text(), search_enabled) {
             InputAction::Search(q) if !q.is_empty() => {
                 if let Some(url) = &cfg.search_url {
                     if let Err(e) = launch::launch_search(url, q) {
@@ -445,6 +493,33 @@ pub(crate) fn run() -> Result<()> {
     Ok(())
 }
 
+/// Draw the current state into the next frame and show it.
+///
+/// The result list borrows the catalog, so it is built inside the draw and
+/// dropped with it; nothing holds that borrow across the event loop, where the
+/// state is mutated.
+fn repaint(
+    client: &mut Client,
+    state: &AppState,
+    font: &font::Font,
+    search_enabled: bool,
+    cursor_visible: bool,
+) -> Result<()> {
+    let text = client.editor.text_owned();
+    client.render(|client| {
+        let (results, _) = resolve_results(&text, search_enabled, &state.entries, &state.recents);
+        draw_ui(
+            client,
+            &text,
+            state,
+            &results,
+            font,
+            search_enabled,
+            cursor_visible,
+        );
+    })
+}
+
 /// Process pointer events and translate to cursor/selection changes.
 fn handle_pointer_input(client: &mut Client, font: &font::Font) {
     let px = client.pointer.x;
@@ -459,7 +534,7 @@ fn handle_pointer_input(client: &mut Client, font: &font::Font) {
     if client.pointer.clicked && in_input_box {
         let text_offset_px = (px - ui::TEXT_X as f64).max(0.0) as f32;
         let char_offset =
-            font.char_offset_at_x(&client.input_text, text_offset_px, font::INPUT_SIZE);
+            font.char_offset_at_x(client.editor.text(), text_offset_px, font::INPUT_SIZE);
         client.handle_pointer_click(char_offset);
     } else if client.pointer.clicked {
         // Click outside input box: clear click flag
@@ -469,7 +544,7 @@ fn handle_pointer_input(client: &mut Client, font: &font::Font) {
     if client.pointer.dragging && in_input_box {
         let text_offset_px = (px - ui::TEXT_X as f64).max(0.0) as f32;
         let char_offset =
-            font.char_offset_at_x(&client.input_text, text_offset_px, font::INPUT_SIZE);
+            font.char_offset_at_x(client.editor.text(), text_offset_px, font::INPUT_SIZE);
         client.handle_pointer_drag(char_offset);
     } else if client.pointer.dragging {
         client.pointer.dragging = false;
@@ -503,5 +578,125 @@ fn resolve_results<'a>(
         InputAction::Search(q) | InputAction::OpenUrl(q) => {
             (arena::ArrayVec::new(), if q.is_empty() { 0 } else { 1 })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entries(names: &[(&str, &str)]) -> desktop::Catalog {
+        let mut out = desktop::Catalog::new();
+        for (name, exec) in names {
+            let _ = out.push(DesktopEntry::new(name, exec, "").expect("entry"));
+        }
+        out
+    }
+
+    fn norm(url: &str) -> String {
+        let mut out: arena::ArrayString<URL_CAP> = arena::ArrayString::new();
+        normalize_url(url, &mut out);
+        out.as_str().to_string()
+    }
+
+    /// The editing keys and the modifiers are layout-independent, so these read
+    /// the same with no keymap loaded, which is the launcher's startup state.
+    #[test]
+    fn the_editing_keys_are_read_off_the_physical_keycode() {
+        let xkb = Xkb::new().expect("xkb context");
+        assert_eq!(key_action(&xkb, keycode::KEY_ENTER), KeyAction::Enter);
+        assert_eq!(key_action(&xkb, keycode::KEY_ESC), KeyAction::Escape);
+        assert_eq!(
+            key_action(&xkb, keycode::KEY_BACKSPACE),
+            KeyAction::Backspace
+        );
+        assert_eq!(key_action(&xkb, keycode::KEY_UP), KeyAction::Up);
+        assert_eq!(key_action(&xkb, keycode::KEY_HOME), KeyAction::Home);
+    }
+
+    #[test]
+    fn a_modifier_on_its_own_is_not_an_action() {
+        let xkb = Xkb::new().expect("xkb context");
+        for key in [
+            keycode::KEY_LEFTSHIFT,
+            keycode::KEY_LEFTCTRL,
+            keycode::KEY_CAPSLOCK,
+            keycode::KEY_LEFTALT,
+        ] {
+            assert_eq!(key_action(&xkb, key), KeyAction::None);
+        }
+    }
+
+    #[test]
+    fn a_letter_types_nothing_until_a_keymap_arrives() {
+        // Character input is the one thing that needs the layout.
+        let xkb = Xkb::new().expect("xkb context");
+        assert_eq!(key_action(&xkb, keycode::KEY_A), KeyAction::None);
+    }
+
+    #[test]
+    fn parse_action_reads_the_search_prefix_only_when_enabled() {
+        assert!(matches!(
+            parse_action("s: cats ", true),
+            InputAction::Search("cats")
+        ));
+        // Without a configured search URL the prefix is ordinary text.
+        assert!(matches!(
+            parse_action("s: cats ", false),
+            InputAction::AppSearch("s: cats ")
+        ));
+    }
+
+    #[test]
+    fn parse_action_reads_the_url_prefix_regardless_of_search() {
+        assert!(matches!(
+            parse_action("u: example.com ", false),
+            InputAction::OpenUrl("example.com")
+        ));
+    }
+
+    #[test]
+    fn parse_action_leaves_plain_input_untrimmed() {
+        // The app query is passed through as typed: a trailing space is part of
+        // what the user is searching for.
+        assert!(matches!(
+            parse_action(" fire ", true),
+            InputAction::AppSearch(" fire ")
+        ));
+    }
+
+    #[test]
+    fn normalize_url_adds_a_scheme_only_when_missing() {
+        assert_eq!(norm("example.com"), "https://example.com");
+        assert_eq!(norm("http://example.com"), "http://example.com");
+        assert_eq!(norm("file:///tmp/x"), "file:///tmp/x");
+    }
+
+    #[test]
+    fn resolve_results_caps_rows_at_what_the_list_shows() {
+        // More matches than the UI paints: the row count stops at MAX_RESULTS so
+        // selection cannot land on a row the user never sees.
+        let names: Vec<(String, String)> = (0..MAX_RESULTS + 5)
+            .map(|i| (format!("App{}", i), "app".to_string()))
+            .collect();
+        let refs: Vec<(&str, &str)> = names
+            .iter()
+            .map(|(n, e)| (n.as_str(), e.as_str()))
+            .collect();
+        let catalog = entries(&refs);
+        let (results, rows) = resolve_results("app", true, &catalog, &[]);
+        assert!(results.len() > MAX_RESULTS);
+        assert_eq!(rows, MAX_RESULTS);
+    }
+
+    #[test]
+    fn resolve_results_counts_one_row_for_a_non_empty_url() {
+        let catalog = entries(&[("Firefox", "firefox")]);
+        let (results, rows) = resolve_results("u:example.com", true, &catalog, &[]);
+        assert!(results.is_empty());
+        assert_eq!(rows, 1);
+        // An empty target has nothing to launch, so it offers no row.
+        let (_, rows) = resolve_results("u:", true, &catalog, &[]);
+        assert_eq!(rows, 0);
     }
 }

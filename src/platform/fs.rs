@@ -7,15 +7,16 @@
 
 #![allow(dead_code)]
 
-use crate::arena::{ArrayString, ArrayVec};
-use crate::error::{Error, Result};
-use crate::syscall::{
+use crate::platform::arena::{ArrayString, ArrayVec};
+use crate::platform::bytes;
+use crate::platform::error::{elog, Error, Result};
+use crate::platform::syscall::{
     self, linux_dirent64, stat, Fd, RawFd, AT_FDCWD, AT_SYMLINK_NOFOLLOW, EEXIST, EINTR, O_CREAT,
     O_DIRECTORY, O_RDONLY, O_TRUNC, O_WRONLY, S_IFDIR, S_IFMT,
 };
 
 /// Longest path the helpers handle.
-pub const PATH_CAP: usize = crate::syscall::PATH_CAP;
+pub const PATH_CAP: usize = crate::platform::syscall::PATH_CAP;
 
 /// Build a checked C path for the path syscalls, or an error if it does not fit
 /// or holds an interior NUL.
@@ -208,8 +209,19 @@ impl ReadDir {
             let name_start = self.pos + DIRENT_NAME_OFFSET;
             let name_end = self.pos + reclen;
             let raw = &self.buf[name_start..name_end];
-            let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-            let name = core::str::from_utf8(&raw[..nul]).unwrap_or("");
+            // The name is NUL-terminated and padded out to the record length.
+            let nul = bytes::find_byte(raw, 0).unwrap_or(raw.len());
+            // Linux filenames are bytes, not text. One that is not UTF-8 has no
+            // str to hand the callback, so it is skipped; say so, since an app
+            // silently missing from the results is otherwise a mystery.
+            let name = match core::str::from_utf8(&raw[..nul]) {
+                Ok(name) => name,
+                Err(_) => {
+                    elog!("bnklaunch: skipping directory entry with a non-UTF-8 name");
+                    self.pos += reclen;
+                    continue;
+                }
+            };
 
             self.pos += reclen;
 

@@ -5,9 +5,9 @@
 //! # comments are ignored, and unknown fields are tolerated for forward-compat.
 //! A field may repeat: hidden takes one app name per line and they accumulate.
 
-use crate::arena::{ArrayString, ArrayVec};
 use crate::desktop::NAME_CAP;
-use crate::{env, fs};
+use crate::platform::arena::{ArrayString, ArrayVec};
+use crate::platform::{env, fs};
 
 const FILENAME: &str = "config";
 
@@ -18,6 +18,13 @@ const CONFIG_MAX: usize = 16 * 1024;
 pub const URL_CAP: usize = 512;
 /// Most hidden app names the config holds.
 pub const MAX_DENY: usize = 64;
+
+/// Result rows drawn under the input. The window grows and shrinks with the
+/// number of rows, up to this many.
+pub const MAX_RESULTS: usize = 5;
+
+/// Width of the launcher window in pixels.
+pub const WINDOW_WIDTH: u32 = 800;
 
 /// Parsed configuration. A field absent from the file keeps its default.
 #[derive(Debug, Default, PartialEq, Eq)]

@@ -7,7 +7,7 @@
 
 #![allow(dead_code)]
 
-use crate::syscall::EAGAIN;
+use crate::platform::syscall::EAGAIN;
 
 /// An OS error (a positive errno) or a static message. Exactly one is set.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -55,13 +55,19 @@ pub type Result<T> = core::result::Result<T, Error>;
 /// Write a formatted line to stderr without std, the no_std stand-in for
 /// eprintln. The message is formatted into a fixed buffer (truncated past its
 /// capacity) and a newline is appended.
-#[macro_export]
+///
+/// Exported through the module rather than with macro_export, which would hoist
+/// it to the crate root and leave platform code naming crate::elog: a reference
+/// out of the layer, and one the boundary test rightly rejects.
 macro_rules! elog {
     ($($arg:tt)*) => {{
         use core::fmt::Write as _;
-        let mut buf: $crate::arena::ArrayString<256> = $crate::arena::ArrayString::new();
+        let mut buf: $crate::platform::arena::ArrayString<256> =
+            $crate::platform::arena::ArrayString::new();
         let _ = write!(buf, $($arg)*);
         let _ = buf.push('\n');
-        $crate::syscall::write_fd(2, buf.as_bytes());
+        $crate::platform::syscall::write_fd(2, buf.as_bytes());
     }};
 }
+
+pub(crate) use elog;

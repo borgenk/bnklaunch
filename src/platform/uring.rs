@@ -22,14 +22,13 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::syscall::{
-    self, io_uring_cqe, io_uring_params, io_uring_sqe, kernel_timespec, IORING_ENTER_GETEVENTS,
-    IORING_FEAT_SINGLE_MMAP, IORING_OFF_CQ_RING, IORING_OFF_SQES, IORING_OFF_SQ_RING,
-    IORING_OP_CLOSE, IORING_OP_NOP, IORING_OP_OPENAT, IORING_OP_POLL_ADD, IORING_OP_READ,
-    IORING_OP_TIMEOUT, IOSQE_IO_LINK, MAP_POPULATE, MAP_SHARED, PROT_READ, PROT_WRITE,
+use crate::platform::syscall::{
+    self, io_uring_cqe, io_uring_params, io_uring_sqe, kernel_timespec, RawFd,
+    IORING_ENTER_GETEVENTS, IORING_FEAT_SINGLE_MMAP, IORING_OFF_CQ_RING, IORING_OFF_SQES,
+    IORING_OFF_SQ_RING, IORING_OP_CLOSE, IORING_OP_NOP, IORING_OP_OPENAT, IORING_OP_POLL_ADD,
+    IORING_OP_READ, IORING_OP_TIMEOUT, IOSQE_IO_LINK, MAP_POPULATE, MAP_SHARED, PROT_READ,
+    PROT_WRITE,
 };
-
-type RawFd = i32;
 
 /// An io_uring instance with its mapped rings.
 pub struct Ring {
@@ -69,6 +68,18 @@ impl Ring {
         let fd = syscall::io_uring_setup(entries, &mut params);
         if fd < 0 {
             return Err(-fd);
+        }
+
+        // io_uring_setup takes no open flags, so close-on-exec is set here.
+        // Without it the ring fd rides through fork/exec into every launched
+        // application, which keeps the ring's mappings pinned for as long as
+        // that application runs.
+        let r = syscall::fcntl(fd, syscall::F_SETFD, syscall::FD_CLOEXEC);
+        if r < 0 {
+            // SAFETY: fd is the ring just created, closed once on this error
+            // path before any mapping exists or the Ring is built.
+            unsafe { syscall::close(fd) };
+            return Err(-r);
         }
 
         let sq_ring_bytes =
@@ -280,11 +291,20 @@ impl Ring {
         Ok(())
     }
 
-    /// Arm a single relative timer that fires once after ts. ts must outlive the
-    /// op (the kernel reads it asynchronously); keep it in long-lived state. The
-    /// caller re-arms after each fire. A one-shot timeout works on every
-    /// io_uring kernel, unlike multishot timeout (which needs 6.4+).
-    pub fn prep_timeout(&mut self, ts: *const kernel_timespec, user_data: u64) -> Result<(), ()> {
+    /// Arm a single relative timer that fires once after ts. The caller re-arms
+    /// after each fire. A one-shot timeout works on every io_uring kernel,
+    /// unlike multishot timeout (which needs 6.4+).
+    ///
+    /// # Safety
+    ///
+    /// ts is handed to the kernel, which reads it after submit and outside this
+    /// call. It must stay valid and unmoved until the op completes, so it has to
+    /// live somewhere longer-lived than the frame that submits it.
+    pub unsafe fn prep_timeout(
+        &mut self,
+        ts: *const kernel_timespec,
+        user_data: u64,
+    ) -> Result<(), ()> {
         let sqe = self.get_sqe().ok_or(())?;
         sqe.opcode = IORING_OP_TIMEOUT;
         sqe.addr = ts as u64;
@@ -293,10 +313,15 @@ impl Ring {
         Ok(())
     }
 
-    /// Open a path relative to dirfd. The path bytes must outlive the op. When
-    /// link is set, the next prepared entry only runs if this open succeeds,
-    /// which is how an open/read/close chain is built.
-    pub fn prep_openat(
+    /// Open a path relative to dirfd. When link is set, the next prepared entry
+    /// only runs if this open succeeds, which is how an open/read/close chain is
+    /// built.
+    ///
+    /// # Safety
+    ///
+    /// The kernel reads the NUL-terminated path after submit and outside this
+    /// call, so the bytes must stay valid and unmoved until the op completes.
+    pub unsafe fn prep_openat(
         &mut self,
         dirfd: RawFd,
         path: *const u8,
@@ -318,9 +343,16 @@ impl Ring {
         Ok(())
     }
 
-    /// Read up to len bytes from fd at the given offset into buf. buf must
-    /// outlive the op. Pass offset 0 (or the actual offset) for regular files.
-    pub fn prep_read(
+    /// Read up to len bytes from fd at the given offset into buf. Pass offset 0
+    /// (or the actual offset) for regular files.
+    ///
+    /// # Safety
+    ///
+    /// The kernel writes through buf after submit and outside this call. It must
+    /// point at len writable bytes that stay valid and unmoved until the op
+    /// completes: a stack buffer that goes out of scope first is memory
+    /// corruption the caller cannot see.
+    pub unsafe fn prep_read(
         &mut self,
         fd: RawFd,
         buf: *mut u8,
@@ -395,30 +427,30 @@ mod tests {
             Err(_) => return,
         };
         let mut fds = [0i32; 2];
-        if crate::syscall::pipe2(&mut fds, 0) != 0 {
+        if crate::platform::syscall::pipe2(&mut fds, 0) != 0 {
             return;
         }
         let (rd, wr) = (fds[0], fds[1]);
         let byte = [7u8];
-        let _ = crate::syscall::write_fd(wr, &byte);
+        let _ = crate::platform::syscall::write_fd(wr, &byte);
 
         assert_eq!(
-            ring.prep_poll_add(rd, crate::syscall::POLLIN as u32, 42),
+            ring.prep_poll_add(rd, crate::platform::syscall::POLLIN as u32, 42),
             Ok(())
         );
         ring.submit_and_wait(1).expect("enter");
         let cqe = ring.next_cqe().expect("poll completion");
         assert_eq!(cqe.user_data, 42);
         assert!(
-            cqe.res > 0 && cqe.res as u32 & crate::syscall::POLLIN as u32 != 0,
+            cqe.res > 0 && cqe.res as u32 & crate::platform::syscall::POLLIN as u32 != 0,
             "POLLIN should be set, got {}",
             cqe.res
         );
 
         // SAFETY: both fds are live and closed once here.
         unsafe {
-            crate::syscall::close(rd);
-            crate::syscall::close(wr);
+            crate::platform::syscall::close(rd);
+            crate::platform::syscall::close(wr);
         }
     }
 
@@ -442,14 +474,18 @@ mod tests {
             .expect("utf8 path");
         cpath.push('\0');
 
-        ring.prep_openat(
-            crate::syscall::AT_FDCWD,
-            cpath.as_ptr(),
-            crate::syscall::O_RDONLY,
-            0,
-            1,
-            false,
-        )
+        // SAFETY: cpath lives until the end of this test, past the completion
+        // of the open op below.
+        unsafe {
+            ring.prep_openat(
+                crate::platform::syscall::AT_FDCWD,
+                cpath.as_ptr(),
+                crate::platform::syscall::O_RDONLY,
+                0,
+                1,
+                false,
+            )
+        }
         .expect("queue openat");
         ring.submit_and_wait(1).expect("enter");
         let open = ring.next_cqe().expect("openat completion");
@@ -458,7 +494,9 @@ mod tests {
         let fd = open.res;
 
         let mut buf = [0u8; 64];
-        ring.prep_read(fd, buf.as_mut_ptr(), buf.len() as u32, 0, 2)
+        // SAFETY: buf outlives the read op, which is waited on below before the
+        // buffer is read or dropped.
+        unsafe { ring.prep_read(fd, buf.as_mut_ptr(), buf.len() as u32, 0, 2) }
             .expect("queue read");
         ring.submit_and_wait(1).expect("enter");
         let read = ring.next_cqe().expect("read completion");
@@ -486,7 +524,8 @@ mod tests {
             tv_sec: 0,
             tv_nsec: 2_000_000,
         };
-        if ring.prep_timeout(&ts, 7).is_err() || ring.submit_and_wait(1).is_err() {
+        // SAFETY: ts outlives the timeout op, which is waited on below.
+        if unsafe { ring.prep_timeout(&ts, 7) }.is_err() || ring.submit_and_wait(1).is_err() {
             return;
         }
         if let Some(cqe) = ring.next_cqe() {

@@ -3,9 +3,9 @@
 //! Parses freedesktop.org desktop entry files to discover installed applications.
 //! See: https://specifications.freedesktop.org/desktop-entry-spec/latest/
 
-use crate::arena::{ArrayString, ArrayVec};
-use crate::syscall::{DT_DIR, DT_LNK, DT_REG};
-use crate::{env, fs};
+use crate::platform::arena::{ArrayString, ArrayVec};
+use crate::platform::syscall::{DT_DIR, DT_LNK, DT_REG};
+use crate::platform::{env, fs};
 
 /// Most XDG data directories scanned for applications.
 const MAX_DATA_DIRS: usize = 16;
@@ -38,8 +38,11 @@ pub const NAME_CAP: usize = 256;
 pub const EXEC_CAP: usize = 1024;
 /// Byte capacity of an entry's icon name (empty means no icon).
 pub const ICON_CAP: usize = 64;
-/// Byte capacity of one tokenized Exec argument.
-pub const ARG_CAP: usize = 384;
+/// Byte capacity of one tokenized Exec argument. Tokenizing only ever removes
+/// characters from the Exec value, so an argument cannot outgrow the value it
+/// came from: matching EXEC_CAP here makes a truncated argument impossible
+/// rather than merely unlikely.
+pub const ARG_CAP: usize = EXEC_CAP;
 /// Most arguments a tokenized Exec value yields.
 pub const MAX_ARGS: usize = 32;
 /// Byte capacity of the rendered command-line subtitle under a result.
@@ -179,7 +182,17 @@ impl DesktopEntry {
         }
 
         // Name and Exec are required; the raw Exec is tokenized at launch time.
-        Self::new(name?, exec?, icon)
+        // All three are string-typed keys, so their escape sequences resolve
+        // here, before anything reads the value.
+        let mut e = DesktopEntry {
+            name: ArrayString::new(),
+            exec: ArrayString::new(),
+            icon: ArrayString::new(),
+        };
+        unescape_into(&mut e.name, name?).ok()?;
+        unescape_into(&mut e.exec, exec?).ok()?;
+        unescape_into(&mut e.icon, icon).ok()?;
+        Some(e)
     }
 
     /// Check if this entry matches a search query (case-insensitive substring
@@ -221,6 +234,37 @@ impl DesktopEntry {
     }
 }
 
+/// Copy a Desktop Entry string value into out with its escape sequences
+/// resolved: \s is a space, \n a newline, \t a tab, \r a carriage return, and
+/// \\ a single backslash. Any other escape is kept as written.
+///
+/// The spec applies these before the Exec quoting rules, so \\ has to collapse
+/// here: leave it, and the tokenizer reads two backslashes where the file meant
+/// one. Err when the value does not fit, which drops the entry rather than
+/// storing a truncated command.
+fn unescape_into<const N: usize>(out: &mut ArrayString<N>, s: &str) -> Result<(), ()> {
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c)?;
+            continue;
+        }
+        match chars.next() {
+            Some('s') => out.push(' ')?,
+            Some('n') => out.push('\n')?,
+            Some('t') => out.push('\t')?,
+            Some('r') => out.push('\r')?,
+            Some('\\') => out.push('\\')?,
+            Some(other) => {
+                out.push('\\')?;
+                out.push(other)?;
+            }
+            None => out.push('\\')?,
+        }
+    }
+    Ok(())
+}
+
 /// Append the lowercase of s to out, dropping anything past out's capacity.
 /// Used to build a comparison key without allocating; a truncated key only
 /// affects matching for pathologically long names.
@@ -236,8 +280,9 @@ fn push_lower<const N: usize>(out: &mut ArrayString<N>, s: &str) {
 
 /// Tokenize an Exec value per the Desktop Entry spec and call emit once per
 /// argument. The shared tokenizer behind exec_argv and exec_subtitle; the
-/// quoting and field-code rules live here.
-fn for_each_exec_arg(exec: &str, mut emit: impl FnMut(&str)) {
+/// quoting and field-code rules live here. Err means the value did not fit: an
+/// argument overran ARG_CAP, or emit rejected one.
+fn for_each_exec_arg(exec: &str, mut emit: impl FnMut(&str) -> Result<(), ()>) -> Result<(), ()> {
     let mut cur: ArrayString<ARG_CAP> = ArrayString::new();
     let mut has_arg = false;
     let mut chars = exec.chars().peekable();
@@ -246,7 +291,7 @@ fn for_each_exec_arg(exec: &str, mut emit: impl FnMut(&str)) {
         match ch {
             ' ' | '\t' => {
                 if has_arg {
-                    emit(cur.as_str());
+                    emit(cur.as_str())?;
                     cur.clear();
                     has_arg = false;
                 }
@@ -258,36 +303,41 @@ fn for_each_exec_arg(exec: &str, mut emit: impl FnMut(&str)) {
                         '"' => break,
                         '\\' => match chars.peek() {
                             Some(&next @ ('"' | '`' | '$' | '\\')) => {
-                                let _ = cur.push(next);
+                                cur.push(next)?;
                                 chars.next();
                             }
-                            _ => {
-                                let _ = cur.push('\\');
-                            }
+                            _ => cur.push('\\')?,
                         },
-                        other => {
-                            let _ = cur.push(other);
-                        }
+                        other => cur.push(other)?,
                     }
                 }
             }
-            '%' => {
-                // %% is a literal percent; other field codes expand to nothing.
-                // A bare code leaves has_arg unset, so it emits no argument.
-                if let Some('%') = chars.next() {
-                    let _ = cur.push('%');
+            '%' => match chars.peek() {
+                // %% is a literal percent sign.
+                Some('%') => {
+                    chars.next();
+                    cur.push('%')?;
                     has_arg = true;
                 }
-            }
+                // Every other field code (%f, %U, %i, ...) expands to nothing:
+                // the launcher has no file or URL to substitute. Only the code
+                // letter is consumed, so a lone % standing before a separator
+                // cannot swallow it and glue two arguments into one.
+                Some(&next) if next != ' ' && next != '\t' => {
+                    chars.next();
+                }
+                _ => {}
+            },
             other => {
-                let _ = cur.push(other);
+                cur.push(other)?;
                 has_arg = true;
             }
         }
     }
     if has_arg {
-        emit(cur.as_str());
+        emit(cur.as_str())?;
     }
+    Ok(())
 }
 
 /// Tokenize an Exec value into an argument vector per the Desktop Entry spec
@@ -295,28 +345,31 @@ fn for_each_exec_arg(exec: &str, mut emit: impl FnMut(&str)) {
 /// four reserved characters inside them; %% becomes a literal %, and the field
 /// codes (%f, %U, %i, ...) are dropped since the launcher has no file or URL
 /// to substitute. The result is exec'd directly, never through a shell, so
-/// shell metacharacters in a .desktop file are inert. Arguments past the buffer
-/// capacity are dropped.
-pub fn exec_argv(exec: &str, out: &mut ArrayVec<ArrayString<ARG_CAP>, MAX_ARGS>) {
+/// shell metacharacters in a .desktop file are inert.
+///
+/// Err when the value yields more arguments than MAX_ARGS. A truncated argv
+/// would exec a mangled command line, so the caller refuses the launch instead.
+pub fn exec_argv(exec: &str, out: &mut ArrayVec<ArrayString<ARG_CAP>, MAX_ARGS>) -> Result<(), ()> {
     out.clear();
     for_each_exec_arg(exec, |arg| {
         let mut s: ArrayString<ARG_CAP> = ArrayString::new();
-        let _ = s.push_str(arg);
-        let _ = out.push(s);
-    });
+        s.push_str(arg)?;
+        out.push(s).map_err(|_| ())
+    })
 }
 
 /// Render the tokenized Exec value as a single space-joined line for the result
-/// subtitle, with field codes already dropped.
+/// subtitle, with field codes already dropped. The subtitle is cosmetic, so a
+/// command line longer than the line renders as much as fits and stops.
 pub fn exec_subtitle(exec: &str, out: &mut ArrayString<SUBTITLE_CAP>) {
     out.clear();
     let mut first = true;
-    for_each_exec_arg(exec, |arg| {
+    let _ = for_each_exec_arg(exec, |arg| {
         if !first {
-            let _ = out.push(' ');
+            out.push(' ')?;
         }
         first = false;
-        let _ = out.push_str(arg);
+        out.push_str(arg)
     });
 }
 
@@ -402,23 +455,28 @@ fn desktop_id(root: &str, path: &str) -> Option<ArrayString<ID_CAP>> {
 fn get_data_dirs(out: &mut ArrayVec<ScanPath, MAX_DATA_DIRS>) {
     out.clear();
 
-    // User data dir (highest priority).
-    if let Some(home) = env::var("HOME") {
-        let mut dir = ScanPath::new();
-        let ok = match env::var("XDG_DATA_HOME") {
-            Some(xdg) => dir.push_str(xdg).is_ok(),
-            None => dir
+    // User data dir (highest priority). XDG_DATA_HOME stands on its own; HOME
+    // only supplies the base for the default when it is unset or empty, so a
+    // session that sets XDG_DATA_HOME without HOME still resolves.
+    let mut dir = ScanPath::new();
+    let ok = match env::var("XDG_DATA_HOME").filter(|s| !s.is_empty()) {
+        Some(xdg) => dir.push_str(xdg).is_ok(),
+        None => match env::var("HOME") {
+            Some(home) => dir
                 .push_str(home)
                 .and_then(|_| dir.push_str("/.local/share"))
                 .is_ok(),
-        };
-        if ok {
-            let _ = out.push(dir);
-        }
+            None => false,
+        },
+    };
+    if ok {
+        let _ = out.push(dir);
     }
 
-    // System data dirs.
-    let system_dirs = env::var("XDG_DATA_DIRS").unwrap_or("/usr/local/share:/usr/share");
+    // System data dirs. Unset and empty both mean the spec's default.
+    let system_dirs = env::var("XDG_DATA_DIRS")
+        .filter(|s| !s.is_empty())
+        .unwrap_or("/usr/local/share:/usr/share");
     for dir in system_dirs.split(':') {
         if dir.is_empty() {
             continue;
@@ -595,7 +653,7 @@ Exec=myapp --new
     /// Collect the tokenized arguments as owned strings for comparison.
     fn argv(exec: &str) -> Vec<String> {
         let mut out: ArrayVec<ArrayString<ARG_CAP>, MAX_ARGS> = ArrayVec::new();
-        exec_argv(exec, &mut out);
+        exec_argv(exec, &mut out).expect("tokenize");
         out.iter().map(|a| a.as_str().to_string()).collect()
     }
 
@@ -625,6 +683,72 @@ Exec=myapp --new
     #[test]
     fn exec_argv_double_percent_is_literal() {
         assert_eq!(argv("printf 100%%"), ["printf", "100%"]);
+    }
+
+    #[test]
+    fn exec_argv_lone_percent_does_not_eat_the_separator() {
+        // The % is a stray field code with no letter. Consuming the space after
+        // it would glue the next argument onto this one.
+        assert_eq!(argv("app % --flag"), ["app", "--flag"]);
+        assert_eq!(argv("app %"), ["app"]);
+        assert_eq!(argv("app %\tsecond"), ["app", "second"]);
+    }
+
+    #[test]
+    fn exec_argv_unterminated_quote_takes_the_rest() {
+        assert_eq!(argv(r#"prog "one arg"#), ["prog", "one arg"]);
+    }
+
+    #[test]
+    fn exec_argv_rejects_too_many_arguments() {
+        let mut exec = String::from("app");
+        for i in 0..MAX_ARGS {
+            exec.push_str(&format!(" --flag{}", i));
+        }
+        let mut out: ArrayVec<ArrayString<ARG_CAP>, MAX_ARGS> = ArrayVec::new();
+        // MAX_ARGS + 1 tokens: refused, not trimmed to the first MAX_ARGS.
+        assert!(exec_argv(&exec, &mut out).is_err());
+    }
+
+    #[test]
+    fn exec_argv_takes_exactly_max_args() {
+        let mut exec = String::from("app");
+        for i in 0..MAX_ARGS - 1 {
+            exec.push_str(&format!(" --flag{}", i));
+        }
+        let mut out: ArrayVec<ArrayString<ARG_CAP>, MAX_ARGS> = ArrayVec::new();
+        assert!(exec_argv(&exec, &mut out).is_ok());
+        assert_eq!(out.len(), MAX_ARGS);
+    }
+
+    #[test]
+    fn exec_argv_holds_an_argument_as_long_as_the_exec_value() {
+        // An argument cannot outgrow the Exec value it is tokenized from, so a
+        // full-capacity single argument still round-trips whole.
+        let long = "x".repeat(EXEC_CAP);
+        assert_eq!(argv(&long), [long]);
+    }
+
+    #[test]
+    fn parse_resolves_string_escapes() {
+        let content = "[Desktop Entry]\n\
+                       Type=Application\n\
+                       Name=My\\sApp\n\
+                       Exec=prog --title=a\\\\b\n";
+        let entry = DesktopEntry::parse(content).expect("entry");
+        assert_eq!(entry.name, "My App");
+        // The \\ collapses to one backslash before the Exec quoting rules run.
+        assert_eq!(entry.exec, r"prog --title=a\b");
+    }
+
+    #[test]
+    fn parse_keeps_unknown_escapes_as_written() {
+        let content = "[Desktop Entry]\n\
+                       Type=Application\n\
+                       Name=A\\qB\n\
+                       Exec=prog\n";
+        let entry = DesktopEntry::parse(content).expect("entry");
+        assert_eq!(entry.name, r"A\qB");
     }
 
     #[test]

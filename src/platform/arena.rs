@@ -2,9 +2,8 @@
 //!
 //! Everything here stores its elements inline in a const-sized array, so the
 //! whole program runs without an allocator. ArrayVec and ArrayString stand in
-//! for Vec and String; Arena packs many small strings into one byte buffer and
-//! hands back compact spans into it, which is how the desktop catalog avoids a
-//! separate String per field.
+//! for Vec and String, and every write that would exceed the capacity is
+//! reported instead of growing.
 
 #![allow(dead_code)]
 
@@ -312,10 +311,17 @@ impl<const N: usize> ArrayString<N> {
         Some(c)
     }
 
-    pub fn truncate(&mut self, byte_len: usize) {
-        if byte_len < self.len && self.as_str().is_char_boundary(byte_len) {
-            self.len = byte_len;
+    /// Shorten to byte_len bytes (a char boundary). Err and no change when
+    /// byte_len is not a boundary; a byte_len past the end is a no-op.
+    pub fn truncate(&mut self, byte_len: usize) -> Result<(), ()> {
+        if byte_len >= self.len {
+            return Ok(());
         }
+        if !self.as_str().is_char_boundary(byte_len) {
+            return Err(());
+        }
+        self.len = byte_len;
+        Ok(())
     }
 
     /// Insert a string slice at byte index idx (a char boundary), shifting the
@@ -353,13 +359,21 @@ impl<const N: usize> ArrayString<N> {
         Some(ch)
     }
 
-    /// Delete the byte range [start, end), shifting the rest left. The bounds
-    /// must be char boundaries within the string.
-    pub fn delete_range(&mut self, start: usize, end: usize) {
-        if start <= end && end <= self.len {
-            self.buf.copy_within(end..self.len, start);
-            self.len -= end - start;
+    /// Delete the byte range [start, end), shifting the rest left. Err and no
+    /// change unless both bounds are char boundaries within the string: a
+    /// partial delete would leave a lone continuation byte, and as_str would
+    /// then hand out bytes that are not UTF-8.
+    pub fn delete_range(&mut self, start: usize, end: usize) -> Result<(), ()> {
+        if start > end || end > self.len {
+            return Err(());
         }
+        let s = self.as_str();
+        if !s.is_char_boundary(start) || !s.is_char_boundary(end) {
+            return Err(());
+        }
+        self.buf.copy_within(end..self.len, start);
+        self.len -= end - start;
+        Ok(())
     }
 }
 
@@ -411,72 +425,6 @@ impl<const N: usize> fmt::Debug for ArrayString<N> {
 impl<const N: usize> fmt::Display for ArrayString<N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-/// A compact slice into an Arena: a byte offset and length.
-///
-/// Stored on entries instead of an owned string, so the catalog is a flat
-/// array of fixed-size records pointing into one shared byte buffer.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub struct Span {
-    pub off: u32,
-    pub len: u32,
-}
-
-/// A bump buffer that packs many strings back to back.
-///
-/// push_str copies the bytes in and returns a Span; get resolves a Span back to
-/// the str. There is no per-string free; clear resets the whole buffer at once,
-/// which suits rebuild-from-scratch passes like a desktop rescan.
-pub struct Arena<const N: usize> {
-    buf: [u8; N],
-    len: usize,
-}
-
-impl<const N: usize> Arena<N> {
-    pub const fn new() -> Self {
-        Self {
-            buf: [0; N],
-            len: 0,
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.len = 0;
-    }
-
-    pub const fn used(&self) -> usize {
-        self.len
-    }
-
-    /// Copy a string in and return its span. None when the buffer is full.
-    pub fn push_str(&mut self, s: &str) -> Option<Span> {
-        let bytes = s.as_bytes();
-        if self.len + bytes.len() > N {
-            return None;
-        }
-        let off = self.len as u32;
-        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
-        self.len += bytes.len();
-        Some(Span {
-            off,
-            len: bytes.len() as u32,
-        })
-    }
-
-    pub fn get(&self, span: Span) -> &str {
-        let start = span.off as usize;
-        let end = start + span.len as usize;
-        // SAFETY: spans are only minted by push_str, which copies valid UTF-8
-        // and never hands out a range past the bytes it wrote.
-        unsafe { core::str::from_utf8_unchecked(&self.buf[start..end]) }
-    }
-}
-
-impl<const N: usize> Default for Arena<N> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -587,8 +535,41 @@ mod tests {
         assert_eq!(s.as_str(), "abcde");
         assert_eq!(s.remove(0), Some('a'));
         assert_eq!(s.as_str(), "bcde");
-        s.delete_range(1, 3);
+        assert_eq!(s.delete_range(1, 3), Ok(()));
         assert_eq!(s.as_str(), "be");
+    }
+
+    #[test]
+    fn array_string_delete_range_rejects_split_char() {
+        let mut s: ArrayString<16> = ArrayString::new();
+        let _ = s.push_str("aéb");
+        // 'é' occupies bytes 1..3, so 2 is inside it. Both bounds are checked.
+        assert_eq!(s.delete_range(1, 2), Err(()));
+        assert_eq!(s.delete_range(2, 3), Err(()));
+        assert_eq!(s.as_str(), "aéb");
+        assert_eq!(s.delete_range(1, 3), Ok(()));
+        assert_eq!(s.as_str(), "ab");
+    }
+
+    #[test]
+    fn array_string_delete_range_rejects_bad_bounds() {
+        let mut s: ArrayString<16> = ArrayString::new();
+        let _ = s.push_str("abc");
+        assert_eq!(s.delete_range(2, 1), Err(()));
+        assert_eq!(s.delete_range(0, 4), Err(()));
+        assert_eq!(s.as_str(), "abc");
+    }
+
+    #[test]
+    fn array_string_truncate_rejects_split_char() {
+        let mut s: ArrayString<16> = ArrayString::new();
+        let _ = s.push_str("aéb");
+        assert_eq!(s.truncate(2), Err(()));
+        assert_eq!(s.as_str(), "aéb");
+        assert_eq!(s.truncate(9), Ok(()));
+        assert_eq!(s.as_str(), "aéb");
+        assert_eq!(s.truncate(1), Ok(()));
+        assert_eq!(s.as_str(), "a");
     }
 
     #[test]
@@ -624,16 +605,5 @@ mod tests {
         let mut s: ArrayString<16> = ArrayString::new();
         let _ = write!(s, "{}-{}", 1, 2);
         assert_eq!(s.as_str(), "1-2");
-    }
-
-    #[test]
-    fn arena_packs_and_resolves_spans() {
-        let mut a: Arena<16> = Arena::new();
-        let first = a.push_str("foo").unwrap();
-        let second = a.push_str("barbar").unwrap();
-        assert_eq!(a.get(first), "foo");
-        assert_eq!(a.get(second), "barbar");
-        // 3 + 6 = 9 used, 7 left: this 8-byte push must fail.
-        assert!(a.push_str("douuuuugh").is_none());
     }
 }

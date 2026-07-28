@@ -6,8 +6,8 @@
 
 use core::ptr::NonNull;
 
-use crate::error::{Error, Result};
-use crate::syscall::{self as sys, Fd, RawFd};
+use crate::platform::error::{Error, Result};
+use crate::platform::syscall::{self as sys, Fd, RawFd};
 
 /// A memory-mapped buffer for pixel data.
 pub struct PixelBuffer {
@@ -152,9 +152,6 @@ impl Drop for PixelBuffer {
         }
     }
 }
-
-// SAFETY: The buffer is not accessed from multiple threads simultaneously
-unsafe impl Send for PixelBuffer {}
 
 /// Create an anonymous file using memfd_create. The name is a fixed program
 /// constant, checked into a CPath for the syscall.

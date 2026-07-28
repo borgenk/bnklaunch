@@ -1,25 +1,29 @@
 //! High-level Wayland client state machine.
 
-use crate::arena::{ArrayString, ArrayVec};
-use crate::clipboard;
-use crate::error::{Error, Result};
-use crate::time::Instant;
-use crate::wire::WIRE_STR_CAP;
+use crate::clipboard::{self, Clipboard};
+use crate::platform::arena::{ArrayString, ArrayVec};
+use crate::platform::error::{elog, Error, Result};
+use crate::platform::syscall;
+use crate::platform::time::Instant;
 
-use crate::protocol::layer_shell::{self, KeyboardInteractivity, Layer};
-use crate::protocol::{self, interface, ShmFormat};
+use crate::app::{key_action, KeyAction};
+use crate::editor::Editor;
+use crate::platform::conn::Connection;
+use crate::platform::protocol::{self as proto, KeyboardInteractivity};
+use crate::platform::wire::Arg;
+use crate::platform::wire::Message;
+use crate::platform::xkb::Xkb;
+use crate::present::{Present, MAX_SURFACE_DIM};
 use crate::shm::PixelBuffer;
-use crate::socket::{Message, WaylandSocket};
-use crate::xkb::{KeyAction, XkbState};
 
 /// Most recycled ids held at once.
 const MAX_IDS: usize = 256;
 /// Most globals the compositor advertises that we track.
 const MAX_GLOBALS: usize = 64;
-/// Most buffers retired (awaiting release) at once.
-const MAX_RETIRED: usize = 8;
-/// Capacity of the search input field.
-pub const INPUT_CAP: usize = 1024;
+/// Byte capacity of a stored interface name. The reader hands out a borrowed
+/// str, so this bounds only what a tracked global keeps, and every name it
+/// keeps is one of the five the launcher binds.
+const IFACE_CAP: usize = 64;
 
 /// Object ID allocator - starts at 2 since 1 is wl_display.
 pub struct IdAllocator {
@@ -57,7 +61,7 @@ impl IdAllocator {
 #[derive(Debug, Clone)]
 pub struct Global {
     pub name: u32,
-    pub interface: ArrayString<WIRE_STR_CAP>,
+    pub interface: ArrayString<IFACE_CAP>,
     pub version: u32,
 }
 
@@ -66,11 +70,11 @@ pub struct Global {
 /// globals; filtering at advertise time keeps that flood from pushing wl_seat
 /// or the layer shell past the bounded globals array and dropping it.
 fn is_bindable_interface(iface: &str) -> bool {
-    iface == interface::WL_COMPOSITOR
-        || iface == interface::WL_SHM
-        || iface == interface::WL_SEAT
-        || iface == interface::ZWLR_LAYER_SHELL_V1
-        || iface == interface::WL_DATA_DEVICE_MANAGER
+    iface == proto::IFACE_COMPOSITOR
+        || iface == proto::IFACE_SHM
+        || iface == proto::IFACE_SEAT
+        || iface == proto::IFACE_LAYER_SHELL
+        || iface == proto::IFACE_DATA_DEVICE_MANAGER
 }
 
 /// Bound object IDs for essential interfaces.
@@ -84,80 +88,12 @@ pub struct Bindings {
     pub data_device_manager: Option<u32>,
 }
 
-/// Text MIME types accepted from the clipboard, ordered worst to best so the
-/// derived Ord picks the richest one advertised.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum TextMime {
-    Plain,
-    Utf8,
-}
-
-impl TextMime {
-    fn as_str(self) -> &'static str {
-        match self {
-            TextMime::Plain => "text/plain",
-            TextMime::Utf8 => "text/plain;charset=utf-8",
-        }
-    }
-
-    /// Map an advertised MIME string to one we accept, if any.
-    fn from_mime(s: &str) -> Option<TextMime> {
-        match s {
-            "text/plain;charset=utf-8" => Some(TextMime::Utf8),
-            "text/plain" => Some(TextMime::Plain),
-            _ => None,
-        }
-    }
-}
-
-/// Clipboard state for the core wl_data_device protocol.
-pub struct ClipboardState {
-    /// Data device ID (per-seat clipboard access)
-    pub device_id: Option<u32>,
-    /// Active data source ID we own, for serving copy requests
-    pub source_id: Option<u32>,
-    /// Text offered through the data source we own
-    pub source_text: Option<ArrayString<INPUT_CAP>>,
-    /// Offer the compositor is describing with offer() events, before it marks
-    /// the offer as the selection.
-    pub pending_offer: Option<u32>,
-    /// Best text MIME seen on the pending offer so far.
-    pub pending_mime: Option<TextMime>,
-    /// Offer the compositor marked as the clipboard selection, with its MIME.
-    pub selection_offer: Option<u32>,
-    pub selection_mime: Option<TextMime>,
-}
-
-/// Upper bound on a surface dimension accepted from a configure event. A buggy
-/// or hostile compositor could otherwise echo an enormous size; the buffer math
-/// is checked, but capping here keeps a usable surface instead of an error.
-const MAX_SURFACE_DIM: u32 = 16384;
-
-/// Surface state.
-pub struct Surface {
-    pub id: u32,
-    /// Layer surface ID
-    pub layer_surface_id: u32,
-    pub configured: bool,
-    pub width: u32,
-    pub height: u32,
-}
-
-/// A buffer retired on resize, kept mapped until the compositor sends
-/// wl_buffer.release. Tearing it down sooner could unmap memory the compositor
-/// is still scanning out, flashing a stale or blank frame.
-struct RetiredBuffer {
-    buffer_id: u32,
-    pool_id: u32,
-    _buffer: PixelBuffer,
-}
-
-/// Keyboard state. Owns an XkbState that handles layout-aware translation;
+/// Keyboard state. Owns the Xkb that handles layout-aware translation;
 /// the compositor populates the keymap on the first wl_keyboard.keymap event.
 pub struct Keyboard {
     pub id: Option<u32>,
     pub focused: bool,
-    pub xkb: XkbState,
+    pub xkb: Xkb,
 }
 
 /// Key repeat state.
@@ -235,15 +171,6 @@ pub struct Pointer {
     pub click_count: u32,
 }
 
-/// Deferred clipboard operation.
-pub enum ClipboardOp {
-    None,
-    Copy(ArrayString<INPUT_CAP>),
-    Cut(ArrayString<INPUT_CAP>),
-    Paste,
-}
-
-/// Pending action from input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingAction {
     None,
@@ -252,26 +179,14 @@ pub enum PendingAction {
     Launch,
 }
 
-/// Convert char offset to byte offset in a string.
-fn char_to_byte(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
-}
-
 /// Client state.
 pub struct Client {
-    pub socket: WaylandSocket,
+    pub socket: Connection,
     pub ids: IdAllocator,
     pub globals: ArrayVec<Global, MAX_GLOBALS>,
     pub bindings: Bindings,
-    pub surface: Option<Surface>,
-    pub buffer: Option<PixelBuffer>,
-    pub pool_id: Option<u32>,
-    pub buffer_id: Option<u32>,
-    /// Buffers awaiting wl_buffer.release before their memory is unmapped.
-    retired_buffers: ArrayVec<RetiredBuffer, MAX_RETIRED>,
+    /// The surface and the frames drawn into it.
+    pub present: Present,
     pub running: bool,
     /// Pending sync callback ID
     sync_callback: Option<u32>,
@@ -283,16 +198,12 @@ pub struct Client {
     pub key_repeat: KeyRepeat,
     /// Pointer state
     pub pointer: Pointer,
-    /// Current input text
-    pub input_text: ArrayString<INPUT_CAP>,
-    /// Cursor position (char offset)
-    pub cursor: usize,
-    /// Selection anchor (char offset), None = no selection
-    pub selection_anchor: Option<usize>,
-    /// Deferred clipboard operation
-    pub clipboard_op: ClipboardOp,
-    /// Native Wayland clipboard state
-    pub clipboard: ClipboardState,
+    /// The search input: text, caret, and selection.
+    pub editor: Editor,
+    /// What the user asked the clipboard to do, serviced by the event loop.
+    pub clipboard_op: clipboard::Op,
+    /// The clipboard's protocol state.
+    pub clipboard: Clipboard,
     /// Serial of the most recent input event, required to set the selection.
     pub last_serial: u32,
     /// Flag indicating input changed (for redraw)
@@ -304,40 +215,26 @@ pub struct Client {
 impl Client {
     /// Connect to the Wayland compositor.
     pub fn connect() -> Result<Self> {
-        let socket = WaylandSocket::connect()?;
+        let socket = Connection::connect()?;
         Ok(Self {
             socket,
             ids: IdAllocator::new(),
             globals: ArrayVec::new(),
             bindings: Bindings::default(),
-            surface: None,
-            buffer: None,
-            pool_id: None,
-            buffer_id: None,
-            retired_buffers: ArrayVec::new(),
+            present: Present::new(),
             running: true,
             sync_callback: None,
             sync_done: false,
             keyboard: Keyboard {
                 id: None,
                 focused: false,
-                xkb: XkbState::new()?,
+                xkb: Xkb::new()?,
             },
             key_repeat: KeyRepeat::default(),
             pointer: Pointer::default(),
-            input_text: ArrayString::new(),
-            cursor: 0,
-            selection_anchor: None,
-            clipboard_op: ClipboardOp::None,
-            clipboard: ClipboardState {
-                device_id: None,
-                source_id: None,
-                source_text: None,
-                pending_offer: None,
-                pending_mime: None,
-                selection_offer: None,
-                selection_mime: None,
-            },
+            editor: Editor::new(),
+            clipboard_op: clipboard::Op::None,
+            clipboard: Clipboard::default(),
             last_serial: 0,
             input_changed: false,
             pending_action: PendingAction::None,
@@ -348,7 +245,7 @@ impl Client {
     pub fn has_layer_shell(&self) -> bool {
         self.globals
             .iter()
-            .any(|g| g.interface == interface::ZWLR_LAYER_SHELL_V1)
+            .any(|g| g.interface == proto::IFACE_LAYER_SHELL)
     }
 
     /// Send a sync request and wait for the callback.
@@ -356,13 +253,23 @@ impl Client {
         let callback_id = self.ids.allocate();
         self.sync_callback = Some(callback_id);
         self.sync_done = false;
-        protocol::display::sync(&mut self.socket, callback_id)?;
+        self.socket.request(
+            proto::WL_DISPLAY,
+            proto::wl_display::SYNC,
+            &[Arg::NewId(callback_id)],
+        )?;
         self.socket.flush()?;
 
-        while !self.sync_done {
+        // A wl_display.error or a closed layer surface clears running, and the
+        // done event will never arrive after either. Waiting on sync_done alone
+        // would block here forever.
+        while !self.sync_done && self.running {
             self.dispatch()?;
         }
         self.sync_callback = None;
+        if !self.sync_done {
+            return Err(Error::msg("connection ended before sync completed"));
+        }
         Ok(())
     }
 
@@ -370,16 +277,26 @@ impl Client {
     pub fn init(&mut self) -> Result<()> {
         let registry_id = self.ids.allocate();
         self.bindings.registry = Some(registry_id);
-        protocol::display::get_registry(&mut self.socket, registry_id)?;
+        self.socket.request(
+            proto::WL_DISPLAY,
+            proto::wl_display::GET_REGISTRY,
+            &[Arg::NewId(registry_id)],
+        )?;
         self.socket.flush()?;
         Ok(())
     }
 
-    /// Process a single message from the compositor.
+    /// Handle one message from the compositor, reading more from the socket only
+    /// when none is fully buffered. On the non-blocking socket the event loop
+    /// runs, a would-block error is how a drained socket says so, and the loop
+    /// reads that as the end of the burst.
     pub fn dispatch(&mut self) -> Result<()> {
-        let msg = self.socket.read_message()?;
-        self.handle_message(msg)?;
-        Ok(())
+        loop {
+            if let Some(msg) = self.socket.next_message()? {
+                return self.handle_message(msg);
+            }
+            self.socket.fill()?;
+        }
     }
 
     /// Handle a received message.
@@ -387,32 +304,30 @@ impl Client {
         let registry_id = self.bindings.registry;
 
         // wl_callback.done (for sync)
-        if Some(msg.object_id) == self.sync_callback {
-            if msg.opcode == protocol::wl_callback_event::DONE {
+        if Some(msg.object) == self.sync_callback {
+            if msg.opcode == proto::wl_callback::EV_DONE {
                 self.sync_done = true;
             }
             return Ok(());
         }
 
         // wl_display events
-        if msg.object_id == protocol::object::WL_DISPLAY {
+        if msg.object == proto::WL_DISPLAY {
             match msg.opcode {
-                protocol::wl_display_event::ERROR => {
+                proto::wl_display::EV_ERROR => {
                     // Log the error (object id, code, message); otherwise a
                     // protocol error is a silent teardown.
-                    let mut parser = msg.parser();
-                    if let (Ok(object), Ok(code), Ok(message)) =
-                        (parser.get_u32(), parser.get_u32(), parser.get_string())
-                    {
-                        crate::elog!(
+                    let mut r = msg.reader();
+                    if let (Ok(object), Ok(code), Ok(message)) = (r.u32(), r.u32(), r.string()) {
+                        elog!(
                             "bnklaunch: protocol error from object {object} (code {code}): {message}"
                         );
                     }
                     self.running = false;
                 }
-                protocol::wl_display_event::DELETE_ID => {
-                    let mut parser = msg.parser();
-                    if let Ok(id) = parser.get_u32() {
+                proto::wl_display::EV_DELETE_ID => {
+                    let mut r = msg.reader();
+                    if let Ok(id) = r.u32() {
                         self.ids.recycle(id);
                     }
                 }
@@ -422,24 +337,28 @@ impl Client {
         }
 
         // wl_registry events
-        if Some(msg.object_id) == registry_id {
+        if Some(msg.object) == registry_id {
             match msg.opcode {
-                protocol::wl_registry_event::GLOBAL => {
-                    let mut parser = msg.parser();
-                    let name = parser.get_u32()?;
-                    let interface = parser.get_string()?;
-                    let version = parser.get_u32()?;
-                    if is_bindable_interface(interface.as_str()) {
-                        let _ = self.globals.push(Global {
-                            name,
-                            interface,
-                            version,
-                        });
+                proto::wl_registry::EV_GLOBAL => {
+                    let mut r = msg.reader();
+                    let name = r.u32()?;
+                    let interface = r.string()?;
+                    let version = r.u32()?;
+                    if is_bindable_interface(interface) {
+                        // Only the five bindable names get here, and each fits.
+                        let mut stored: ArrayString<IFACE_CAP> = ArrayString::new();
+                        if stored.push_str(interface).is_ok() {
+                            let _ = self.globals.push(Global {
+                                name,
+                                interface: stored,
+                                version,
+                            });
+                        }
                     }
                 }
-                protocol::wl_registry_event::GLOBAL_REMOVE => {
-                    let mut parser = msg.parser();
-                    let name = parser.get_u32()?;
+                proto::wl_registry::EV_GLOBAL_REMOVE => {
+                    let mut r = msg.reader();
+                    let name = r.u32()?;
                     if let Some(i) = self.globals.iter().position(|g| g.name == name) {
                         self.globals.swap_remove(i);
                     }
@@ -450,28 +369,29 @@ impl Client {
         }
 
         // Layer surface events
-        if let Some(ref mut surface) = self.surface {
-            if msg.object_id == surface.layer_surface_id {
+        if let Some(ref mut surface) = self.present.surface {
+            if msg.object == surface.layer_surface_id {
                 match msg.opcode {
-                    layer_shell::zwlr_layer_surface_v1_event::CONFIGURE => {
-                        let mut parser = msg.parser();
-                        let serial = parser.get_u32()?;
-                        let width = parser.get_u32()?;
-                        let height = parser.get_u32()?;
+                    proto::zwlr_layer_surface_v1::EV_CONFIGURE => {
+                        let mut r = msg.reader();
+                        let serial = r.u32()?;
+                        let width = r.u32()?;
+                        let height = r.u32()?;
                         if (1..=MAX_SURFACE_DIM).contains(&width)
                             && (1..=MAX_SURFACE_DIM).contains(&height)
                         {
                             surface.width = width;
                             surface.height = height;
                         }
-                        layer_shell::ack_configure(
-                            &mut self.socket,
-                            surface.layer_surface_id,
-                            serial,
+                        let layer_surface_id = surface.layer_surface_id;
+                        self.socket.request(
+                            layer_surface_id,
+                            proto::zwlr_layer_surface_v1::ACK_CONFIGURE,
+                            &[Arg::Uint(serial)],
                         )?;
                         surface.configured = true;
                     }
-                    layer_shell::zwlr_layer_surface_v1_event::CLOSED => {
+                    proto::zwlr_layer_surface_v1::EV_CLOSED => {
                         self.running = false;
                     }
                     _ => {}
@@ -480,89 +400,93 @@ impl Client {
             }
         }
 
-        // A retired buffer's release means the compositor is done scanning it
-        // out, so unmapping is finally safe.
-        if let Some(idx) = self
-            .retired_buffers
-            .iter()
-            .position(|b| b.buffer_id == msg.object_id)
+        // A wl_buffer.release says the compositor has finished with a frame: it
+        // is free to draw into again, or, if it was retired by a resize, free to
+        // unmap.
+        if msg.opcode == proto::wl_buffer::EV_RELEASE
+            && self.present.release(&mut self.socket, msg.object)?
         {
-            if msg.opcode == protocol::wl_buffer_event::RELEASE {
-                if let Some(retired) = self.retired_buffers.swap_remove(idx) {
-                    protocol::shm::buffer_destroy(&mut self.socket, retired.buffer_id)?;
-                    protocol::shm::pool_destroy(&mut self.socket, retired.pool_id)?;
-                    self.socket.flush()?;
-                    // retired._buffer drops here: munmap + close the memfd.
-                }
-            }
-            return Ok(());
-        }
-
-        // The active buffer is reused in place, so its release needs no action.
-        if Some(msg.object_id) == self.buffer_id {
             return Ok(());
         }
 
         // wl_seat events
-        if Some(msg.object_id) == self.bindings.seat {
+        if Some(msg.object) == self.bindings.seat {
             match msg.opcode {
-                protocol::wl_seat_event::CAPABILITIES => {
-                    let mut parser = msg.parser();
-                    let caps = parser.get_u32()?;
+                proto::wl_seat::EV_CAPABILITIES => {
+                    let mut r = msg.reader();
+                    let caps = r.u32()?;
                     // Request keyboard if available
-                    if (caps & protocol::wl_seat_capability::KEYBOARD) != 0
-                        && self.keyboard.id.is_none()
-                    {
+                    if (caps & proto::wl_seat::CAP_KEYBOARD) != 0 && self.keyboard.id.is_none() {
                         let keyboard_id = self.ids.allocate();
-                        protocol::seat::get_keyboard(&mut self.socket, msg.object_id, keyboard_id)?;
+                        self.socket.request(
+                            msg.object,
+                            proto::wl_seat::GET_KEYBOARD,
+                            &[Arg::NewId(keyboard_id)],
+                        )?;
                         self.keyboard.id = Some(keyboard_id);
                     }
                     // Request pointer if available
-                    if (caps & protocol::wl_seat_capability::POINTER) != 0
-                        && self.pointer.id.is_none()
-                    {
+                    if (caps & proto::wl_seat::CAP_POINTER) != 0 && self.pointer.id.is_none() {
                         let pointer_id = self.ids.allocate();
-                        protocol::seat::get_pointer(&mut self.socket, msg.object_id, pointer_id)?;
+                        self.socket.request(
+                            msg.object,
+                            proto::wl_seat::GET_POINTER,
+                            &[Arg::NewId(pointer_id)],
+                        )?;
                         self.pointer.id = Some(pointer_id);
                     }
                     self.socket.flush()?;
                 }
-                protocol::wl_seat_event::NAME => {}
+                proto::wl_seat::EV_NAME => {}
                 _ => {}
             }
             return Ok(());
         }
 
         // wl_keyboard events
-        if Some(msg.object_id) == self.keyboard.id {
+        if Some(msg.object) == self.keyboard.id {
             match msg.opcode {
-                protocol::wl_keyboard_event::KEYMAP => {
-                    let mut parser = msg.parser();
-                    let format = parser.get_u32()?;
-                    let size = parser.get_u32()?;
-                    if let Some(fd) = self.socket.take_fd() {
-                        if let Err(e) = self.keyboard.xkb.load_keymap(fd, size, format) {
-                            crate::elog!("bnklaunch: failed to load keymap: {e}");
+                proto::wl_keyboard::EV_KEYMAP => {
+                    let mut r = msg.reader();
+                    let format = r.u32()?;
+                    let size = r.u32()?;
+                    match self.socket.take_fd() {
+                        Some(fd) => {
+                            // The keymap is mapped rather than read: the fd
+                            // shares its seek position with the compositor's own
+                            // file-table entry, and not every compositor rewinds
+                            // it. The mapping and the fd both go away at the end
+                            // of this arm, once xkb has compiled the bytes.
+                            let loaded = syscall::read_mapped(fd.as_raw_fd(), size as usize)
+                                .and_then(|map| {
+                                    self.keyboard.xkb.load_keymap(map.as_slice(), format)
+                                });
+                            if let Err(e) = loaded {
+                                elog!("bnklaunch: failed to load keymap: {e}");
+                            }
                         }
+                        // Without a keymap no key types anything, so the keyboard
+                        // is dead. Say so rather than look hung.
+                        None => elog!("bnklaunch: keymap event carried no file descriptor"),
                     }
                 }
-                protocol::wl_keyboard_event::ENTER => {
-                    let mut parser = msg.parser();
-                    self.last_serial = parser.get_u32()?;
+                proto::wl_keyboard::EV_ENTER => {
+                    let mut r = msg.reader();
+                    self.last_serial = r.u32()?;
                     self.keyboard.focused = true;
                 }
-                protocol::wl_keyboard_event::LEAVE => {
+                proto::wl_keyboard::EV_LEAVE => {
                     self.keyboard.focused = false;
                     self.running = false;
                 }
-                protocol::wl_keyboard_event::KEY => {
-                    let mut parser = msg.parser();
-                    self.last_serial = parser.get_u32()?;
-                    let _time = parser.get_u32()?;
-                    let key = parser.get_u32()?;
-                    let state = parser.get_u32()?;
+                proto::wl_keyboard::EV_KEY => {
+                    let mut r = msg.reader();
+                    self.last_serial = r.u32()?;
+                    let _time = r.u32()?;
+                    let key = r.u32()?;
+                    let state = r.u32()?;
 
-                    if state == protocol::wl_keyboard_key_state::PRESSED {
+                    if state == proto::wl_keyboard::KEY_PRESSED {
                         self.key_repeat.held_key = Some(key);
                         self.key_repeat.press_time = Some(Instant::now());
                         self.key_repeat.last_repeat = None;
@@ -577,13 +501,13 @@ impl Client {
                         }
                     }
                 }
-                protocol::wl_keyboard_event::MODIFIERS => {
-                    let mut parser = msg.parser();
-                    let _serial = parser.get_u32()?;
-                    let mods_depressed = parser.get_u32()?;
-                    let mods_latched = parser.get_u32()?;
-                    let mods_locked = parser.get_u32()?;
-                    let group = parser.get_u32()?;
+                proto::wl_keyboard::EV_MODIFIERS => {
+                    let mut r = msg.reader();
+                    let _serial = r.u32()?;
+                    let mods_depressed = r.u32()?;
+                    let mods_latched = r.u32()?;
+                    let mods_locked = r.u32()?;
+                    let group = r.u32()?;
                     self.keyboard.xkb.update_modifiers(
                         mods_depressed,
                         mods_latched,
@@ -591,14 +515,18 @@ impl Client {
                         group,
                     );
                 }
-                protocol::wl_keyboard_event::REPEAT_INFO => {
-                    let mut parser = msg.parser();
-                    let rate = parser.get_i32()?;
-                    let delay = parser.get_i32()?;
-                    if rate > 0 {
+                proto::wl_keyboard::EV_REPEAT_INFO => {
+                    let mut r = msg.reader();
+                    let rate = r.i32()?;
+                    let delay = r.i32()?;
+                    // A rate of zero is the compositor turning key repeat off,
+                    // so it has to be stored (should_repeat reads it as
+                    // disabled). Only a negative rate or delay, which the
+                    // protocol does not define, keeps the current setting.
+                    if rate >= 0 {
                         self.key_repeat.rate = rate as u32;
                     }
-                    if delay > 0 {
+                    if delay >= 0 {
                         self.key_repeat.delay_ms = delay as u32;
                     }
                 }
@@ -608,35 +536,35 @@ impl Client {
         }
 
         // wl_pointer events
-        if Some(msg.object_id) == self.pointer.id {
+        if Some(msg.object) == self.pointer.id {
             match msg.opcode {
-                protocol::wl_pointer_event::ENTER => {
-                    let mut parser = msg.parser();
-                    self.last_serial = parser.get_u32()?;
-                    let _surface = parser.get_u32()?;
-                    self.pointer.x = parser.get_fixed()?;
-                    self.pointer.y = parser.get_fixed()?;
+                proto::wl_pointer::EV_ENTER => {
+                    let mut r = msg.reader();
+                    self.last_serial = r.u32()?;
+                    let _surface = r.u32()?;
+                    self.pointer.x = r.fixed()?;
+                    self.pointer.y = r.fixed()?;
                 }
-                protocol::wl_pointer_event::LEAVE => {}
-                protocol::wl_pointer_event::MOTION => {
-                    let mut parser = msg.parser();
-                    let _time = parser.get_u32()?;
-                    self.pointer.x = parser.get_fixed()?;
-                    self.pointer.y = parser.get_fixed()?;
+                proto::wl_pointer::EV_LEAVE => {}
+                proto::wl_pointer::EV_MOTION => {
+                    let mut r = msg.reader();
+                    let _time = r.u32()?;
+                    self.pointer.x = r.fixed()?;
+                    self.pointer.y = r.fixed()?;
                     if self.pointer.button_pressed {
                         self.pointer.dragging = true;
                         self.input_changed = true;
                     }
                 }
-                protocol::wl_pointer_event::BUTTON => {
-                    let mut parser = msg.parser();
-                    self.last_serial = parser.get_u32()?;
-                    let _time = parser.get_u32()?;
-                    let button = parser.get_u32()?;
-                    let state = parser.get_u32()?;
+                proto::wl_pointer::EV_BUTTON => {
+                    let mut r = msg.reader();
+                    self.last_serial = r.u32()?;
+                    let _time = r.u32()?;
+                    let button = r.u32()?;
+                    let state = r.u32()?;
 
-                    if button == protocol::button::BTN_LEFT {
-                        if state == protocol::wl_pointer_button_state::PRESSED {
+                    if button == proto::BTN_LEFT {
+                        if state == proto::wl_pointer::BUTTON_PRESSED {
                             self.pointer.button_pressed = true;
                             // Double/triple click detection
                             let now = Instant::now();
@@ -664,224 +592,92 @@ impl Client {
             return Ok(());
         }
 
-        // Data device events advertise and select clipboard offers. The
-        // compositor sends data_offer, then offer() per MIME on that offer,
-        // then selection() naming it as the clipboard (or null to clear).
-        if Some(msg.object_id) == self.clipboard.device_id {
-            match msg.opcode {
-                protocol::data_device::device_event::DATA_OFFER => {
-                    let mut parser = msg.parser();
-                    self.clipboard.pending_offer = Some(parser.get_u32()?);
-                    self.clipboard.pending_mime = None;
-                }
-                protocol::data_device::device_event::SELECTION => {
-                    let mut parser = msg.parser();
-                    let offer_id = parser.get_u32()?;
-                    if let Some(old) = self.clipboard.selection_offer.take() {
-                        let _ = protocol::data_device::offer_destroy(&mut self.socket, old);
-                    }
-                    if offer_id == 0 {
-                        self.clipboard.selection_mime = None;
-                    } else {
-                        self.clipboard.selection_offer = Some(offer_id);
-                        self.clipboard.selection_mime = self.clipboard.pending_mime;
-                    }
-                    self.clipboard.pending_offer = None;
-                }
-                _ => {}
-            }
-            return Ok(());
-        }
-
-        // MIME types advertised on the offer currently being described.
-        if Some(msg.object_id) == self.clipboard.pending_offer
-            && msg.opcode == protocol::data_device::offer_event::OFFER
+        // The clipboard's own events: the offers the compositor describes, the
+        // selection it names, and the requests to serve what we copied.
+        if self
+            .clipboard
+            .handle(&mut self.socket, msg.object, msg.opcode, &msg.body)?
         {
-            let mut parser = msg.parser();
-            let mime = parser.get_string()?;
-            if let Some(m) = TextMime::from_mime(mime.as_str()) {
-                self.clipboard.pending_mime = Some(match self.clipboard.pending_mime {
-                    Some(cur) => cur.max(m),
-                    None => m,
-                });
-            }
-            return Ok(());
-        }
-
-        // Data source events: serve copied text and notice ownership loss.
-        if Some(msg.object_id) == self.clipboard.source_id {
-            match msg.opcode {
-                protocol::data_device::source_event::SEND => {
-                    // Compositor asks us to write clipboard data to an fd
-                    let mut parser = msg.parser();
-                    let _mime = parser.get_string()?;
-                    if let Some(fd) = self.socket.take_fd() {
-                        let raw_fd = fd.as_raw_fd();
-                        if let Some(ref text) = self.clipboard.source_text {
-                            write_all_to_fd(raw_fd, text.as_bytes());
-                        }
-                        // fd closes when it drops at the end of this block.
-                    }
-                }
-                protocol::data_device::source_event::CANCELLED => {
-                    // Another app took the clipboard
-                    self.clipboard.source_id = None;
-                    self.clipboard.source_text = None;
-                }
-                _ => {}
-            }
             return Ok(());
         }
 
         Ok(())
     }
 
-    /// Handle a key action (used for initial press and repeat).
+    /// Turn a key press into editor calls plus whatever the launcher has to do
+    /// about it: a clipboard transfer, a move in the result list, a launch.
     fn handle_key_action(&mut self, key: u32) {
-        let action = self.keyboard.xkb.keycode_to_action(key);
-        let shift = self.keyboard.xkb.shift();
-        let char_count = self.input_text.chars().count();
+        let action = key_action(&self.keyboard.xkb, key);
+        let shift = self.keyboard.xkb.shift_active();
 
         match action {
             KeyAction::Char(ch) => {
-                self.delete_selection();
-                let byte_pos = char_to_byte(&self.input_text, self.cursor);
-                // Advance only if the insert landed. A full input rejects it
-                // (insert is atomic), and moving the cursor past the real length
-                // would desync it: later Backspace and Delete go dead until the
-                // phantom offset drains.
-                if self.input_text.insert(byte_pos, ch).is_ok() {
-                    self.cursor += 1;
+                if self.editor.insert(ch) {
                     self.input_changed = true;
                 }
-                self.selection_anchor = None;
             }
             KeyAction::Backspace => {
-                if self.has_selection() {
-                    self.delete_selection();
-                } else if self.cursor > 0 {
-                    self.cursor -= 1;
-                    let byte_pos = char_to_byte(&self.input_text, self.cursor);
-                    self.input_text.remove(byte_pos);
-                }
+                self.editor.backspace();
                 self.input_changed = true;
             }
             KeyAction::Delete => {
-                if self.has_selection() {
-                    self.delete_selection();
-                } else if self.cursor < char_count {
-                    let byte_pos = char_to_byte(&self.input_text, self.cursor);
-                    self.input_text.remove(byte_pos);
-                }
+                self.editor.delete();
                 self.input_changed = true;
             }
             KeyAction::Left => {
-                if shift {
-                    if self.selection_anchor.is_none() {
-                        self.selection_anchor = Some(self.cursor);
-                    }
-                } else {
-                    // If there's a selection, jump cursor to the start of it
-                    if let Some((start, _)) = self.selection_range() {
-                        self.cursor = start;
-                        self.selection_anchor = None;
-                        self.input_changed = true;
-                        return;
-                    }
-                    self.selection_anchor = None;
-                }
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                }
+                self.editor.left(shift);
                 self.input_changed = true;
             }
             KeyAction::Right => {
-                if shift {
-                    if self.selection_anchor.is_none() {
-                        self.selection_anchor = Some(self.cursor);
-                    }
-                } else {
-                    if let Some((_, end)) = self.selection_range() {
-                        self.cursor = end;
-                        self.selection_anchor = None;
-                        self.input_changed = true;
-                        return;
-                    }
-                    self.selection_anchor = None;
-                }
-                if self.cursor < char_count {
-                    self.cursor += 1;
-                }
+                self.editor.right(shift);
                 self.input_changed = true;
             }
             KeyAction::Home => {
-                if shift {
-                    if self.selection_anchor.is_none() {
-                        self.selection_anchor = Some(self.cursor);
-                    }
-                } else {
-                    self.selection_anchor = None;
-                }
-                self.cursor = 0;
+                self.editor.home(shift);
                 self.input_changed = true;
             }
             KeyAction::End => {
-                if shift {
-                    if self.selection_anchor.is_none() {
-                        self.selection_anchor = Some(self.cursor);
-                    }
-                } else {
-                    self.selection_anchor = None;
-                }
-                self.cursor = char_count;
+                self.editor.end(shift);
                 self.input_changed = true;
             }
             KeyAction::SelectAll => {
-                self.selection_anchor = Some(0);
-                self.cursor = char_count;
+                self.editor.select_all();
                 self.input_changed = true;
             }
             KeyAction::Copy => {
-                if let Some(text) = self.selected_text() {
-                    self.clipboard_op = ClipboardOp::Copy(text);
+                if let Some(text) = self.editor.selected_text() {
+                    self.clipboard_op = clipboard::Op::Copy(text);
                 }
             }
             KeyAction::Cut => {
-                if let Some(text) = self.selected_text() {
-                    self.clipboard_op = ClipboardOp::Cut(text);
+                if let Some(text) = self.editor.selected_text() {
+                    self.clipboard_op = clipboard::Op::Cut(text);
                 }
             }
             KeyAction::Paste => {
-                self.clipboard_op = ClipboardOp::Paste;
+                self.clipboard_op = clipboard::Op::Paste;
             }
             KeyAction::Enter => {
                 self.pending_action = PendingAction::Launch;
                 self.running = false;
             }
             KeyAction::Escape => {
-                self.input_text.clear();
-                self.cursor = 0;
-                self.selection_anchor = None;
+                self.editor.clear();
                 self.running = false;
             }
             KeyAction::Up => {
                 if shift {
-                    // Shift+Up: select all
-                    self.selection_anchor = Some(0);
-                    self.cursor = char_count;
+                    self.editor.select_all();
                     self.input_changed = true;
                 } else {
-                    // Result-list navigation leaves the text caret in place, so
-                    // it signals a selection move rather than input_changed.
-                    // Marking input_changed here would reset the caret to solid
-                    // every press and stall the blink.
+                    // Result-list navigation leaves the text caret where it is,
+                    // so it moves the selection rather than changing the input.
                     self.pending_action = PendingAction::SelectUp;
                 }
             }
             KeyAction::Down => {
                 if shift {
-                    // Shift+Down: deselect
-                    self.selection_anchor = None;
+                    self.editor.select_all();
                     self.input_changed = true;
                 } else {
                     self.pending_action = PendingAction::SelectDown;
@@ -902,217 +698,63 @@ impl Client {
         }
     }
 
-    // --- Selection helpers ---
-
-    /// Whether there is an active selection.
-    fn has_selection(&self) -> bool {
-        self.selection_range().is_some()
-    }
-
-    /// Get the selection range as (start, end) char offsets, if any.
-    pub fn selection_range(&self) -> Option<(usize, usize)> {
-        let anchor = self.selection_anchor?;
-        if anchor == self.cursor {
-            return None;
-        }
-        Some((anchor.min(self.cursor), anchor.max(self.cursor)))
-    }
-
-    /// Get the selected text, if any.
-    fn selected_text(&self) -> Option<ArrayString<INPUT_CAP>> {
-        let (start, end) = self.selection_range()?;
-        let byte_start = char_to_byte(&self.input_text, start);
-        let byte_end = char_to_byte(&self.input_text, end);
-        let mut out: ArrayString<INPUT_CAP> = ArrayString::new();
-        out.push_str(&self.input_text.as_str()[byte_start..byte_end])
-            .ok()?;
-        Some(out)
-    }
-
-    /// Delete the selected text and move cursor to selection start.
-    fn delete_selection(&mut self) {
-        if let Some((start, end)) = self.selection_range() {
-            let byte_start = char_to_byte(&self.input_text, start);
-            let byte_end = char_to_byte(&self.input_text, end);
-            self.input_text.delete_range(byte_start, byte_end);
-            self.cursor = start;
-            self.selection_anchor = None;
-        }
-    }
-
-    /// Insert text at the cursor position.
-    pub fn insert_at_cursor(&mut self, s: &str) {
-        let byte_pos = char_to_byte(&self.input_text, self.cursor);
-        // insert_str is atomic: all of s lands or none does. Advance the cursor
-        // only when it landed, so a paste that does not fit leaves the cursor on
-        // the unchanged text rather than past its end.
-        if self.input_text.insert_str(byte_pos, s).is_ok() {
-            self.cursor += s.chars().count();
-            self.input_changed = true;
-        }
-        self.selection_anchor = None;
-    }
-
-    /// Handle a pointer click in the input box area.
-    /// text_x_offset is the pixel x relative to the start of the text.
+    /// A pointer click inside the input box, at a char offset in the text.
     pub fn handle_pointer_click(&mut self, char_offset: usize) {
-        match self.pointer.click_count {
-            2 => {
-                // Double-click: select word
-                let (start, end) = word_boundaries(&self.input_text, char_offset);
-                self.selection_anchor = Some(start);
-                self.cursor = end;
-            }
-            n if n >= 3 => {
-                // Triple-click: select all
-                self.selection_anchor = Some(0);
-                self.cursor = self.input_text.chars().count();
-            }
-            _ => {
-                // Single click: position cursor, clear selection
-                let char_count = self.input_text.chars().count();
-                self.cursor = char_offset.min(char_count);
-                self.selection_anchor = None;
-            }
-        }
+        self.editor.click(char_offset, self.pointer.click_count);
         self.pointer.clicked = false;
         self.input_changed = true;
     }
 
-    /// Handle pointer drag in the input box area.
+    /// A pointer drag inside the input box, to a char offset in the text.
     pub fn handle_pointer_drag(&mut self, char_offset: usize) {
-        let char_count = self.input_text.chars().count();
-        if self.selection_anchor.is_none() {
-            self.selection_anchor = Some(self.cursor);
-        }
-        self.cursor = char_offset.min(char_count);
+        self.editor.drag(char_offset);
         self.pointer.dragging = false;
         self.input_changed = true;
     }
 
-    /// Process a deferred clipboard operation using native Wayland protocol.
+    /// Service the clipboard operation the last key press asked for.
     pub fn process_clipboard(&mut self) {
-        let op = core::mem::replace(&mut self.clipboard_op, ClipboardOp::None);
+        let op = core::mem::take(&mut self.clipboard_op);
+        let manager_id = self.bindings.data_device_manager;
+        let serial = self.last_serial;
+        let ids = &mut self.ids;
+
         match op {
-            ClipboardOp::Copy(text) => {
-                if let Err(e) = self.clipboard_set(&text) {
-                    crate::elog!("bnklaunch: copy failed: {e}");
+            clipboard::Op::Copy(text) => {
+                if let Err(e) = self.clipboard.set(
+                    &mut self.socket,
+                    manager_id,
+                    &mut || ids.allocate(),
+                    serial,
+                    &text,
+                ) {
+                    elog!("bnklaunch: copy failed: {e}");
                 }
             }
-            ClipboardOp::Cut(text) => {
-                if let Err(e) = self.clipboard_set(&text) {
-                    crate::elog!("bnklaunch: cut failed: {e}");
+            clipboard::Op::Cut(text) => {
+                if let Err(e) = self.clipboard.set(
+                    &mut self.socket,
+                    manager_id,
+                    &mut || ids.allocate(),
+                    serial,
+                    &text,
+                ) {
+                    elog!("bnklaunch: cut failed: {e}");
                 }
-                self.delete_selection();
+                self.editor.delete_selection();
                 self.input_changed = true;
             }
-            ClipboardOp::Paste => {
-                // If we own the clipboard, use our stored text directly.
-                // Receiving our own offer would deadlock: the compositor sends
-                // source.SEND back to this connection while we block on the pipe.
-                let mut text: ArrayString<INPUT_CAP> = ArrayString::new();
-                let got = if let Some(ref t) = self.clipboard.source_text {
-                    let _ = text.push_str(t.as_str());
-                    true
-                } else {
-                    match self.clipboard_read() {
-                        Ok(t) => {
-                            let _ = text.push_str(t.as_str());
-                            true
-                        }
-                        Err(e) => {
-                            crate::elog!("bnklaunch: paste failed: {e}");
-                            false
-                        }
+            clipboard::Op::Paste => match self.clipboard.read(&mut self.socket) {
+                Ok(text) => {
+                    if !self.editor.paste(&text) {
+                        elog!("bnklaunch: the pasted text does not fit the input");
                     }
-                };
-                if got {
-                    self.delete_selection();
-                    self.insert_at_cursor(&text);
+                    self.input_changed = true;
                 }
-            }
-            ClipboardOp::None => {}
+                Err(e) => elog!("bnklaunch: paste failed: {e}"),
+            },
+            clipboard::Op::None => {}
         }
-    }
-
-    /// Set the clipboard selection to text owned by this client.
-    fn clipboard_set(&mut self, text: &str) -> Result<()> {
-        let manager_id = self
-            .bindings
-            .data_device_manager
-            .ok_or_else(|| Error::msg("no data device manager"))?;
-        let device_id = self
-            .clipboard
-            .device_id
-            .ok_or_else(|| Error::msg("no data device"))?;
-
-        // Destroy previous source if any
-        if let Some(old_source) = self.clipboard.source_id.take() {
-            let _ = protocol::data_device::source_destroy(&mut self.socket, old_source);
-        }
-
-        // Create new data source
-        let source_id = self.ids.allocate();
-        protocol::data_device::create_data_source(&mut self.socket, manager_id, source_id)?;
-
-        // Offer text MIME types
-        protocol::data_device::source_offer(&mut self.socket, source_id, TextMime::Utf8.as_str())?;
-        protocol::data_device::source_offer(&mut self.socket, source_id, TextMime::Plain.as_str())?;
-
-        // Take ownership of the selection with the latest input serial
-        protocol::data_device::set_selection(
-            &mut self.socket,
-            device_id,
-            source_id,
-            self.last_serial,
-        )?;
-        self.socket.flush()?;
-
-        // Store source state so we can serve send events
-        self.clipboard.source_id = Some(source_id);
-        let mut stored: ArrayString<INPUT_CAP> = ArrayString::new();
-        let _ = stored.push_str(text);
-        self.clipboard.source_text = Some(stored);
-
-        Ok(())
-    }
-
-    /// Read the current clipboard selection through a pipe on this connection.
-    /// Only valid when another client owns the selection; a self-owned offer is
-    /// served from source_text by the caller to avoid the send/read deadlock.
-    fn clipboard_read(&mut self) -> Result<ArrayString<{ clipboard::CLIP_CAP }>> {
-        let offer_id = self
-            .clipboard
-            .selection_offer
-            .ok_or_else(|| Error::msg("no clipboard selection"))?;
-        let mime = self
-            .clipboard
-            .selection_mime
-            .ok_or_else(|| Error::msg("clipboard has no text content"))?;
-
-        let mut fds = [0i32; 2];
-        let ret = crate::syscall::pipe2(&mut fds, crate::syscall::O_CLOEXEC);
-        if ret < 0 {
-            return Err(Error::from_errno(-ret));
-        }
-        // Own both ends immediately so any early return closes them. Both fds
-        // come fresh from pipe2 and are owned by no one else.
-        let read_end = crate::syscall::Fd::new(fds[0]);
-        let write_end = crate::syscall::Fd::new(fds[1]);
-
-        protocol::data_device::offer_receive(
-            &mut self.socket,
-            offer_id,
-            mime.as_str(),
-            write_end.as_raw_fd(),
-        )?;
-        self.socket.flush()?;
-
-        // Drop our write end; the compositor keeps its own via SCM_RIGHTS, so
-        // the pipe reaches EOF once the owner finishes writing.
-        drop(write_end);
-
-        clipboard::read_text(read_end)
     }
 
     // --- Wayland protocol methods ---
@@ -1124,70 +766,48 @@ impl Client {
             .registry
             .ok_or_else(|| Error::msg("registry not initialized"))?;
 
-        for global in self.globals.iter() {
-            match global.interface.as_str() {
-                interface::WL_COMPOSITOR => {
-                    let id = self.ids.allocate();
-                    protocol::display::registry_bind(
-                        &mut self.socket,
-                        registry_id,
-                        global.name,
-                        &global.interface,
-                        global.version.min(4),
-                        id,
-                    )?;
-                    self.bindings.compositor = Some(id);
+        // The interface a global advertises decides which binding it fills and
+        // which version to ask for. A compositor may advertise the same
+        // interface more than once (a seat per input device, say); the first
+        // wins, since every binding here is single-valued.
+        for i in 0..self.globals.len() {
+            let (name, version) = (self.globals[i].name, self.globals[i].version);
+            let iface = self.globals[i].interface;
+
+            let (slot, want): (&mut Option<u32>, u32) = match iface.as_str() {
+                proto::IFACE_COMPOSITOR => {
+                    (&mut self.bindings.compositor, proto::VERSION_COMPOSITOR)
                 }
-                interface::WL_SHM => {
-                    let id = self.ids.allocate();
-                    protocol::display::registry_bind(
-                        &mut self.socket,
-                        registry_id,
-                        global.name,
-                        &global.interface,
-                        global.version.min(1),
-                        id,
-                    )?;
-                    self.bindings.shm = Some(id);
+                proto::IFACE_SHM => (&mut self.bindings.shm, proto::VERSION_SHM),
+                proto::IFACE_SEAT => (&mut self.bindings.seat, proto::VERSION_SEAT),
+                proto::IFACE_LAYER_SHELL => {
+                    (&mut self.bindings.layer_shell, proto::VERSION_LAYER_SHELL)
                 }
-                interface::WL_SEAT if self.bindings.seat.is_none() => {
-                    let id = self.ids.allocate();
-                    protocol::display::registry_bind(
-                        &mut self.socket,
-                        registry_id,
-                        global.name,
-                        &global.interface,
-                        global.version.min(5),
-                        id,
-                    )?;
-                    self.bindings.seat = Some(id);
-                }
-                interface::ZWLR_LAYER_SHELL_V1 => {
-                    let id = self.ids.allocate();
-                    protocol::display::registry_bind(
-                        &mut self.socket,
-                        registry_id,
-                        global.name,
-                        &global.interface,
-                        global.version.min(4),
-                        id,
-                    )?;
-                    self.bindings.layer_shell = Some(id);
-                }
-                interface::WL_DATA_DEVICE_MANAGER => {
-                    let id = self.ids.allocate();
-                    protocol::display::registry_bind(
-                        &mut self.socket,
-                        registry_id,
-                        global.name,
-                        &global.interface,
-                        global.version.min(3),
-                        id,
-                    )?;
-                    self.bindings.data_device_manager = Some(id);
-                }
-                _ => {}
+                proto::IFACE_DATA_DEVICE_MANAGER => (
+                    &mut self.bindings.data_device_manager,
+                    proto::VERSION_DATA_DEVICE_MANAGER,
+                ),
+                _ => continue,
+            };
+            if slot.is_some() {
+                continue;
             }
+
+            let id = self.ids.allocate();
+            *slot = Some(id);
+            self.socket.request(
+                registry_id,
+                proto::wl_registry::BIND,
+                &[
+                    Arg::Uint(name),
+                    Arg::Bind {
+                        interface: iface.as_str(),
+                        // Never ask for more than the compositor offers.
+                        version: version.min(want),
+                        new_id: id,
+                    },
+                ],
+            )?;
         }
 
         // Get a data device for clipboard operations
@@ -1195,11 +815,10 @@ impl Client {
             (self.bindings.data_device_manager, self.bindings.seat)
         {
             let device_id = self.ids.allocate();
-            protocol::data_device::get_data_device(
-                &mut self.socket,
+            self.socket.request(
                 manager_id,
-                device_id,
-                seat_id,
+                proto::wl_data_device_manager::GET_DATA_DEVICE,
+                &[Arg::NewId(device_id), Arg::Object(seat_id)],
             )?;
             self.clipboard.device_id = Some(device_id);
         }
@@ -1208,7 +827,7 @@ impl Client {
         Ok(())
     }
 
-    /// Create a layer shell surface (overlay).
+    /// Create the layer surface the launcher paints on.
     pub fn create_layer_surface(&mut self, width: u32, height: u32) -> Result<()> {
         let compositor_id = self
             .bindings
@@ -1218,101 +837,49 @@ impl Client {
             .bindings
             .layer_shell
             .ok_or_else(|| Error::msg("zwlr_layer_shell_v1 not bound"))?;
-
-        let surface_id = self.ids.allocate();
-        protocol::compositor::create_surface(&mut self.socket, compositor_id, surface_id)?;
-
-        let layer_surface_id = self.ids.allocate();
-        layer_shell::get_layer_surface(
-            &mut self.socket,
-            layer_shell_id,
-            layer_surface_id,
-            surface_id,
-            0,
-            Layer::Overlay,
-            "bnklaunch",
-        )?;
-
-        layer_shell::set_size(&mut self.socket, layer_surface_id, width, height)?;
-        layer_shell::set_anchor(&mut self.socket, layer_surface_id, layer_shell::anchor::TOP)?;
-        layer_shell::set_margin(&mut self.socket, layer_surface_id, 350, 0, 0, 0)?;
-        layer_shell::set_exclusive_zone(&mut self.socket, layer_surface_id, -1)?;
-
-        // on_demand (layer-shell v4+) yields keyboard focus when the user
+        // OnDemand needs layer-shell v4. It yields keyboard focus when the user
         // switches windows, which fires wl_keyboard.leave and dismisses the
-        // launcher. Pre-v4 only supports the exclusive grab.
-        let layer_shell_version = self
+        // launcher; older versions only offer the exclusive grab, which does not.
+        let version = self
             .globals
             .iter()
-            .find(|g| g.interface == interface::ZWLR_LAYER_SHELL_V1)
+            .find(|g| g.interface == proto::IFACE_LAYER_SHELL)
             .map(|g| g.version)
             .unwrap_or(1);
-        let interactivity = if layer_shell_version >= 4 {
+        let interactivity = if version >= 4 {
             KeyboardInteractivity::OnDemand
         } else {
             KeyboardInteractivity::Exclusive
         };
-        layer_shell::set_keyboard_interactivity(&mut self.socket, layer_surface_id, interactivity)?;
 
-        protocol::compositor::surface_commit(&mut self.socket, surface_id)?;
-
-        self.surface = Some(Surface {
-            id: surface_id,
-            layer_surface_id,
-            configured: false,
+        let ids = &mut self.ids;
+        self.present.create_surface(
+            &mut self.socket,
+            &mut || ids.allocate(),
+            compositor_id,
+            layer_shell_id,
+            interactivity,
             width,
             height,
-        });
-
-        self.socket.flush()?;
-        Ok(())
+        )
     }
 
-    /// Create a shared memory buffer for the current surface.
+    /// Allocate the frames for the current surface size.
     pub fn create_buffer(&mut self) -> Result<()> {
         let shm_id = self
             .bindings
             .shm
             .ok_or_else(|| Error::msg("wl_shm not bound"))?;
-
-        let (width, height) = {
-            let surface = self
-                .surface
-                .as_ref()
-                .ok_or_else(|| Error::msg("no surface"))?;
-            (surface.width, surface.height)
-        };
-
-        let buffer = PixelBuffer::new(width, height)?;
-
-        let pool_id = self.ids.allocate();
-        let pool_size = i32::try_from(buffer.size())
-            .map_err(|_| Error::msg("buffer too large for wl_shm pool"))?;
-        protocol::shm::create_pool(&mut self.socket, shm_id, pool_id, buffer.fd(), pool_size)?;
-
-        let buffer_id = self.ids.allocate();
-        protocol::shm::pool_create_buffer(
-            &mut self.socket,
-            pool_id,
-            buffer_id,
-            0,
-            width as i32,
-            height as i32,
-            buffer.stride as i32,
-            ShmFormat::Argb8888,
-        )?;
-
-        self.buffer = Some(buffer);
-        self.pool_id = Some(pool_id);
-        self.buffer_id = Some(buffer_id);
-
-        self.socket.flush()?;
-        Ok(())
+        let ids = &mut self.ids;
+        self.present
+            .create_frames(&mut self.socket, &mut || ids.allocate(), shm_id)
     }
 
-    /// Resize the layer surface to new dimensions.
+    /// Resize the layer surface. False when it was already that size, or when
+    /// the compositor closed it instead of acking.
     pub fn resize_surface(&mut self, new_width: u32, new_height: u32) -> Result<bool> {
         let surface = self
+            .present
             .surface
             .as_mut()
             .ok_or_else(|| Error::msg("no surface"))?;
@@ -1321,21 +888,22 @@ impl Client {
             return Ok(false);
         }
 
-        layer_shell::set_size(
-            &mut self.socket,
-            surface.layer_surface_id,
-            new_width,
-            new_height,
+        let (layer_surface_id, surface_id) = (surface.layer_surface_id, surface.id);
+        surface.configured = false;
+        self.socket.request(
+            layer_surface_id,
+            proto::zwlr_layer_surface_v1::SET_SIZE,
+            &[Arg::Uint(new_width), Arg::Uint(new_height)],
         )?;
-        protocol::compositor::surface_commit(&mut self.socket, surface.id)?;
+        self.socket
+            .request(surface_id, proto::wl_surface::COMMIT, &[])?;
         self.socket.flush()?;
 
-        surface.configured = false;
+        // The configure that answers this carries the size to draw at, so wait
+        // for it. Stop if the compositor closes the surface instead (which
+        // clears running), rather than block on a configure that never comes.
         self.socket.set_nonblocking(false)?;
-        // Stop if the compositor closes the surface mid-resize (it sets running
-        // false) instead of acking, so this never blocks on a configure that
-        // will never arrive.
-        while self.running && !self.surface.as_ref().map(|s| s.configured).unwrap_or(false) {
+        while self.running && !self.surface_configured() {
             self.dispatch()?;
         }
         self.socket.set_nonblocking(true)?;
@@ -1343,99 +911,46 @@ impl Client {
             return Ok(false);
         }
 
-        // Retire the in-use buffer rather than tearing it down now; the
-        // compositor releases it once the new frame is committed, and it is
-        // unmapped then (see handle_message).
-        if let (Some(buffer), Some(buffer_id), Some(pool_id)) = (
-            self.buffer.take(),
-            self.buffer_id.take(),
-            self.pool_id.take(),
-        ) {
-            let _ = self.retired_buffers.push(RetiredBuffer {
-                buffer_id,
-                pool_id,
-                _buffer: buffer,
-            });
-        }
-        self.create_buffer()?;
-
+        let shm_id = self
+            .bindings
+            .shm
+            .ok_or_else(|| Error::msg("wl_shm not bound"))?;
+        let ids = &mut self.ids;
+        self.present
+            .resize_frames(&mut self.socket, &mut || ids.allocate(), shm_id)?;
         Ok(true)
     }
 
-    /// Render and commit the current frame.
-    pub fn render(&mut self) -> Result<()> {
-        let (surface_id, width, height) = {
-            let surface = self
-                .surface
-                .as_ref()
-                .ok_or_else(|| Error::msg("no surface"))?;
-            (surface.id, surface.width as i32, surface.height as i32)
-        };
-        let buffer_id = self.buffer_id.ok_or_else(|| Error::msg("no buffer"))?;
-
-        protocol::compositor::surface_attach(&mut self.socket, surface_id, buffer_id, 0, 0)?;
-        protocol::compositor::surface_damage(&mut self.socket, surface_id, 0, 0, width, height)?;
-        protocol::compositor::surface_commit(&mut self.socket, surface_id)?;
-        self.socket.flush()?;
-        Ok(())
+    pub fn surface_configured(&self) -> bool {
+        self.present
+            .surface
+            .as_ref()
+            .map(|s| s.configured)
+            .unwrap_or(false)
     }
 
-    /// Get mutable access to the pixel buffer for drawing.
+    /// Draw the next frame and show it.
+    ///
+    /// The compositor keeps reading a frame after the commit that showed it, so
+    /// the renderer draws into the other one. If it is still holding both, wait
+    /// for it to let one go rather than paint over what is on screen.
+    pub fn render(&mut self, draw: impl FnOnce(&mut Client)) -> Result<()> {
+        while self.running && !self.present.ready() {
+            self.socket.set_nonblocking(false)?;
+            let waited = self.dispatch();
+            self.socket.set_nonblocking(true)?;
+            waited?;
+        }
+        if !self.running {
+            return Ok(());
+        }
+        draw(self);
+        self.present.commit(&mut self.socket)
+    }
+
+    /// The pixels of the frame being drawn into.
     pub fn pixels(&mut self) -> Option<&mut PixelBuffer> {
-        self.buffer.as_mut()
-    }
-}
-
-/// Find word boundaries around a char offset.
-/// Returns (start, end) char offsets for the word.
-fn word_boundaries(text: &str, char_offset: usize) -> (usize, usize) {
-    let mut chars: ArrayVec<char, INPUT_CAP> = ArrayVec::new();
-    for c in text.chars() {
-        if chars.push(c).is_err() {
-            break;
-        }
-    }
-    let len = chars.len();
-    let pos = char_offset.min(len.saturating_sub(1));
-
-    if chars.is_empty() {
-        return (0, 0);
-    }
-
-    // Scan backward to word start
-    let mut start = pos;
-    while start > 0 && chars[start - 1].is_alphanumeric() {
-        start -= 1;
-    }
-
-    // Scan forward to word end
-    let mut end = pos;
-    while end < len && chars[end].is_alphanumeric() {
-        end += 1;
-    }
-
-    // If we didn't find a word (clicked on whitespace), select the whitespace
-    if start == end {
-        while start > 0 && !chars[start - 1].is_alphanumeric() {
-            start -= 1;
-        }
-        while end < len && !chars[end].is_alphanumeric() {
-            end += 1;
-        }
-    }
-
-    (start, end)
-}
-
-/// Write all bytes to a file descriptor, handling partial writes.
-fn write_all_to_fd(fd: crate::syscall::RawFd, data: &[u8]) {
-    let mut offset = 0;
-    while offset < data.len() {
-        let n = crate::syscall::write_fd(fd, &data[offset..]);
-        if n <= 0 {
-            break;
-        }
-        offset += n as usize;
+        self.present.pixels()
     }
 }
 

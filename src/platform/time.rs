@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use crate::syscall::{self, CLOCK_MONOTONIC};
+use crate::platform::syscall::{self, CLOCK_MONOTONIC};
 
 /// Read the monotonic clock in nanoseconds since an arbitrary epoch.
 fn now_nanos() -> u64 {

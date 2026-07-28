@@ -22,8 +22,8 @@
 use core::ffi::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_ushort, c_void};
 use core::ptr::{self, NonNull};
 
-use crate::arena::ArrayVec;
-use crate::error::{Error, Result};
+use crate::platform::arena::ArrayVec;
+use crate::platform::error::{Error, Result};
 
 /// Largest glyph coverage bitmap (width * rows). The UI font sizes are small,
 /// so a glyph never approaches this; an oversized one renders blank.
@@ -248,14 +248,14 @@ impl Face {
         let err = unsafe { FT_Init_FreeType(&mut library) };
         if err != 0 {
             // SAFETY: we own the mapping and free it on this error path.
-            unsafe { crate::syscall::munmap(map_ptr, map_len) };
+            unsafe { crate::platform::syscall::munmap(map_ptr, map_len) };
             return Err(Error::msg("FT_Init_FreeType failed"));
         }
         let library = match NonNull::new(library) {
             Some(l) => l,
             None => {
                 // SAFETY: we own the mapping.
-                unsafe { crate::syscall::munmap(map_ptr, map_len) };
+                unsafe { crate::platform::syscall::munmap(map_ptr, map_len) };
                 return Err(Error::msg("FT_Init_FreeType returned null"));
             }
         };
@@ -277,7 +277,7 @@ impl Face {
             // SAFETY: library came from FT_Init_FreeType; the mapping is ours.
             unsafe {
                 FT_Done_FreeType(library.as_ptr());
-                crate::syscall::munmap(map_ptr, map_len);
+                crate::platform::syscall::munmap(map_ptr, map_len);
             }
             return Err(Error::msg("FT_New_Memory_Face failed"));
         }
@@ -287,7 +287,7 @@ impl Face {
                 // SAFETY: library is valid and not yet freed; mapping is ours.
                 unsafe {
                     FT_Done_FreeType(library.as_ptr());
-                    crate::syscall::munmap(map_ptr, map_len);
+                    crate::platform::syscall::munmap(map_ptr, map_len);
                 }
                 return Err(Error::msg("FT_New_Memory_Face returned null"));
             }
@@ -401,7 +401,7 @@ impl Drop for Face {
         unsafe {
             FT_Done_Face(self.face.as_ptr());
             FT_Done_FreeType(self.library.as_ptr());
-            crate::syscall::munmap(self.map_ptr, self.map_len);
+            crate::platform::syscall::munmap(self.map_ptr, self.map_len);
         }
     }
 }
@@ -446,24 +446,29 @@ mod tests {
     fn load_face() -> Face {
         // mmap the fixture the same way the real loader does, then hand the
         // mapping to the Face (which owns and unmaps it).
-        let cp = crate::fs::cpath(FIXTURE).expect("cpath");
-        let st =
-            crate::syscall::newfstatat(crate::syscall::AT_FDCWD, &cp, 0).expect("stat fixture");
+        let cp = crate::platform::fs::cpath(FIXTURE).expect("cpath");
+        let st = crate::platform::syscall::newfstatat(crate::platform::syscall::AT_FDCWD, &cp, 0)
+            .expect("stat fixture");
         let len = st.st_size as usize;
-        let fd = crate::syscall::openat(crate::syscall::AT_FDCWD, &cp, crate::syscall::O_RDONLY, 0);
+        let fd = crate::platform::syscall::openat(
+            crate::platform::syscall::AT_FDCWD,
+            &cp,
+            crate::platform::syscall::O_RDONLY,
+            0,
+        );
         assert!(fd >= 0, "open fixture");
         let ptr = unsafe {
-            crate::syscall::mmap(
+            crate::platform::syscall::mmap(
                 core::ptr::null_mut(),
                 len,
-                crate::syscall::PROT_READ,
-                crate::syscall::MAP_PRIVATE,
+                crate::platform::syscall::PROT_READ,
+                crate::platform::syscall::MAP_PRIVATE,
                 fd,
                 0,
             )
         };
-        assert!(!crate::syscall::mmap_failed(ptr), "mmap fixture");
-        unsafe { crate::syscall::close(fd) };
+        assert!(!crate::platform::syscall::mmap_failed(ptr), "mmap fixture");
+        unsafe { crate::platform::syscall::close(fd) };
         Face::from_mmap(ptr, len).expect("build face from fixture")
     }
 

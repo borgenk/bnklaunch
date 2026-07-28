@@ -4,13 +4,13 @@
 //! alpha blending onto the pixel buffer. Glyph rasterization and metrics come
 //! from freetype.rs; this module owns font discovery, layout, and the blit.
 
-use crate::error::{Error, Result};
-use crate::freetype;
-use crate::syscall::{self, Fd, AT_FDCWD, DT_DIR, DT_LNK, DT_REG, O_RDONLY};
-use crate::{env, fs};
+use crate::platform::error::{Error, Result};
+use crate::platform::freetype;
+use crate::platform::syscall::{self, Fd, AT_FDCWD, DT_DIR, DT_LNK, DT_REG, O_RDONLY};
+use crate::platform::{env, fs};
 
 /// A scanned filesystem path.
-type ScanPath = crate::arena::ArrayString<{ fs::PATH_CAP }>;
+type ScanPath = crate::platform::arena::ArrayString<{ fs::PATH_CAP }>;
 
 /// Join two path segments with a single separator, or None if it does not fit.
 fn join(base: &str, child: &str) -> Option<ScanPath> {

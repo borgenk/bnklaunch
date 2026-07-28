@@ -4,8 +4,8 @@
 //! config). Applied at presentation time so edits take effect on the next
 //! launch without invalidating the desktop entry cache.
 
-use crate::arena::ArrayString;
 use crate::desktop::{Catalog, NAME_CAP};
+use crate::platform::arena::ArrayString;
 
 /// Drop entries whose name is in deny (in place, preserving order of the rest).
 pub fn apply(entries: &mut Catalog, deny: &[ArrayString<NAME_CAP>]) {
@@ -18,8 +18,8 @@ pub fn apply(entries: &mut Catalog, deny: &[ArrayString<NAME_CAP>]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::ArrayVec;
     use crate::desktop::DesktopEntry;
+    use crate::platform::arena::ArrayVec;
 
     fn entry(name: &str) -> DesktopEntry {
         DesktopEntry::new(name, "x", "").unwrap()
