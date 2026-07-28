@@ -1,5 +1,8 @@
 # BNK Launch
 
+[![CI](https://github.com/borgenk/bnklaunch/actions/workflows/ci.yml/badge.svg)](https://github.com/borgenk/bnklaunch/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/borgenk/bnklaunch)](https://github.com/borgenk/bnklaunch/releases/latest)
+
 A minimal Wayland application launcher written in Rust.
 
 _Disclaimer: learning project, non-standard Rust, built mainly for my own use, AI-assisted._
