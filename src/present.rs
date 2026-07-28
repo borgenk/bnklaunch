@@ -226,6 +226,13 @@ impl Present {
         }
     }
 
+    /// The buffer id of the frame the renderer draws into next, which is the id
+    /// the compositor names when it releases that frame.
+    #[cfg(test)]
+    pub(crate) fn current_buffer_id(&self) -> Option<u32> {
+        self.frames.get(self.current).map(|f| f.buffer_id)
+    }
+
     /// The pixels of the frame being drawn into, if it is free to draw into.
     pub fn pixels(&mut self) -> Option<&mut PixelBuffer> {
         let current = self.current;
@@ -272,13 +279,13 @@ impl Present {
         Ok(())
     }
 
-    /// A wl_buffer.release names a frame the compositor has finished with.
-    /// Returns true when the id was one of ours, so the caller knows the event
-    /// is handled.
-    pub fn release(&mut self, conn: &mut Connection, buffer_id: u32) -> Result<bool> {
+    /// A wl_buffer.release names a frame the compositor has finished with. An id
+    /// naming neither a live frame nor a retired one is not ours, and there is
+    /// nothing to do about it.
+    pub fn release(&mut self, conn: &mut Connection, buffer_id: u32) -> Result<()> {
         if let Some(frame) = self.frames.iter_mut().find(|f| f.buffer_id == buffer_id) {
             frame.held = false;
-            return Ok(true);
+            return Ok(());
         }
 
         // A retired frame's release is the last thing that has to happen before
@@ -290,9 +297,8 @@ impl Present {
                 conn.flush()?;
                 // retired._pixels drops here: munmap plus close of the memfd.
             }
-            return Ok(true);
         }
-        Ok(false)
+        Ok(())
     }
 
     /// Retire every frame and allocate a fresh set at the new size. The old ones

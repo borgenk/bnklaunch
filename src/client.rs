@@ -400,15 +400,6 @@ impl Client {
             }
         }
 
-        // A wl_buffer.release says the compositor has finished with a frame: it
-        // is free to draw into again, or, if it was retired by a resize, free to
-        // unmap.
-        if msg.opcode == proto::wl_buffer::EV_RELEASE
-            && self.present.release(&mut self.socket, msg.object)?
-        {
-            return Ok(());
-        }
-
         // wl_seat events
         if Some(msg.object) == self.bindings.seat {
             match msg.opcode {
@@ -597,6 +588,19 @@ impl Client {
             .handle(&mut self.socket, msg.object, msg.opcode, &msg.body)?
         {
             return Ok(());
+        }
+
+        // A wl_buffer.release says the compositor has finished with a frame: it
+        // is free to draw into again, or, if it was retired by a resize, free to
+        // unmap.
+        //
+        // This is the one test that starts from an opcode rather than an object,
+        // and opcode 0 is crowded: wl_seat.capabilities, wl_pointer.enter,
+        // wl_registry.global and wl_data_offer.offer all share it. So it runs
+        // last, once every message belonging to a known object has been claimed
+        // by that object, and only ever sees what is left over.
+        if msg.opcode == proto::wl_buffer::EV_RELEASE {
+            self.present.release(&mut self.socket, msg.object)?;
         }
 
         Ok(())
@@ -971,6 +975,51 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::syscall::Fd;
+    use crate::platform::wire::MSG_BODY_CAP;
+
+    /// A client talking to one end of a socketpair, with the other end handed
+    /// back so the test can play compositor.
+    fn test_client() -> (Client, Fd) {
+        let (socket, peer) = Connection::pair();
+        let client = Client {
+            socket,
+            ids: IdAllocator::new(),
+            globals: ArrayVec::new(),
+            bindings: Bindings::default(),
+            present: Present::new(),
+            running: true,
+            sync_callback: None,
+            sync_done: false,
+            keyboard: Keyboard {
+                id: None,
+                focused: false,
+                xkb: Xkb::new().expect("xkb context"),
+            },
+            key_repeat: KeyRepeat::default(),
+            pointer: Pointer::default(),
+            editor: Editor::new(),
+            clipboard_op: clipboard::Op::None,
+            clipboard: Clipboard::default(),
+            last_serial: 0,
+            input_changed: false,
+            pending_action: PendingAction::None,
+        };
+        (client, peer)
+    }
+
+    /// An event for an object, carrying the given u32 arguments.
+    fn event(object: u32, opcode: u16, args: &[u32]) -> Message {
+        let mut body: ArrayVec<u8, MSG_BODY_CAP> = ArrayVec::new();
+        for a in args {
+            body.extend_from_slice(&a.to_ne_bytes()).expect("argument");
+        }
+        Message {
+            object,
+            opcode,
+            body,
+        }
+    }
 
     #[test]
     fn id_allocator_reuses_recycled_ids() {
@@ -983,5 +1032,66 @@ mod tests {
         ids.recycle(a);
         assert_eq!(ids.allocate(), a);
         assert_eq!(ids.allocate(), 4);
+    }
+
+    /// Opcode 0 means five different things: wl_buffer.release,
+    /// wl_seat.capabilities, wl_pointer.enter, wl_registry.global and
+    /// wl_data_offer.offer. Only the object id tells them apart, so every event
+    /// here carries the same opcode and differs only in who it is addressed to.
+    #[test]
+    fn opcode_zero_is_routed_by_object_and_never_by_opcode() {
+        let (mut client, _peer) = test_client();
+
+        // A surface with two frames, both committed, so the compositor holds
+        // each of them and neither is free to draw into.
+        client.bindings.compositor = Some(client.ids.allocate());
+        client.bindings.layer_shell = Some(client.ids.allocate());
+        client.bindings.shm = Some(client.ids.allocate());
+        client.create_layer_surface(64, 64).expect("layer surface");
+        client.create_buffer().expect("frames");
+        client
+            .present
+            .commit(&mut client.socket)
+            .expect("first frame");
+        client
+            .present
+            .commit(&mut client.socket)
+            .expect("second frame");
+        assert!(!client.present.ready(), "the compositor holds both frames");
+
+        let seat = client.ids.allocate();
+        client.bindings.seat = Some(seat);
+
+        // The seat's capabilities. Asking for the input devices is what proves
+        // this reached the seat rather than the buffer-release check.
+        let caps = proto::wl_seat::CAP_KEYBOARD | proto::wl_seat::CAP_POINTER;
+        client
+            .handle_message(event(seat, proto::wl_seat::EV_CAPABILITIES, &[caps]))
+            .expect("capabilities");
+        assert!(
+            client.keyboard.id.is_some(),
+            "the seat asked for a keyboard"
+        );
+        assert!(client.pointer.id.is_some(), "the seat asked for a pointer");
+
+        // A buffer release naming a frame, which frees it to draw into again.
+        let frame = client.present.current_buffer_id().expect("a frame");
+        client
+            .handle_message(event(frame, proto::wl_buffer::EV_RELEASE, &[]))
+            .expect("release");
+        assert!(client.present.ready(), "the released frame came free");
+
+        // The pointer entering the surface. Its arguments are a serial and a
+        // position, and reading them back is what proves it landed here.
+        let pointer = client.pointer.id.expect("pointer");
+        client
+            .handle_message(event(
+                pointer,
+                proto::wl_pointer::EV_ENTER,
+                &[9, 0, 256, 512],
+            ))
+            .expect("enter");
+        assert_eq!(client.last_serial, 9);
+        assert_eq!((client.pointer.x, client.pointer.y), (1.0, 2.0));
     }
 }

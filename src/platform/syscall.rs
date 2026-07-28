@@ -1,6 +1,15 @@
 //! Raw Linux syscall wrappers.
 //!
 //! Direct syscall access for x86_64 Linux.
+//!
+//! The lowest layer in the crate: inline assembly that issues the syscall
+//! instruction, and thin typed wrappers over it that everything above trusts to
+//! be correct. Most of those wrappers are themselves safe. They take a slice, a
+//! reference, or a checked CPath, derive the raw pointer inside, and keep the
+//! unsafe in one block, so the filesystem, cache, clipboard, time and stderr
+//! paths that call them carry no unsafe at all. What is left here is the
+//! assembly plus the few wrappers that still hand back a raw pointer or a
+//! mapping.
 
 #![allow(dead_code)]
 #![allow(non_camel_case_types)]

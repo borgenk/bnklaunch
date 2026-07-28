@@ -13,11 +13,10 @@ use crate::platform::error::{Error, Result};
 /// Header size in bytes (object_id + size_opcode).
 pub const HEADER_SIZE: usize = 8;
 
-/// Largest message the wire format can express: the size field is 16 bits.
-pub const MAX_MESSAGE_SIZE: usize = 65536;
-
 /// Body capacity of one received message. The events the launcher reads are
-/// small: the keymap arrives as an fd, not inline.
+/// small: the keymap arrives as an fd, not inline. The wire format allows a
+/// message four times this, since the size field is 16 bits, and the connection
+/// refuses one that large rather than provision for it.
 pub const MSG_BODY_CAP: usize = 16 * 1024;
 
 /// A fully received event: its target object, opcode, and the argument bytes

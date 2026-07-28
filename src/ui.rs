@@ -68,6 +68,23 @@ pub(crate) fn calculate_height(num_results: usize) -> u32 {
     }
 }
 
+/// The result row a pointer position falls in, given how many rows are drawn.
+/// None for a position above the list, past the last row, or outside the field
+/// horizontally. The same arithmetic draw_ui lays the rows out with, read
+/// backwards, so the two cannot disagree about where a row is.
+pub(crate) fn row_at(x: f64, y: f64, num_results: usize) -> Option<usize> {
+    let rows = num_results.min(MAX_RESULTS);
+    if x < MARGIN_X as f64 || x >= (MARGIN_X + FIELD_W) as f64 {
+        return None;
+    }
+    let offset = y - RESULTS_START_Y as f64;
+    if offset < 0.0 {
+        return None;
+    }
+    let row = (offset / RESULT_HEIGHT as f64) as usize;
+    (row < rows).then_some(row)
+}
+
 /// What the caret and the selection look like this frame.
 pub(crate) struct Caret {
     /// Char offset of the caret in the input text.
@@ -205,4 +222,66 @@ fn draw_preview_row(pixels: &mut shm::PixelBuffer, title: &str, subtitle: &str, 
     let y = RESULTS_START_Y;
     pixels.fill_rect(MARGIN_X, y, FIELD_W, RESULT_HEIGHT, SELECTED_BG);
     draw_row(pixels, y, title, subtitle, font);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A point comfortably inside the field horizontally, which is what every
+    /// vertical case below wants to hold still.
+    const MID_X: f64 = (MARGIN_X + FIELD_W / 2) as f64;
+
+    #[test]
+    fn row_at_maps_a_position_to_the_row_drawn_there() {
+        let top = RESULTS_START_Y as f64;
+        assert_eq!(row_at(MID_X, top, 3), Some(0));
+        assert_eq!(row_at(MID_X, top + RESULT_HEIGHT as f64, 3), Some(1));
+        assert_eq!(row_at(MID_X, top + 2.0 * RESULT_HEIGHT as f64, 3), Some(2));
+    }
+
+    #[test]
+    fn a_row_boundary_belongs_to_the_row_below_it() {
+        // The rows butt up against each other, so the pixel a row starts on is
+        // that row's and the one before it ends a pixel short.
+        let boundary = (RESULTS_START_Y + RESULT_HEIGHT) as f64;
+        assert_eq!(row_at(MID_X, boundary - 0.5, 3), Some(0));
+        assert_eq!(row_at(MID_X, boundary, 3), Some(1));
+    }
+
+    #[test]
+    fn row_at_ignores_everything_that_is_not_a_row() {
+        let top = RESULTS_START_Y as f64;
+        // The input field sits above the list.
+        assert_eq!(row_at(MID_X, top - 1.0, 3), None);
+        assert_eq!(row_at(MID_X, INPUT_START_Y as f64, 3), None);
+        // Past the last row drawn, which is not the same as past the window: a
+        // shorter list leaves the rows below it undrawn.
+        assert_eq!(row_at(MID_X, top + 3.0 * RESULT_HEIGHT as f64, 3), None);
+        assert_eq!(row_at(MID_X, top + RESULT_HEIGHT as f64, 1), None);
+        // No results at all means no row anywhere.
+        assert_eq!(row_at(MID_X, top, 0), None);
+    }
+
+    #[test]
+    fn row_at_stops_at_the_edges_of_the_field() {
+        let top = RESULTS_START_Y as f64;
+        assert_eq!(row_at(MARGIN_X as f64, top, 3), Some(0));
+        assert_eq!(row_at(MARGIN_X as f64 - 1.0, top, 3), None);
+        assert_eq!(row_at((MARGIN_X + FIELD_W - 1) as f64, top, 3), Some(0));
+        assert_eq!(row_at((MARGIN_X + FIELD_W) as f64, top, 3), None);
+    }
+
+    #[test]
+    fn row_at_never_points_past_what_the_list_draws() {
+        // draw_ui paints at most MAX_RESULTS rows, whatever the count says, so
+        // the hit test must not hand back an index into a row nothing painted.
+        let top = RESULTS_START_Y as f64;
+        let past = top + (MAX_RESULTS as f64) * RESULT_HEIGHT as f64;
+        assert_eq!(row_at(MID_X, past, MAX_RESULTS + 5), None);
+        assert_eq!(
+            row_at(MID_X, past - 1.0, MAX_RESULTS + 5),
+            Some(MAX_RESULTS - 1)
+        );
+    }
 }

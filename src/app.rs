@@ -420,8 +420,8 @@ fn event_loop(
             client.process_clipboard();
         }
 
-        // Handle pointer click/drag in the input box
-        handle_pointer_input(client, font);
+        // Handle pointer clicks on a result row, and click/drag in the input box
+        handle_pointer_input(client, &mut state.selected, font, total_rows);
 
         // Repaint on any of three triggers: the input changed, the selection
         // moved, or the caret blinked. They differ only in what they settle
@@ -551,10 +551,33 @@ fn repaint(
     })
 }
 
-/// Process pointer events and translate to cursor/selection changes.
-fn handle_pointer_input(client: &mut Client, font: &font::Font) {
+/// Process pointer events: a click on a result row launches it, and a click or
+/// drag in the input box moves the caret or extends the selection.
+///
+/// Takes the selection alone rather than the whole state, which the caller is
+/// still holding a borrow of: the rows on screen point into state.entries.
+fn handle_pointer_input(
+    client: &mut Client,
+    selected: &mut usize,
+    font: &font::Font,
+    total_rows: usize,
+) {
     let px = client.pointer.x;
     let py = client.pointer.y;
+
+    // A click on a result row selects it and ends the loop on a launch, which
+    // is where Enter arrives too. Clearing the redraw flag on the way out keeps
+    // the last pass from resizing a window that is about to go away.
+    if client.pointer.clicked {
+        if let Some(row) = ui::row_at(px, py, total_rows) {
+            *selected = row;
+            client.pointer.clicked = false;
+            client.input_changed = false;
+            client.pending_action = PendingAction::Launch;
+            client.running = false;
+            return;
+        }
+    }
 
     // Check if pointer is in the input box region
     let in_input_box = py >= ui::INPUT_START_Y as f64

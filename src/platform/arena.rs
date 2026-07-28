@@ -4,6 +4,17 @@
 //! whole program runs without an allocator. ArrayVec and ArrayString stand in
 //! for Vec and String, and every write that would exceed the capacity is
 //! reported instead of growing.
+//!
+//! Storing elements inline with no allocator means MaybeUninit, and one
+//! invariant carries every unsafe block below. ArrayVec holds
+//! [MaybeUninit<T>; N] of which only the first len slots are initialized: a slot
+//! below len was written before len reached it, and a slot at or above len is
+//! dead and never read without being written first. len drops before a vacated
+//! top slot can be observed, and a bulk drop sets len to its final value before
+//! dropping anything, so a panicking Drop cannot revisit a slot already dropped.
+//! ArrayString keeps the parallel invariant that buf[..len] is always valid
+//! UTF-8, since every writer appends or moves whole code points and checks char
+//! boundaries. The SAFETY comments below name this rather than restate it.
 
 use core::fmt;
 use core::mem::MaybeUninit;

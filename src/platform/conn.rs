@@ -20,10 +20,19 @@ use crate::platform::syscall::{
     self, pollfd, sockaddr_un, Fd, RawFd, AF_UNIX, EAGAIN, EINTR, F_GETFL, F_SETFL, O_NONBLOCK,
     POLLIN, POLLOUT, SOCK_CLOEXEC, SOCK_STREAM,
 };
-use crate::platform::wire::{self, Arg, Message, HEADER_SIZE, MAX_MESSAGE_SIZE, MSG_BODY_CAP};
+use crate::platform::wire::{self, Arg, Message, HEADER_SIZE, MSG_BODY_CAP};
+
+/// The largest message next_message will accept. The wire format can express
+/// one of 64 KB, since the size field is 16 bits, but a body over MSG_BODY_CAP
+/// has nowhere to go, so anything larger is refused from its header alone.
+/// Everything below is sized against this rather than the format's maximum:
+/// a message that would be rejected never has to fit anywhere.
+const MAX_ACCEPTED: usize = HEADER_SIZE + MSG_BODY_CAP;
 
 /// Incoming-data buffer: a full message plus headroom for the next partial read.
-const RECV_CAP: usize = 2 * MAX_MESSAGE_SIZE;
+/// next_message leaves at most one incomplete message behind, so a fill lands a
+/// whole chunk on top of less than one message and cannot overflow.
+const RECV_CAP: usize = 2 * MAX_ACCEPTED;
 /// Outgoing-request buffer. A frame is attach, damage, and commit; the bind
 /// burst at startup is a handful of short requests. Neither is close to this.
 const OUT_CAP: usize = 8 * 1024;
@@ -40,11 +49,12 @@ pub struct Connection {
     /// Requests buffered since the last flush.
     out: ArrayVec<u8, OUT_CAP>,
     in_buf: ArrayVec<u8, RECV_CAP>,
-    /// Landing buffer for one recvmsg, owned by the connection and zeroed once
-    /// at connect. A local of this size costs a 64 KB memset on every call, and
-    /// fill runs twice per event-loop wakeup: once to drain the socket, once to
-    /// meet the would-block that says it is empty.
-    chunk: [u8; MAX_MESSAGE_SIZE],
+    /// Landing buffer for one recvmsg, holding one whole acceptable message.
+    /// Owned by the connection and zeroed once at connect: a local of this size
+    /// costs a memset on every call, and fill runs twice per event-loop wakeup,
+    /// once to drain the socket and once to meet the would-block that says it is
+    /// empty.
+    chunk: [u8; MAX_ACCEPTED],
     /// How many bytes at the front of in_buf next_message has already consumed.
     /// Each parsed message advances this cursor instead of shifting the rest of
     /// the buffer down, which would cost O(remaining) per message; the consumed
@@ -113,10 +123,29 @@ impl Connection {
             fd,
             out: ArrayVec::new(),
             in_buf: ArrayVec::new(),
-            chunk: [0; MAX_MESSAGE_SIZE],
+            chunk: [0; MAX_ACCEPTED],
             in_pos: 0,
             fds: ArrayVec::new(),
         })
+    }
+
+    /// A connection on one end of a socketpair, with the other end handed back
+    /// so a test can play compositor. No real compositor and no mocks: the same
+    /// syscalls the real connection makes, against a real socket.
+    #[cfg(test)]
+    pub(crate) fn pair() -> (Self, Fd) {
+        let mut fds = [0i32; 2];
+        let r = syscall::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, &mut fds);
+        assert_eq!(r, 0, "socketpair failed");
+        let conn = Self {
+            fd: fds[0],
+            out: ArrayVec::new(),
+            in_buf: ArrayVec::new(),
+            chunk: [0; MAX_ACCEPTED],
+            in_pos: 0,
+            fds: ArrayVec::new(),
+        };
+        (conn, Fd::new(fds[1]))
     }
 
     /// The socket's raw fd, so the event loop can poll it. Read-only: the
@@ -312,6 +341,13 @@ impl Connection {
             return Ok(None);
         }
         let (object, opcode, size) = wire::parse_header(buf)?;
+        // The header alone settles whether the body will fit, so an oversized
+        // message is refused before any of it is waited for. Waiting first would
+        // mean provisioning the buffers for a message that is going to be
+        // rejected either way, and stalling on bytes nothing will ever read.
+        if size > MAX_ACCEPTED {
+            return Err(Error::msg("wayland message body too large"));
+        }
         if buf.len() < size {
             return Ok(None);
         }
@@ -379,24 +415,6 @@ mod tests {
     use super::*;
     use crate::platform::protocol as proto;
 
-    /// A Connection wired to one end of a socketpair, with the other end handed
-    /// back so a test can play compositor. No real compositor, no mocks: the
-    /// same syscalls the real connection makes, against a real socket.
-    fn connected_pair() -> (Connection, Fd) {
-        let mut fds = [0i32; 2];
-        let r = syscall::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, &mut fds);
-        assert_eq!(r, 0, "socketpair failed");
-        let conn = Connection {
-            fd: fds[0],
-            out: ArrayVec::new(),
-            in_buf: ArrayVec::new(),
-            chunk: [0; MAX_MESSAGE_SIZE],
-            in_pos: 0,
-            fds: ArrayVec::new(),
-        };
-        (conn, Fd::new(fds[1]))
-    }
-
     /// Everything the peer end can read right now.
     fn drain(peer: &Fd) -> Vec<u8> {
         let mut out = Vec::new();
@@ -421,7 +439,7 @@ mod tests {
 
     #[test]
     fn requests_are_buffered_until_flush() {
-        let (mut conn, peer) = connected_pair();
+        let (mut conn, peer) = Connection::pair();
         conn.request(1, proto::wl_display::SYNC, &[Arg::NewId(2)])
             .expect("queue");
         assert!(drain(&peer).is_empty(), "nothing goes out before a flush");
@@ -434,7 +452,7 @@ mod tests {
 
     #[test]
     fn a_flush_coalesces_every_queued_request_into_one_write() {
-        let (mut conn, peer) = connected_pair();
+        let (mut conn, peer) = Connection::pair();
         // The frame path: attach, damage, commit. One hand-off, in order.
         for op in [
             proto::wl_surface::ATTACH,
@@ -462,7 +480,7 @@ mod tests {
 
     #[test]
     fn messages_are_framed_out_of_a_partial_stream() {
-        let (mut conn, peer) = connected_pair();
+        let (mut conn, peer) = Connection::pair();
 
         // The peer writes one and a half messages: a whole sync callback done,
         // then only the header of the next.
@@ -501,7 +519,7 @@ mod tests {
 
     #[test]
     fn the_consumed_prefix_is_compacted_once_per_fill() {
-        let (mut conn, peer) = connected_pair();
+        let (mut conn, peer) = Connection::pair();
         let mut stream: ArrayVec<u8, 256> = ArrayVec::new();
         for i in 0..4u32 {
             wire::encode(&mut stream, i + 1, 0, &[Arg::Uint(i)]).expect("encode");
@@ -526,7 +544,7 @@ mod tests {
 
     #[test]
     fn a_passed_fd_arrives_on_the_queue() {
-        let (mut conn, peer) = connected_pair();
+        let (mut conn, peer) = Connection::pair();
 
         // The peer passes an fd the way the compositor passes a keymap.
         let mut pipe = [0i32; 2];
@@ -552,13 +570,39 @@ mod tests {
     }
 
     #[test]
+    fn a_body_over_the_cap_is_refused_from_the_header_alone() {
+        let (mut conn, peer) = Connection::pair();
+
+        // A well-formed header announcing a body the parser cannot accept, and
+        // nothing after it. The refusal is settled by the header, so the rest of
+        // the message never has to arrive, and never has to fit anywhere: the
+        // receive buffer is not big enough to hold one of these, by design.
+        let size = MAX_ACCEPTED + 4;
+        assert!(
+            size <= u16::MAX as usize,
+            "the wire format can express this"
+        );
+        let mut header = [0u8; HEADER_SIZE];
+        header[..4].copy_from_slice(&7u32.to_ne_bytes());
+        let word = ((size as u32) << 16) | u32::from(proto::wl_surface::COMMIT);
+        header[4..].copy_from_slice(&word.to_ne_bytes());
+        assert!(syscall::write_fd(peer.as_raw_fd(), &header) > 0);
+
+        conn.fill().expect("fill");
+        assert_eq!(
+            conn.next_message().expect_err("refused"),
+            Error::msg("wayland message body too large")
+        );
+    }
+
+    #[test]
     fn a_flush_finishes_a_write_the_socket_could_not_take_at_once() {
         // On a non-blocking socket a write can take some bytes and then say
         // EAGAIN. Reporting that as an error would strand the tail of a half-sent
         // request, and the next request would be appended straight onto the
         // fragment, which the compositor reads as a corrupt stream. So the flush
         // has to wait for the socket and finish what it started.
-        let (mut conn, peer) = connected_pair();
+        let (mut conn, peer) = Connection::pair();
         conn.set_nonblocking(true).expect("nonblocking");
 
         // Stuff the socket until the kernel will not take another byte, so the
