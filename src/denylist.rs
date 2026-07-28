@@ -22,7 +22,7 @@ mod tests {
     use crate::platform::arena::ArrayVec;
 
     fn entry(name: &str) -> DesktopEntry {
-        DesktopEntry::new(name, "x", "").unwrap()
+        DesktopEntry::new(name, "x").unwrap()
     }
 
     fn catalog(names: &[&str]) -> Catalog {

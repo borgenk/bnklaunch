@@ -4,6 +4,7 @@
 //! See: https://specifications.freedesktop.org/desktop-entry-spec/latest/
 
 use crate::platform::arena::{ArrayString, ArrayVec};
+use crate::platform::fs::{join, ScanPath};
 use crate::platform::syscall::{DT_DIR, DT_LNK, DT_REG};
 use crate::platform::{env, fs};
 #[cfg(test)]
@@ -14,21 +15,6 @@ const MAX_DATA_DIRS: usize = 16;
 /// Largest .desktop file read; these are short key=value files.
 const DESKTOP_FILE_MAX: usize = 64 * 1024;
 
-/// A scanned filesystem path.
-type ScanPath = ArrayString<{ fs::PATH_CAP }>;
-
-/// Join two path segments with a single separator, or None if the result does
-/// not fit.
-fn join(base: &str, child: &str) -> Option<ScanPath> {
-    let mut p = ScanPath::new();
-    p.push_str(base).ok()?;
-    if !base.ends_with('/') {
-        p.push('/').ok()?;
-    }
-    p.push_str(child).ok()?;
-    Some(p)
-}
-
 /// Byte capacity of an entry's display name. Names longer than this are skipped
 /// rather than truncated; real desktop entries are far shorter.
 pub const NAME_CAP: usize = 256;
@@ -38,8 +24,6 @@ pub const NAME_CAP: usize = 256;
 /// past a few hundred bytes, and dropping those installed apps is worse than
 /// the extra catalog bytes.
 pub const EXEC_CAP: usize = 1024;
-/// Byte capacity of an entry's icon name (empty means no icon).
-pub const ICON_CAP: usize = 64;
 /// Byte capacity of one tokenized Exec argument. Tokenizing only ever removes
 /// characters from the Exec value, so an argument cannot outgrow the value it
 /// came from: matching EXEC_CAP here makes a truncated argument impossible
@@ -117,35 +101,40 @@ pub struct DesktopEntry {
     /// the difference between a search that scales with the alphabet and one
     /// that scales with the catalog.
     name_lower: ArrayString<NAME_CAP>,
+    /// Character count of the name, the length ranking reads. Derived with
+    /// name_lower, because counting it is a UTF-8 walk and score would
+    /// otherwise do one per catalog entry per keystroke.
+    name_chars: u32,
     /// Raw Exec value, tokenized per the spec at launch time (see exec_argv).
     pub exec: ArrayString<EXEC_CAP>,
-    /// Icon name, empty when the entry has none. Not rendered yet.
-    #[allow(dead_code)]
-    pub icon: ArrayString<ICON_CAP>,
 }
 
 impl DesktopEntry {
     /// Build an entry from its fields. None when a field exceeds its capacity,
     /// so an absurdly long field skips the entry rather than truncating it.
-    /// icon may be empty.
-    pub fn new(name: &str, exec: &str, icon: &str) -> Option<Self> {
-        let mut e = DesktopEntry {
-            name: ArrayString::new(),
-            name_lower: ArrayString::new(),
-            exec: ArrayString::new(),
-            icon: ArrayString::new(),
-        };
+    pub fn new(name: &str, exec: &str) -> Option<Self> {
+        let mut e = DesktopEntry::blank();
         e.name.push_str(name).ok()?;
         e.exec.push_str(exec).ok()?;
-        e.icon.push_str(icon).ok()?;
-        e.derive_match_key();
+        e.derive_search_keys();
         Some(e)
     }
 
-    /// Rebuild the lowercased name from the name.
-    fn derive_match_key(&mut self) {
+    /// An entry with every field empty, for a caller that fills them itself.
+    fn blank() -> Self {
+        DesktopEntry {
+            name: ArrayString::new(),
+            name_lower: ArrayString::new(),
+            name_chars: 0,
+            exec: ArrayString::new(),
+        }
+    }
+
+    /// Rebuild what search compares and ranks against, from the name.
+    fn derive_search_keys(&mut self) {
         self.name_lower.clear();
         push_lower(&mut self.name_lower, &self.name);
+        self.name_chars = self.name.chars().count() as u32;
     }
 
     /// Parse a desktop file from the given path.
@@ -165,7 +154,6 @@ impl DesktopEntry {
         let mut type_value = "";
         let mut name: Option<&str> = None;
         let mut exec: Option<&str> = None;
-        let mut icon = "";
         let mut no_display = false;
         let mut hidden = false;
 
@@ -202,7 +190,6 @@ impl DesktopEntry {
                     "Type" => type_value = value,
                     "Name" => name = Some(value),
                     "Exec" => exec = Some(value),
-                    "Icon" => icon = value,
                     "NoDisplay" => no_display = value == "true",
                     "Hidden" => hidden = value == "true",
                     _ => {}
@@ -219,18 +206,12 @@ impl DesktopEntry {
         }
 
         // Name and Exec are required; the raw Exec is tokenized at launch time.
-        // All three are string-typed keys, so their escape sequences resolve
-        // here, before anything reads the value.
-        let mut e = DesktopEntry {
-            name: ArrayString::new(),
-            name_lower: ArrayString::new(),
-            exec: ArrayString::new(),
-            icon: ArrayString::new(),
-        };
+        // Both are string-typed keys, so their escape sequences resolve here,
+        // before anything reads the value.
+        let mut e = DesktopEntry::blank();
         unescape_into(&mut e.name, name?).ok()?;
         unescape_into(&mut e.exec, exec?).ok()?;
-        unescape_into(&mut e.icon, icon).ok()?;
-        e.derive_match_key();
+        e.derive_search_keys();
         Some(e)
     }
 
@@ -252,7 +233,7 @@ impl DesktopEntry {
         if name == query_lower {
             return 300;
         }
-        let len_penalty = (self.name.chars().count() as i32).min(50);
+        let len_penalty = (self.name_chars as i32).min(50);
         if name.starts_with(query_lower) {
             return 200 - len_penalty;
         }
@@ -444,18 +425,7 @@ pub fn discover_entries(out: &mut ArrayVec<DesktopEntry, MAX_ENTRIES>) {
     // reads that follow are not: a few hundred small files, none of which cares
     // about the others.
     let mut paths: ArrayVec<ScanPath, MAX_ENTRIES> = ArrayVec::new();
-    let mut seen_ids: ArrayVec<ArrayString<ID_CAP>, MAX_ENTRIES> = ArrayVec::new();
-
-    let mut dirs: ArrayVec<ScanPath, MAX_DATA_DIRS> = ArrayVec::new();
-    get_data_dirs(&mut dirs);
-    for dir in dirs.iter() {
-        if let Some(apps_dir) = join(dir, "applications") {
-            if fs::is_dir(&apps_dir) {
-                collect_paths(&apps_dir, &apps_dir, &mut seen_ids, &mut paths);
-            }
-        }
-    }
-
+    collect_all_paths(&mut paths);
     read_entries(&paths, out);
 
     // Sort alphabetically by name, on the lowercased key each entry carries.
@@ -464,9 +434,8 @@ pub fn discover_entries(out: &mut ArrayVec<DesktopEntry, MAX_ENTRIES>) {
 }
 
 /// The path of every desktop file the data dirs offer, deduplicated by id in
-/// precedence order. The walk half of a scan, without the reading half, so the
-/// bench can time the reading on its own.
-#[cfg(test)]
+/// precedence order. The walk half of a scan, split out from the reading half so
+/// the bench can time the reading on its own.
 pub(crate) fn collect_all_paths(paths: &mut ArrayVec<ScanPath, MAX_ENTRIES>) {
     let mut seen_ids: ArrayVec<ArrayString<ID_CAP>, MAX_ENTRIES> = ArrayVec::new();
     let mut dirs: ArrayVec<ScanPath, MAX_DATA_DIRS> = ArrayVec::new();
@@ -480,7 +449,8 @@ pub(crate) fn collect_all_paths(paths: &mut ArrayVec<ScanPath, MAX_ENTRIES>) {
     }
 }
 
-/// Read and parse every discovered file, one at a time.
+/// Read and parse every discovered file, one at a time: open, read, close,
+/// parse, next.
 ///
 /// This looks like the obvious candidate for io_uring: a few hundred small
 /// independent files, order irrelevant, three syscalls apiece. The ring can do
@@ -503,15 +473,7 @@ pub(crate) fn collect_all_paths(paths: &mut ArrayVec<ScanPath, MAX_ENTRIES>) {
 /// The capability stays in the platform layer, tested, because the finding is
 /// worth being able to re-check. `make scan-bench` times both against each
 /// other.
-fn read_entries(paths: &[ScanPath], out: &mut ArrayVec<DesktopEntry, MAX_ENTRIES>) {
-    read_entries_serial(paths, out);
-}
-
-/// One file at a time: open, read, close, parse, next.
-pub(crate) fn read_entries_serial(
-    paths: &[ScanPath],
-    out: &mut ArrayVec<DesktopEntry, MAX_ENTRIES>,
-) {
+pub(crate) fn read_entries(paths: &[ScanPath], out: &mut ArrayVec<DesktopEntry, MAX_ENTRIES>) {
     for path in paths {
         if let Some(entry) = DesktopEntry::from_file(path) {
             let _ = out.push(entry);
@@ -736,7 +698,7 @@ mod tests {
     use std::collections::HashSet;
 
     fn make_entry(name: &str, exec: &str) -> DesktopEntry {
-        DesktopEntry::new(name, exec, "").unwrap()
+        DesktopEntry::new(name, exec).unwrap()
     }
 
     // === Parsing tests ===
@@ -754,7 +716,6 @@ Icon=firefox
         assert_eq!(entry.name, "Firefox");
         // Exec is stored raw; field codes are handled at launch time.
         assert_eq!(entry.exec, "firefox %u");
-        assert_eq!(entry.icon, "firefox");
     }
 
     #[test]

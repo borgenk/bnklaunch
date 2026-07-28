@@ -4,8 +4,6 @@
 //! and double-click detection, so this is a thin wrapper over CLOCK_MONOTONIC
 //! rather than a full Duration/Instant arithmetic surface.
 
-#![allow(dead_code)]
-
 use crate::platform::syscall::{self, CLOCK_MONOTONIC};
 
 /// Read the monotonic clock in nanoseconds since an arbitrary epoch.

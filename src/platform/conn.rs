@@ -40,6 +40,11 @@ pub struct Connection {
     /// Requests buffered since the last flush.
     out: ArrayVec<u8, OUT_CAP>,
     in_buf: ArrayVec<u8, RECV_CAP>,
+    /// Landing buffer for one recvmsg, owned by the connection and zeroed once
+    /// at connect. A local of this size costs a 64 KB memset on every call, and
+    /// fill runs twice per event-loop wakeup: once to drain the socket, once to
+    /// meet the would-block that says it is empty.
+    chunk: [u8; MAX_MESSAGE_SIZE],
     /// How many bytes at the front of in_buf next_message has already consumed.
     /// Each parsed message advances this cursor instead of shifting the rest of
     /// the buffer down, which would cost O(remaining) per message; the consumed
@@ -108,6 +113,7 @@ impl Connection {
             fd,
             out: ArrayVec::new(),
             in_buf: ArrayVec::new(),
+            chunk: [0; MAX_MESSAGE_SIZE],
             in_pos: 0,
             fds: ArrayVec::new(),
         })
@@ -282,8 +288,8 @@ impl Connection {
         // than shifting per message in next_message.
         self.compact();
 
-        let mut chunk = [0u8; MAX_MESSAGE_SIZE];
-        let n = syscall::recv_with_fds(self.fd, &mut chunk, &mut self.fds)?;
+        // chunk and fds are distinct fields, so both can be lent out at once.
+        let n = syscall::recv_with_fds(self.fd, &mut self.chunk, &mut self.fds)?;
         if n < 0 {
             return Err(Error::from_errno(-n as i32));
         }
@@ -292,7 +298,7 @@ impl Connection {
         }
         let n = n as usize;
         self.in_buf
-            .extend_from_slice(&chunk[..n])
+            .extend_from_slice(&self.chunk[..n])
             .map_err(|_| Error::msg("wayland receive buffer overflow"))?;
         Ok(n)
     }
@@ -384,6 +390,7 @@ mod tests {
             fd: fds[0],
             out: ArrayVec::new(),
             in_buf: ArrayVec::new(),
+            chunk: [0; MAX_MESSAGE_SIZE],
             in_pos: 0,
             fds: ArrayVec::new(),
         };

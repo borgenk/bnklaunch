@@ -5,8 +5,6 @@
 //! for Vec and String, and every write that would exceed the capacity is
 //! reported instead of growing.
 
-#![allow(dead_code)]
-
 use core::fmt;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
@@ -34,16 +32,15 @@ impl<T, const N: usize> ArrayVec<T, N> {
         self.len
     }
 
+    /// Kept alongside len, which clippy requires it to be, though the slice's
+    /// own is_empty is what most callers reach through Deref.
+    #[allow(dead_code)]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     pub const fn is_full(&self) -> bool {
         self.len == N
-    }
-
-    pub const fn capacity(&self) -> usize {
-        N
     }
 
     pub const fn remaining(&self) -> usize {
@@ -269,10 +266,6 @@ impl<const N: usize> ArrayString<N> {
         self.len == 0
     }
 
-    pub const fn capacity(&self) -> usize {
-        N
-    }
-
     pub fn clear(&mut self) {
         self.len = 0;
     }
@@ -302,26 +295,6 @@ impl<const N: usize> ArrayString<N> {
     pub fn push(&mut self, c: char) -> Result<(), ()> {
         let mut tmp = [0u8; 4];
         self.push_str(c.encode_utf8(&mut tmp))
-    }
-
-    /// Drop the last character. Returns it, or None when empty.
-    pub fn pop(&mut self) -> Option<char> {
-        let c = self.as_str().chars().next_back()?;
-        self.len -= c.len_utf8();
-        Some(c)
-    }
-
-    /// Shorten to byte_len bytes (a char boundary). Err and no change when
-    /// byte_len is not a boundary; a byte_len past the end is a no-op.
-    pub fn truncate(&mut self, byte_len: usize) -> Result<(), ()> {
-        if byte_len >= self.len {
-            return Ok(());
-        }
-        if !self.as_str().is_char_boundary(byte_len) {
-            return Err(());
-        }
-        self.len = byte_len;
-        Ok(())
     }
 
     /// Insert a string slice at byte index idx (a char boundary), shifting the
@@ -561,18 +534,6 @@ mod tests {
     }
 
     #[test]
-    fn array_string_truncate_rejects_split_char() {
-        let mut s: ArrayString<16> = ArrayString::new();
-        let _ = s.push_str("aéb");
-        assert_eq!(s.truncate(2), Err(()));
-        assert_eq!(s.as_str(), "aéb");
-        assert_eq!(s.truncate(9), Ok(()));
-        assert_eq!(s.as_str(), "aéb");
-        assert_eq!(s.truncate(1), Ok(()));
-        assert_eq!(s.as_str(), "a");
-    }
-
-    #[test]
     fn array_string_insert_multibyte() {
         let mut s: ArrayString<16> = ArrayString::new();
         let _ = s.push_str("ab");
@@ -590,14 +551,6 @@ mod tests {
         assert_eq!(v.swap_remove(1), Some(2));
         // Element 1 is now the former last element.
         assert_eq!(v.as_slice(), &[1, 4, 3]);
-    }
-
-    #[test]
-    fn array_string_multibyte_pop() {
-        let mut s: ArrayString<16> = ArrayString::new();
-        assert_eq!(s.push_str("aé"), Ok(()));
-        assert_eq!(s.pop(), Some('é'));
-        assert_eq!(s.as_str(), "a");
     }
 
     #[test]

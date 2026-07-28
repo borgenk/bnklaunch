@@ -9,22 +9,9 @@ use core::cell::RefCell;
 use crate::platform::arena::ArrayVec;
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype;
+use crate::platform::fs::ScanPath;
 use crate::platform::syscall::{self, Fd, AT_FDCWD, DT_DIR, DT_LNK, DT_REG, O_RDONLY};
 use crate::platform::{env, fs};
-
-/// A scanned filesystem path.
-type ScanPath = crate::platform::arena::ArrayString<{ fs::PATH_CAP }>;
-
-/// Join two path segments with a single separator, or None if it does not fit.
-fn join(base: &str, child: &str) -> Option<ScanPath> {
-    let mut p = ScanPath::new();
-    p.push_str(base).ok()?;
-    if !base.ends_with('/') {
-        p.push('/').ok()?;
-    }
-    p.push_str(child).ok()?;
-    Some(p)
-}
 
 /// Font sizes for UI elements.
 pub const INPUT_SIZE: f32 = 20.0;
@@ -158,8 +145,9 @@ pub struct Font {
     cache: RefCell<GlyphCache>,
 }
 
-/// Preferred font filenames, searched in order.
-const PREFERRED_FONTS: &[&str] = &[
+/// Preferred font filenames, most wanted first. A file's position here is its
+/// rank, and the best-ranked one found anywhere is the one loaded.
+const PREFERRED_FONTS: [&str; 12] = [
     "DejaVuSans.ttf",
     "NotoSans-Regular.ttf",
     "LiberationSans-Regular.ttf",
@@ -174,34 +162,52 @@ const PREFERRED_FONTS: &[&str] = &[
     "SourceSansPro-Regular.ttf",
 ];
 
-/// Directories to search for fonts.
-const FONT_DIRS: &[&str] = &["/usr/share/fonts", "/usr/local/share/fonts"];
+/// Directories to search, highest priority first. The user's own is appended at
+/// load time, since it depends on HOME.
+const FONT_DIRS: [&str; 2] = ["/usr/share/fonts", "/usr/local/share/fonts"];
+
+/// Paths kept per preferred name. The same name turns up under more than one
+/// root, and distributions ship one font under two paths, so a name keeps a few
+/// candidates: whether a file actually loads is not known until FreeType is
+/// handed it, and the ones behind it have to still be there when it does not.
+const PATHS_PER_NAME: usize = 3;
+
+/// The paths found for each preferred name, indexed by that name's rank. A name
+/// has its own slots, so no amount of one font crowds out another, and within a
+/// slot the paths sit in the order the directories were walked.
+type FontHits = [ArrayVec<ScanPath, PATHS_PER_NAME>; PREFERRED_FONTS.len()];
 
 impl Font {
     /// Load the best available system font.
     pub fn load() -> Result<Self> {
-        for name in PREFERRED_FONTS {
-            for dir in FONT_DIRS {
-                if !fs::is_dir(dir) {
-                    continue;
-                }
-                if let Some(path) = find_font_file(dir, name) {
-                    if let Ok(font) = Self::from_path(&path) {
-                        return Ok(font);
-                    }
-                }
+        // Each directory tree is walked once, checking every file against the
+        // whole preference list. A font tree runs to hundreds of files across
+        // dozens of subdirectories, so walking it per name is the expensive way
+        // to ask the same question.
+        //
+        // The walk does not stop at the first top choice. Whether a file is a
+        // font this can render is only known once FreeType has parsed it and
+        // every UI size has been set on it, which happens below; a corrupt or
+        // bitmap-only DejaVuSans.ttf must leave the fallbacks still collected.
+        let mut hits: FontHits = core::array::from_fn(|_| ArrayVec::new());
+        for dir in FONT_DIRS {
+            if fs::is_dir(dir) {
+                collect_fonts(dir, &mut hits);
+            }
+        }
+        if let Some(user_fonts) = env::var("HOME").and_then(|h| fs::join(h, ".local/share/fonts")) {
+            if fs::is_dir(&user_fonts) {
+                collect_fonts(&user_fonts, &mut hits);
             }
         }
 
-        // Check user font directory.
-        if let Some(user_fonts) = env::var("HOME").and_then(|h| join(h, ".local/share/fonts")) {
-            if fs::is_dir(&user_fonts) {
-                for name in PREFERRED_FONTS {
-                    if let Some(path) = find_font_file(&user_fonts, name) {
-                        if let Ok(font) = Self::from_path(&path) {
-                            return Ok(font);
-                        }
-                    }
+        // Preference order, and within a name the order the roots were walked.
+        // A file that does not load falls through to the next candidate, so one
+        // broken font cannot leave the launcher with none.
+        for slot in hits.iter() {
+            for path in slot.iter() {
+                if let Ok(font) = Self::from_path(path) {
+                    return Ok(font);
                 }
             }
         }
@@ -404,16 +410,16 @@ fn blend(bg: u32, fg: u32, coverage: u8) -> u32 {
     (out_a << 24) | (r << 16) | (g << 8) | b
 }
 
-/// Recursively search a directory for a font file by name. A symlinked
-/// directory is not descended into, which breaks any symlink cycle.
-fn find_font_file(dir: &str, target_name: &str) -> Option<ScanPath> {
-    let mut rd = fs::ReadDir::open(dir).ok()?;
-    let mut found: Option<ScanPath> = None;
+/// Walk a directory tree, recording every preferred name it holds against that
+/// name's rank. A symlinked directory is not descended into, which breaks any
+/// symlink cycle. A name whose slots are already full keeps the paths it has,
+/// which are the ones found earliest and so in the highest-priority root.
+fn collect_fonts(dir: &str, hits: &mut FontHits) {
+    let Ok(mut rd) = fs::ReadDir::open(dir) else {
+        return;
+    };
     let _ = rd.for_each(|name, d_type| {
-        if found.is_some() {
-            return;
-        }
-        let Some(path) = join(dir, name) else {
+        let Some(path) = fs::join(dir, name) else {
             return;
         };
         let is_directory = match d_type {
@@ -422,12 +428,11 @@ fn find_font_file(dir: &str, target_name: &str) -> Option<ScanPath> {
             _ => fs::is_dir_nofollow(&path),
         };
         if is_directory {
-            found = find_font_file(&path, target_name);
-        } else if name == target_name {
-            found = Some(path);
+            collect_fonts(&path, hits);
+        } else if let Some(rank) = PREFERRED_FONTS.iter().position(|f| *f == name) {
+            let _ = hits[rank].push(path);
         }
     });
-    found
 }
 
 /// Map a font file read-only and return the mapping pointer and length. Font
@@ -473,6 +478,99 @@ mod tests {
 
     fn load_fixture_font() -> Font {
         Font::from_path(FIXTURE).expect("load fixture font")
+    }
+
+    /// The preference list is a ranking, not a search order. One walk of the
+    /// tree checks every file against the whole list, so the top choice wins
+    /// however deep it sits and a lesser name at the root does not shadow it.
+    #[test]
+    fn font_discovery_ranks_by_preference_not_by_depth() {
+        let base = format!(
+            "{}/bnk_fonts_{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(format!("{base}/sys/vendor/opentype")).expect("dirs");
+        std::fs::create_dir_all(format!("{base}/user")).expect("dirs");
+        let last = PREFERRED_FONTS[PREFERRED_FONTS.len() - 1];
+        // The top choice sits two levels down in the first root; the last choice
+        // has a root of its own, walked second. Splitting them across roots is
+        // what makes the second assertion independent of the order getdents
+        // happens to return names in. Only the filenames matter to the walk, so
+        // these need no font bytes.
+        std::fs::write(
+            format!("{base}/sys/vendor/opentype/{}", PREFERRED_FONTS[0]),
+            b"",
+        )
+        .expect("write first choice");
+        std::fs::write(format!("{base}/user/{last}"), b"").expect("write last choice");
+
+        let mut hits: FontHits = core::array::from_fn(|_| ArrayVec::new());
+        collect_fonts(&format!("{base}/sys"), &mut hits);
+        collect_fonts(&format!("{base}/user"), &mut hits);
+        assert!(
+            hits[0]
+                .first()
+                .is_some_and(|p| p.ends_with(PREFERRED_FONTS[0])),
+            "the top choice should be found two directories down"
+        );
+        // Finding the top choice must not end the walk: the lesser name in the
+        // next root is still recorded, because whether the top choice actually
+        // loads is not known until FreeType has been handed it.
+        assert!(
+            hits[PREFERRED_FONTS.len() - 1]
+                .first()
+                .is_some_and(|p| p.ends_with(last)),
+            "a later root should still be collected behind the top choice"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A broken top choice must not cost the launcher its font. The first
+    /// candidate here is a file that is not a font at all; loading has to fall
+    /// through to the real one behind it.
+    #[test]
+    fn a_top_choice_that_does_not_load_falls_through_to_the_next() {
+        let base = format!(
+            "{}/bnk_fonts_broken_{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(format!("{base}/sys")).expect("dir");
+        std::fs::create_dir_all(format!("{base}/user")).expect("dir");
+        // Rank 0 is bytes FreeType will refuse, in the root walked first; rank 1
+        // is the real fixture, in the root walked second. A scan that stopped at
+        // the top choice would never reach the second root at all.
+        std::fs::write(format!("{base}/sys/{}", PREFERRED_FONTS[0]), b"not a font")
+            .expect("write broken");
+        std::fs::copy(FIXTURE, format!("{base}/user/{}", PREFERRED_FONTS[1]))
+            .expect("copy fixture");
+
+        let mut hits: FontHits = core::array::from_fn(|_| ArrayVec::new());
+        collect_fonts(&format!("{base}/sys"), &mut hits);
+        collect_fonts(&format!("{base}/user"), &mut hits);
+        assert_eq!(hits[0].len(), 1, "the broken top choice was collected");
+        assert_eq!(hits[1].len(), 1, "and so was the one behind it");
+
+        // The same order load() tries them in.
+        let mut loaded = None;
+        for slot in hits.iter() {
+            for path in slot.iter() {
+                if let Ok(font) = Font::from_path(path) {
+                    loaded = Some(font);
+                    break;
+                }
+            }
+        }
+        assert!(
+            loaded.is_some(),
+            "a broken first candidate must not sink the load"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

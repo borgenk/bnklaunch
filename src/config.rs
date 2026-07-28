@@ -1,4 +1,5 @@
-//! User configuration.
+//! User configuration only. The window's layout constants live with the drawing
+//! that reads them, in ui.
 //!
 //! $XDG_CONFIG_HOME/bnklaunch/config (fallback ~/.config/bnklaunch/config), one
 //! `field value` per line. Blank lines and # comments are ignored, and an
@@ -15,17 +16,12 @@ const FILENAME: &str = "config";
 /// Largest config file read; config is a handful of short lines.
 const CONFIG_MAX: usize = 16 * 1024;
 
-/// Byte capacity of the configured search URL.
-pub const URL_CAP: usize = 512;
+/// Byte capacity of the configured search URL template. Smaller than the URL
+/// the launcher builds from it (see launch::URL_CAP), which also carries the
+/// percent-encoded query.
+pub const SEARCH_URL_CAP: usize = 512;
 /// Most hidden app names the config holds.
 pub const MAX_DENY: usize = 64;
-
-/// Result rows drawn under the input. The window grows and shrinks with the
-/// number of rows, up to this many.
-pub const MAX_RESULTS: usize = 5;
-
-/// Width of the launcher window in pixels.
-pub const WINDOW_WIDTH: u32 = 800;
 
 /// Parsed configuration. A field absent from the file keeps its default.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -33,7 +29,7 @@ pub struct Config {
     /// Search URL for the s: prefix; None disables it. The URL holds %s where
     /// the percent-encoded query goes, or has the query appended when it has
     /// no placeholder.
-    pub search_url: Option<ArrayString<URL_CAP>>,
+    pub search_url: Option<ArrayString<SEARCH_URL_CAP>>,
     /// App names to hide from results, one per hidden line, deduplicated.
     pub denied: ArrayVec<ArrayString<NAME_CAP>, MAX_DENY>,
 }
@@ -88,7 +84,7 @@ fn parse(text: &str) -> Config {
         }
         match field {
             "search_url" => {
-                let mut url: ArrayString<URL_CAP> = ArrayString::new();
+                let mut url: ArrayString<SEARCH_URL_CAP> = ArrayString::new();
                 if url.push_str(value).is_ok() {
                     config.search_url = Some(url);
                 }

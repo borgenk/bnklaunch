@@ -92,7 +92,7 @@ fn catalog() -> desktop::Catalog {
     for i in 0..MAX_ENTRIES {
         let name = format!("Application {i}");
         let exec = format!("/usr/bin/app{i} --flag %U");
-        if let Some(entry) = DesktopEntry::new(&name, &exec, "icon") {
+        if let Some(entry) = DesktopEntry::new(&name, &exec) {
             let _ = out.push(entry);
         }
     }
@@ -108,8 +108,8 @@ fn measure_all() -> Vec<Measurement> {
 
     // An offscreen frame the size of the real window with a full result list.
     let mut pixels = crate::shm::PixelBuffer::new(
-        crate::config::WINDOW_WIDTH,
-        crate::ui::calculate_height(crate::config::MAX_RESULTS),
+        crate::ui::WINDOW_WIDTH,
+        crate::ui::calculate_height(crate::ui::MAX_RESULTS),
     )
     .expect("offscreen buffer");
     let font = crate::font::Font::from_path(concat!(
@@ -274,7 +274,7 @@ fn scan_bench() {
         if only == "serial" {
             let mut out = crate::desktop::Catalog::new();
             let start = Instant::now();
-            crate::desktop::read_entries_serial(&paths, &mut out);
+            crate::desktop::read_entries(&paths, &mut out);
             best_serial = start.elapsed().as_secs_f64() * 1e6;
             continue;
         }
@@ -299,7 +299,7 @@ fn scan_bench() {
 
         let mut out = crate::desktop::Catalog::new();
         let start = Instant::now();
-        crate::desktop::read_entries_serial(&paths, &mut out);
+        crate::desktop::read_entries(&paths, &mut out);
         best_serial = best_serial.min(start.elapsed().as_secs_f64() * 1e6);
     }
 

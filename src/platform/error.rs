@@ -5,8 +5,6 @@
 //! errno or a static message. Carrying the errno lets the event loop test for
 //! the conditions it cares about, chiefly a non-blocking would-block.
 
-#![allow(dead_code)]
-
 use crate::platform::syscall::EAGAIN;
 
 /// An OS error (a positive errno) or a static message. Exactly one is set.
@@ -25,11 +23,6 @@ impl Error {
     /// An error described by a static message, with no OS errno.
     pub const fn msg(msg: &'static str) -> Self {
         Self { errno: 0, msg }
-    }
-
-    /// The errno, or 0 for a message-only error.
-    pub const fn errno(&self) -> i32 {
-        self.errno
     }
 
     /// Whether this is a would-block (EAGAIN): the signal to stop draining a

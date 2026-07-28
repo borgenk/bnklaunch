@@ -2,7 +2,6 @@
 //! that composite the input field and result rows into the pixel buffer.
 
 use crate::app::{normalize_url, parse_action, AppState, InputAction};
-use crate::config::{MAX_RESULTS, WINDOW_WIDTH};
 use crate::desktop::{self, DesktopEntry};
 use crate::launch::URL_CAP;
 use crate::platform::arena;
@@ -23,6 +22,13 @@ const SELECTED_BG: u32 = argb(255, 50, 51, 56);
 // A muted accent behind selected input text.
 const SELECTION_COLOR: u32 = argb(255, 96, 40, 82);
 
+/// Width of the launcher window in pixels.
+pub(crate) const WINDOW_WIDTH: u32 = 800;
+
+/// Result rows drawn under the input. The window grows and shrinks with the
+/// number of rows, up to this many.
+pub(crate) const MAX_RESULTS: usize = 5;
+
 /// Y position where the input field starts
 pub(crate) const INPUT_START_Y: u32 = 0;
 
@@ -37,6 +43,11 @@ const FIELD_W: u32 = WINDOW_WIDTH - MARGIN_X * 2;
 
 /// X position where text starts (gutter plus inner padding)
 pub(crate) const TEXT_X: u32 = MARGIN_X + 15;
+
+/// Right edge of every text run, as a width from TEXT_X. The trailing gutter is
+/// the wider of the two, so a name that fills the row stops well short of the
+/// window edge.
+const TEXT_W: u32 = WINDOW_WIDTH - TEXT_X - 115;
 
 /// Y position where results start, flush under the input field
 const RESULTS_START_Y: u32 = INPUT_START_Y + INPUT_BOX_H;
@@ -116,7 +127,7 @@ pub(crate) fn draw_ui(
             text_y,
             input_text,
             TEXT_COLOR,
-            670,
+            TEXT_W,
             font,
             font::INPUT_SIZE,
         );
@@ -160,8 +171,8 @@ pub(crate) fn draw_ui(
 }
 
 /// Draw a result row: title over subtitle, the two lines vertically centered as
-/// a block in the row starting at y. The subtitle is clamped so a long command
-/// line cannot run off the row.
+/// a block in the row starting at y. Both lines stop at TEXT_W, so a long name
+/// or command line cannot run off the row.
 fn draw_row(pixels: &mut shm::PixelBuffer, y: u32, title: &str, subtitle: &str, font: &font::Font) {
     let title_h = font.text_height(font::NAME_SIZE);
     let subtitle_h = font.text_height(font::SUBTITLE_SIZE);
@@ -174,25 +185,16 @@ fn draw_row(pixels: &mut shm::PixelBuffer, y: u32, title: &str, subtitle: &str, 
         top as u32,
         title,
         TEXT_COLOR,
-        670,
+        TEXT_W,
         font,
         font::NAME_SIZE,
     );
-
-    // Clamp to 80 characters on a char boundary so a long command line cannot
-    // run off the row; draw_text clips further by width.
-    let cut = subtitle
-        .char_indices()
-        .nth(80)
-        .map(|(i, _)| i)
-        .unwrap_or(subtitle.len());
-    let truncated = &subtitle[..cut];
     pixels.draw_text(
         TEXT_X,
         (top + title_h + gap) as u32,
-        truncated,
+        subtitle,
         SUBTITLE_COLOR,
-        670,
+        TEXT_W,
         font,
         font::SUBTITLE_SIZE,
     );

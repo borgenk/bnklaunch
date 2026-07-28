@@ -72,6 +72,7 @@ mod nr {
     pub const READ: usize = 0;
     pub const WRITE: usize = 1;
     pub const CLOSE: usize = 3;
+    pub const FSTAT: usize = 5;
     pub const LSEEK: usize = 8;
     pub const POLL: usize = 7;
     pub const MMAP: usize = 9;
@@ -305,9 +306,9 @@ pub struct stat_timespec {
     pub tv_nsec: i64,
 }
 
-/// The x86_64 struct stat filled by newfstatat. Only st_mode (for the file
-/// kind) and st_mtime (for the cache fingerprint) are read; the rest is laid
-/// out to match the kernel ABI.
+/// The x86_64 struct stat filled by newfstatat and fstat. st_mode (the file
+/// kind), st_mtime (the cache fingerprint), and st_size (a mapping's length)
+/// are read; the rest is laid out to match the kernel ABI.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct stat {
@@ -665,6 +666,18 @@ pub fn read_mapped(fd: RawFd, len: usize) -> Result<Mapped> {
     if len == 0 {
         return Err(Error::msg("cannot map an empty file"));
     }
+    // `len` is the sender's claim about a file the compositor owns, not one we
+    // made. mmap maps past the end of a short file, and the first read of a page
+    // beyond its last byte raises SIGBUS, which no `Result` can catch. Measure
+    // the file (with fstat, which unlike a seek leaves the shared offset alone)
+    // and refuse a claim that runs past it.
+    match fstat(fd) {
+        Some(st) if len as u64 > st.st_size as u64 => {
+            return Err(Error::msg("keymap fd is shorter than the sender claimed"));
+        }
+        None => return Err(Error::msg("could not stat the keymap fd")),
+        Some(_) => {}
+    }
     // SAFETY: a null hint lets the kernel choose the address, and the result is
     // checked with mmap_failed before it is used or stored. The mapping is
     // private and read-only, so nothing else can be affected through it.
@@ -913,6 +926,21 @@ pub fn rename(oldpath: &CPath, newpath: &CPath) -> i32 {
 pub fn mkdir(path: &CPath, mode: u32) -> i32 {
     // SAFETY: CPath is a valid C string the kernel only reads.
     unsafe { syscall2(nr::MKDIR, path.as_ptr() as usize, mode as usize) as i32 }
+}
+
+/// Stat an open descriptor, or None on error. Unlike a seek to the end, this
+/// measures the file without touching the offset the compositor shares with us
+/// through the passed keymap fd, so it is the safe way to size that mapping.
+pub fn fstat(fd: RawFd) -> Option<stat> {
+    // SAFETY: stat is a plain integer struct, so zeroed is a valid value the
+    // kernel then fills; the pointer is exclusively borrowed for this call.
+    let mut st: stat = unsafe { core::mem::zeroed() };
+    let r = unsafe { syscall2(nr::FSTAT, fd as usize, &mut st as *mut stat as usize) as i32 };
+    if r < 0 {
+        None
+    } else {
+        Some(st)
+    }
 }
 
 /// Stat a path relative to dirfd, or None on error.
@@ -1173,6 +1201,36 @@ mod tests {
         // Ignored, so the write reports the hangup instead of raising a signal.
         let n = write_fd(write_end.as_raw_fd(), b"data");
         assert_eq!(n, -(EPIPE as isize), "expected EPIPE, got {n}");
+    }
+
+    /// The length handed to `read_mapped` is the compositor's claim about a file
+    /// it owns. A claim past the end of the file must be refused: mapping it
+    /// succeeds, and reading the bytes beyond the end raises SIGBUS, killing the
+    /// process where no `Result` can intervene.
+    #[test]
+    fn read_mapped_refuses_a_length_past_the_end_of_the_file() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        let path =
+            std::env::temp_dir().join(format!("bnklaunch-read-mapped-{}", std::process::id()));
+        let mut f = std::fs::File::create(&path).expect("create fixture");
+        f.write_all(b"keymap").expect("write fixture");
+        drop(f);
+        let file = std::fs::File::open(&path).expect("open fixture");
+        let fd = file.as_raw_fd();
+
+        assert_eq!(
+            read_mapped(fd, 6).expect("exact length").as_slice(),
+            b"keymap"
+        );
+        assert_eq!(read_mapped(fd, 3).expect("short length").as_slice(), b"key");
+        assert!(
+            read_mapped(fd, 4096).is_err(),
+            "a length past the end must be refused"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

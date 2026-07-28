@@ -51,8 +51,6 @@
 //! together, and it does it with no thread and no executor behind it, which is
 //! the whole point of the thing.
 
-#![allow(dead_code)]
-
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::platform::arena::ArrayVec;
@@ -306,6 +304,9 @@ impl Ring {
     }
 
     /// Queue a no-op completion. Used as a setup smoke test.
+    // Reached only by the tests and the scan bench. Kept so the measurement in
+    // the module docs stays checkable.
+    #[allow(dead_code)]
     pub fn prep_nop(&mut self, user_data: u64) -> Result<(), ()> {
         let sqe = self.get_sqe().ok_or(())?;
         sqe.opcode = IORING_OP_NOP;
@@ -355,6 +356,9 @@ impl Ring {
     ///
     /// The kernel reads the NUL-terminated path after submit and outside this
     /// call, so the bytes must stay valid and unmoved until the op completes.
+    // Reached only by the tests and the scan bench. Kept so the measurement in
+    // the module docs stays checkable.
+    #[allow(dead_code)]
     pub unsafe fn prep_openat(
         &mut self,
         dirfd: RawFd,
@@ -386,6 +390,9 @@ impl Ring {
     /// point at len writable bytes that stay valid and unmoved until the op
     /// completes: a stack buffer that goes out of scope first is memory
     /// corruption the caller cannot see.
+    // Reached only by the tests and the scan bench. Kept so the measurement in
+    // the module docs stays checkable.
+    #[allow(dead_code)]
     pub unsafe fn prep_read(
         &mut self,
         fd: RawFd,
@@ -409,6 +416,9 @@ impl Ring {
     }
 
     /// Close a file descriptor through the ring.
+    // Reached only by the tests and the scan bench. Kept so the measurement in
+    // the module docs stays checkable.
+    #[allow(dead_code)]
     pub fn prep_close(&mut self, fd: RawFd, user_data: u64) -> Result<(), ()> {
         let sqe = self.get_sqe().ok_or(())?;
         sqe.opcode = IORING_OP_CLOSE;
@@ -442,6 +452,7 @@ impl Ring {
 /// below block until every operation the kernel was given has reported back. So
 /// nothing the kernel holds a pointer to can go away underneath it, which is the
 /// obligation the prep functions carry.
+#[allow(dead_code)]
 pub fn read_files(
     ring: &mut Ring,
     paths: &[CPath],
@@ -449,7 +460,9 @@ pub fn read_files(
     stride: usize,
     lens: &mut [usize],
 ) -> Result<(), ()> {
-    if paths.len() > lens.len() || paths.len() * stride > bufs.len() {
+    // The fd table below is one slot per path, so a batch past its capacity
+    // would open descriptors it then has no slot to close. The caller chunks.
+    if paths.len() > MAX_BATCH || paths.len() > lens.len() || paths.len() * stride > bufs.len() {
         return Err(());
     }
     for len in lens.iter_mut() {
@@ -515,10 +528,12 @@ pub fn read_files(
 
 /// user_data for the closes, which have no result worth reading. Real slots are
 /// indices, so no index can collide with it.
+#[allow(dead_code)]
 const CLOSE_TAG: u64 = u64::MAX;
 
 /// Most files one read_files call handles. The ring is sized for twice this,
 /// since an opened file costs a read and a close.
+#[allow(dead_code)]
 pub const MAX_BATCH: usize = 64;
 
 impl Drop for Ring {
@@ -694,6 +709,31 @@ mod tests {
         assert_eq!(lens[3], 0, "a missing file reads as nothing");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A batch bigger than the fd table is refused. Without the check the
+    /// surplus files would open with no slot to record them in, so nothing
+    /// would ever close those descriptors.
+    #[test]
+    fn read_files_refuses_a_batch_past_what_it_can_track() {
+        let mut ring = match Ring::new(MAX_BATCH as u32 * 2) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        // Paths that do not exist: every open fails, so this exercises the
+        // bounds and nothing else. The other two bounds are satisfied, which
+        // leaves the batch size as the only thing that can refuse it.
+        let mut paths: ArrayVec<CPath, { MAX_BATCH + 1 }> = ArrayVec::new();
+        for _ in 0..MAX_BATCH + 1 {
+            let _ = paths.push(CPath::new("/nonexistent/bnklaunch").expect("cpath"));
+        }
+        let mut bufs = [0u8; MAX_BATCH + 1];
+        let mut lens = [0usize; MAX_BATCH + 1];
+        assert!(read_files(&mut ring, &paths, &mut bufs, 1, &mut lens).is_err());
+
+        // A full batch is still accepted, so the bound is MAX_BATCH and not
+        // something quietly smaller.
+        assert!(read_files(&mut ring, &paths[..MAX_BATCH], &mut bufs, 1, &mut lens).is_ok());
     }
 
     // A short one-shot timeout posts a completion tagged with its user_data,

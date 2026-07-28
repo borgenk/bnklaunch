@@ -493,12 +493,10 @@ impl Client {
                         self.key_repeat.repeating = false;
 
                         self.handle_key_action(key);
-                    } else {
-                        if self.key_repeat.held_key == Some(key) {
-                            self.key_repeat.held_key = None;
-                            self.key_repeat.press_time = None;
-                            self.key_repeat.repeating = false;
-                        }
+                    } else if self.key_repeat.held_key == Some(key) {
+                        self.key_repeat.held_key = None;
+                        self.key_repeat.press_time = None;
+                        self.key_repeat.repeating = false;
                     }
                 }
                 proto::wl_keyboard::EV_MODIFIERS => {
@@ -606,85 +604,89 @@ impl Client {
 
     /// Turn a key press into editor calls plus whatever the launcher has to do
     /// about it: a clipboard transfer, a move in the result list, a launch.
+    ///
+    /// Each arm answers one question, whether the input now looks different, and
+    /// the caller records it. The clipboard and the launch answer no: a copy
+    /// changes nothing on screen, and a paste redraws once the event loop has
+    /// actually fetched the text.
     fn handle_key_action(&mut self, key: u32) {
         let action = key_action(&self.keyboard.xkb, key);
         let shift = self.keyboard.xkb.shift_active();
 
-        match action {
-            KeyAction::Char(ch) => {
-                if self.editor.insert(ch) {
-                    self.input_changed = true;
-                }
-            }
+        let changed = match action {
+            KeyAction::Char(ch) => self.editor.insert(ch),
             KeyAction::Backspace => {
                 self.editor.backspace();
-                self.input_changed = true;
+                true
             }
             KeyAction::Delete => {
                 self.editor.delete();
-                self.input_changed = true;
+                true
             }
             KeyAction::Left => {
                 self.editor.left(shift);
-                self.input_changed = true;
+                true
             }
             KeyAction::Right => {
                 self.editor.right(shift);
-                self.input_changed = true;
+                true
             }
             KeyAction::Home => {
                 self.editor.home(shift);
-                self.input_changed = true;
+                true
             }
             KeyAction::End => {
                 self.editor.end(shift);
-                self.input_changed = true;
+                true
             }
             KeyAction::SelectAll => {
                 self.editor.select_all();
-                self.input_changed = true;
+                true
             }
             KeyAction::Copy => {
                 if let Some(text) = self.editor.selected_text() {
                     self.clipboard_op = clipboard::Op::Copy(text);
                 }
+                false
             }
             KeyAction::Cut => {
                 if let Some(text) = self.editor.selected_text() {
                     self.clipboard_op = clipboard::Op::Cut(text);
                 }
+                false
             }
             KeyAction::Paste => {
                 self.clipboard_op = clipboard::Op::Paste;
+                false
             }
             KeyAction::Enter => {
                 self.pending_action = PendingAction::Launch;
                 self.running = false;
+                false
             }
             KeyAction::Escape => {
                 self.editor.clear();
                 self.running = false;
+                false
             }
-            KeyAction::Up => {
+            // Shift turns the arrows into a select-all; without it they move
+            // through the result list, which leaves the text caret alone.
+            KeyAction::Up | KeyAction::Down => {
                 if shift {
                     self.editor.select_all();
-                    self.input_changed = true;
+                    true
                 } else {
-                    // Result-list navigation leaves the text caret where it is,
-                    // so it moves the selection rather than changing the input.
-                    self.pending_action = PendingAction::SelectUp;
+                    self.pending_action = if action == KeyAction::Up {
+                        PendingAction::SelectUp
+                    } else {
+                        PendingAction::SelectDown
+                    };
+                    false
                 }
             }
-            KeyAction::Down => {
-                if shift {
-                    self.editor.select_all();
-                    self.input_changed = true;
-                } else {
-                    self.pending_action = PendingAction::SelectDown;
-                }
-            }
-            KeyAction::Tab | KeyAction::None => {}
-        }
+            KeyAction::Tab | KeyAction::None => false,
+        };
+        self.input_changed |= changed;
     }
 
     /// Process key repeat if a key is being held.
@@ -935,9 +937,12 @@ impl Client {
     /// the renderer draws into the other one. If it is still holding both, wait
     /// for it to let one go rather than paint over what is on screen.
     pub fn render(&mut self, draw: impl FnOnce(&mut Client)) -> Result<()> {
-        while self.running && !self.present.ready() {
+        // Waiting for a release is a genuine block, so the socket goes blocking
+        // for the duration. The two fcntls sit outside the loop: each turn of it
+        // is one message, and a compositor holding both frames can take several.
+        if self.running && !self.present.ready() {
             self.socket.set_nonblocking(false)?;
-            let waited = self.dispatch();
+            let waited = self.wait_for_free_frame();
             self.socket.set_nonblocking(true)?;
             waited?;
         }
@@ -946,6 +951,15 @@ impl Client {
         }
         draw(self);
         self.present.commit(&mut self.socket)
+    }
+
+    /// Dispatch until the frame to draw into comes free, or the surface goes
+    /// away. The caller puts the socket in blocking mode around this.
+    fn wait_for_free_frame(&mut self) -> Result<()> {
+        while self.running && !self.present.ready() {
+            self.dispatch()?;
+        }
+        Ok(())
     }
 
     /// The pixels of the frame being drawn into.

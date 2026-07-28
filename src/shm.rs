@@ -172,9 +172,9 @@ mod tests {
     fn expect_overflow(width: u32, height: u32) {
         match PixelBuffer::new(width, height) {
             Ok(_) => panic!("expected an overflow error for {width}x{height}"),
-            // The dimension math fails before any syscall, so this is a
-            // message error rather than an errno.
-            Err(e) => assert_eq!(e.errno(), 0),
+            // The dimension math fails before any syscall is attempted, so it is
+            // this error and not an errno from ftruncate or mmap.
+            Err(e) => assert_eq!(e, Error::msg("buffer dimensions too large")),
         }
     }
 

@@ -33,7 +33,7 @@ use crate::desktop::{Catalog, DesktopEntry, NAME_CAP, RESULT_CAP};
 use crate::platform::arena::{ArrayString, ArrayVec};
 use crate::platform::bytes::Cursor;
 use crate::platform::error::{Error, Result};
-use crate::platform::syscall::{self, Fd, AT_FDCWD, O_WRONLY, SEEK_SET};
+use crate::platform::syscall::{self, Fd, AT_FDCWD, O_CLOEXEC, O_WRONLY, SEEK_SET};
 use crate::platform::{env, fs};
 
 const MAGIC: &[u8; 4] = b"BNKL";
@@ -141,7 +141,9 @@ pub fn record(recents_offset: u64, recents: &mut Recents, name: &str) -> Result<
 fn record_to(path: &str, recents_offset: u64, recents: &[ArrayString<NAME_CAP>]) -> Result<()> {
     let block = encode_recents(recents)?;
     let cp = fs::cpath(path)?;
-    let fd = syscall::openat(AT_FDCWD, &cp, O_WRONLY, 0);
+    // O_CLOEXEC so a launched app never inherits this descriptor, whatever
+    // order a caller does the launch and the record in.
+    let fd = syscall::openat(AT_FDCWD, &cp, O_WRONLY | O_CLOEXEC, 0);
     if fd < 0 {
         return Err(Error::from_errno(-fd));
     }
@@ -266,7 +268,7 @@ pub(crate) fn decode(data: &[u8]) -> Option<Cached> {
         let exec = r.string()?;
         // A stored field longer than an entry can hold is dropped, not
         // truncated; the record is still consumed so the stream stays aligned.
-        if let Some(entry) = DesktopEntry::new(name, exec, "") {
+        if let Some(entry) = DesktopEntry::new(name, exec) {
             let _ = entries.push(entry);
         }
     }
@@ -352,7 +354,7 @@ mod tests {
     use super::*;
 
     fn entry(name: &str, exec: &str) -> DesktopEntry {
-        DesktopEntry::new(name, exec, "").unwrap()
+        DesktopEntry::new(name, exec).unwrap()
     }
 
     fn bytes(

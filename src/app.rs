@@ -3,14 +3,13 @@
 
 use crate::client::{Client, PendingAction};
 use crate::clipboard;
-use crate::config::{MAX_RESULTS, WINDOW_WIDTH};
 use crate::desktop::{self, DesktopEntry};
 use crate::platform::error::elog;
 use crate::platform::error::{Error, Result};
 use crate::platform::time::Instant;
 use crate::platform::xkb::{keycode, Xkb};
 use crate::platform::{arena, env, fs, syscall, uring};
-use crate::ui::{calculate_height, draw_ui};
+use crate::ui::{calculate_height, draw_ui, MAX_RESULTS, WINDOW_WIDTH};
 use crate::{cache, config, denylist, font, launch, ui};
 
 /// Caret blink half-period in milliseconds: solid this long, then hidden this
@@ -181,19 +180,6 @@ impl AppState {
     }
 }
 
-/// Record a successful launch as the most recent, overwriting the recents tail
-/// of the cache in place. A no-op when nothing launched or the cache offset is
-/// unknown (no cache dir).
-fn record_launch(
-    state: &mut AppState,
-    recents_offset: Option<u64>,
-    launched: Option<arena::ArrayString<{ desktop::NAME_CAP }>>,
-) {
-    if let (Some(name), Some(offset)) = (launched, recents_offset) {
-        let _ = cache::record(offset, &mut state.recents, name.as_str());
-    }
-}
-
 /// The launcher's entry logic. Wrapped by the C entry point in main.rs in the
 /// real build; called directly by tests through the std harness.
 pub(crate) fn run() -> Result<()> {
@@ -281,10 +267,10 @@ pub(crate) fn run() -> Result<()> {
     client.roundtrip()?;
 
     // Create layer surface sized for the initial empty-input view (recents).
-    let initial_total = cache::resolve(&state.recents, &state.entries)
+    let initial_rows = cache::resolve(&state.recents, &state.entries)
         .len()
         .min(MAX_RESULTS);
-    client.create_layer_surface(WINDOW_WIDTH, calculate_height(initial_total))?;
+    client.create_layer_surface(WINDOW_WIDTH, calculate_height(initial_rows))?;
 
     // Wait for the configure event. The compositor may send closed instead
     // (no output available, or an output destroyed mid-resize), which sets
@@ -303,8 +289,24 @@ pub(crate) fn run() -> Result<()> {
     // Wait for input devices
     client.roundtrip()?;
 
+    event_loop(&mut client, &mut state, &font, search_enabled)?;
+
+    if client.pending_action == PendingAction::Launch {
+        dispatch_launch(&client, &mut state, &cfg, recents_offset, search_enabled);
+    }
+    Ok(())
+}
+
+/// Run until something dismisses the launcher: Enter, Escape, focus loss, or the
+/// compositor closing the surface.
+fn event_loop(
+    client: &mut Client,
+    state: &mut AppState,
+    font: &font::Font,
+    search_enabled: bool,
+) -> Result<()> {
     // Caret blink state. The caret is solid for one interval then toggles; any
-    // input activity resets it to solid in the event loop below.
+    // input activity resets it to solid below.
     let mut cursor_visible = true;
     let mut last_blink = Instant::now();
 
@@ -312,13 +314,19 @@ pub(crate) fn run() -> Result<()> {
     // can be told apart from a cursor move or a click, which leave it standing.
     let mut last_query = client.editor.text_owned();
 
-    // Initial draw of the empty-input view (recents). The result list borrows
-    // state, so scope it to this block: it must not hold that borrow across the
-    // loop, where state is mutated.
-    let mut current_results_len = cache::resolve(&state.recents, &state.entries)
-        .len()
-        .min(MAX_RESULTS);
-    repaint(&mut client, &state, &font, search_enabled, cursor_visible)?;
+    // The rows on screen, rebuilt only when the input changes. A selection move
+    // and a caret blink redraw the list that is already in hand, so neither
+    // searches the catalog again.
+    let (mut results, mut total_rows) =
+        resolve_results(&last_query, search_enabled, &state.entries, &state.recents);
+    repaint(
+        client,
+        state,
+        &results,
+        font,
+        search_enabled,
+        cursor_visible,
+    )?;
 
     // Non-blocking socket: a poll readiness wakeup then drains every queued
     // message in one pass without blocking on the final partial read.
@@ -388,9 +396,9 @@ pub(crate) fn run() -> Result<()> {
         match client.pending_action {
             PendingAction::SelectUp => {
                 client.pending_action = PendingAction::None;
-                if current_results_len > 0 {
+                if total_rows > 0 {
                     state.selected = if state.selected == 0 {
-                        current_results_len - 1
+                        total_rows - 1
                     } else {
                         state.selected - 1
                     };
@@ -399,8 +407,8 @@ pub(crate) fn run() -> Result<()> {
             }
             PendingAction::SelectDown => {
                 client.pending_action = PendingAction::None;
-                if current_results_len > 0 {
-                    state.selected = (state.selected + 1) % current_results_len;
+                if total_rows > 0 {
+                    state.selected = (state.selected + 1) % total_rows;
                     selection_moved = true;
                 }
             }
@@ -413,7 +421,7 @@ pub(crate) fn run() -> Result<()> {
         }
 
         // Handle pointer click/drag in the input box
-        handle_pointer_input(&mut client, &font);
+        handle_pointer_input(client, font);
 
         // Repaint on any of three triggers: the input changed, the selection
         // moved, or the caret blinked. They differ only in what they settle
@@ -427,9 +435,8 @@ pub(crate) fn run() -> Result<()> {
             let text = client.editor.text_owned();
             let query_changed = text != last_query;
             last_query = text;
-            let total_rows =
-                resolve_results(&text, search_enabled, &state.entries, &state.recents).1;
-            current_results_len = total_rows;
+            (results, total_rows) =
+                resolve_results(&text, search_enabled, &state.entries, &state.recents);
 
             // A new query is a new list. An index carried over from the previous
             // one points at a row the user never scanned, and Enter would launch
@@ -441,72 +448,91 @@ pub(crate) fn run() -> Result<()> {
 
             // The window grows and shrinks with the row count.
             client.resize_surface(WINDOW_WIDTH, calculate_height(total_rows))?;
-            repaint(&mut client, &state, &font, search_enabled, cursor_visible)?;
+            repaint(
+                client,
+                state,
+                &results,
+                font,
+                search_enabled,
+                cursor_visible,
+            )?;
         } else if selection_moved {
             // The highlight moved. The caret keeps its phase and the window its
             // size, so navigation does not disturb the blink.
-            repaint(&mut client, &state, &font, search_enabled, cursor_visible)?;
+            repaint(
+                client,
+                state,
+                &results,
+                font,
+                search_enabled,
+                cursor_visible,
+            )?;
         } else if last_blink.elapsed_ms() >= CURSOR_BLINK_MS {
             cursor_visible = !cursor_visible;
             last_blink = Instant::now();
-            repaint(&mut client, &state, &font, search_enabled, cursor_visible)?;
+            repaint(
+                client,
+                state,
+                &results,
+                font,
+                search_enabled,
+                cursor_visible,
+            )?;
         }
     }
-
-    // Check if we should launch something
-    if client.pending_action == PendingAction::Launch {
-        match parse_action(client.editor.text(), search_enabled) {
-            InputAction::Search(q) if !q.is_empty() => {
-                if let Some(url) = &cfg.search_url {
-                    if let Err(e) = launch::launch_search(url, q) {
-                        elog!("bnklaunch: web search failed: {e}");
-                    }
-                }
-            }
-            InputAction::OpenUrl(u) if !u.is_empty() => {
-                let mut url: arena::ArrayString<URL_CAP> = arena::ArrayString::new();
-                normalize_url(u, &mut url);
-                if let Err(e) = launch::launch_url(&url) {
-                    elog!("bnklaunch: failed to open URL: {e}");
-                }
-            }
-            InputAction::AppSearch(text) if !text.is_empty() => {
-                // Scope the borrowed result list so it drops before the &mut
-                // state in record_launch.
-                let launched = {
-                    let results = desktop::search(&state.entries, text);
-                    match results.get(state.selected) {
-                        Some(entry) if launch::launch(entry).is_ok() => Some(entry.name),
-                        _ => None,
-                    }
-                };
-                record_launch(&mut state, recents_offset, launched);
-            }
-            InputAction::AppSearch(_) => {
-                let launched = {
-                    let results = cache::resolve(&state.recents, &state.entries);
-                    match results.get(state.selected) {
-                        Some(entry) if launch::launch(entry).is_ok() => Some(entry.name),
-                        _ => None,
-                    }
-                };
-                record_launch(&mut state, recents_offset, launched);
-            }
-            _ => {}
-        }
-    }
-
     Ok(())
 }
 
-/// Draw the current state into the next frame and show it.
-///
-/// The result list borrows the catalog, so it is built inside the draw and
-/// dropped with it; nothing holds that borrow across the event loop, where the
-/// state is mutated.
+/// Launch whatever the input resolved to, and record an application launch as
+/// the most recent. Reached only when the loop ended on Enter.
+fn dispatch_launch(
+    client: &Client,
+    state: &mut AppState,
+    cfg: &config::Config,
+    recents_offset: Option<u64>,
+    search_enabled: bool,
+) {
+    let text = client.editor.text();
+    match parse_action(text, search_enabled) {
+        InputAction::Search(q) if !q.is_empty() => {
+            if let Some(url) = &cfg.search_url {
+                if let Err(e) = launch::launch_search(url, q) {
+                    elog!("bnklaunch: web search failed: {e}");
+                }
+            }
+        }
+        InputAction::OpenUrl(u) if !u.is_empty() => {
+            let mut url: arena::ArrayString<URL_CAP> = arena::ArrayString::new();
+            normalize_url(u, &mut url);
+            if let Err(e) = launch::launch_url(&url) {
+                elog!("bnklaunch: failed to open URL: {e}");
+            }
+        }
+        // A query and an empty input both land on a row of the same list; which
+        // list is resolve_results' business, not this one's.
+        InputAction::AppSearch(_) => {
+            // Scope the borrowed row so it drops before the &mut state below.
+            let launched = {
+                let (results, _) =
+                    resolve_results(text, search_enabled, &state.entries, &state.recents);
+                match results.get(state.selected) {
+                    Some(entry) if launch::launch(entry).is_ok() => Some(entry.name),
+                    _ => None,
+                }
+            };
+            if let (Some(name), Some(offset)) = (launched, recents_offset) {
+                let _ = cache::record(offset, &mut state.recents, name.as_str());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Draw the given rows into the next frame and show it.
 fn repaint(
     client: &mut Client,
     state: &AppState,
+    results: &[&DesktopEntry],
     font: &font::Font,
     search_enabled: bool,
     cursor_visible: bool,
@@ -521,8 +547,7 @@ fn repaint(
         let Some(pixels) = client.pixels() else {
             return;
         };
-        let (results, _) = resolve_results(&text, search_enabled, &state.entries, &state.recents);
-        draw_ui(pixels, &text, state, &results, font, search_enabled, &caret);
+        draw_ui(pixels, &text, state, results, font, search_enabled, &caret);
     })
 }
 
@@ -594,7 +619,7 @@ mod tests {
     fn entries(names: &[(&str, &str)]) -> desktop::Catalog {
         let mut out = desktop::Catalog::new();
         for (name, exec) in names {
-            let _ = out.push(DesktopEntry::new(name, exec, "").expect("entry"));
+            let _ = out.push(DesktopEntry::new(name, exec).expect("entry"));
         }
         out
     }

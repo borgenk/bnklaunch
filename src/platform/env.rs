@@ -5,8 +5,6 @@
 //! environ walk. The returned value borrows the process environment, which is
 //! stable for the program's lifetime since nothing here sets variables.
 
-#![allow(dead_code)]
-
 use core::ffi::c_char;
 
 use crate::platform::arena::ArrayString;

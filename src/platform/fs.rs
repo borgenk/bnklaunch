@@ -5,8 +5,6 @@
 //! contents read into a caller-provided fixed buffer, and directory entries are
 //! walked from a getdents64 buffer without allocating.
 
-#![allow(dead_code)]
-
 use crate::platform::arena::{ArrayString, ArrayVec};
 use crate::platform::bytes;
 use crate::platform::error::{elog, Error, Result};
@@ -17,6 +15,21 @@ use crate::platform::syscall::{
 
 /// Longest path the helpers handle.
 pub const PATH_CAP: usize = crate::platform::syscall::PATH_CAP;
+
+/// A filesystem path held inline. What the directory scans build and carry.
+pub type ScanPath = ArrayString<PATH_CAP>;
+
+/// Join two path segments with a single separator, or None when the result does
+/// not fit.
+pub fn join(base: &str, child: &str) -> Option<ScanPath> {
+    let mut p = ScanPath::new();
+    p.push_str(base).ok()?;
+    if !base.ends_with('/') {
+        p.push('/').ok()?;
+    }
+    p.push_str(child).ok()?;
+    Some(p)
+}
 
 /// Build a checked C path for the path syscalls, or an error if it does not fit
 /// or holds an interior NUL.

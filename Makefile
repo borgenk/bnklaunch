@@ -22,8 +22,13 @@ TEST_ENV := CARGO_ENCODED_RUSTFLAGS="" RUST_MIN_STACK=16777216 CARGO_UNSTABLE_BU
 fmt:
 	cargo fmt --all
 
+# Lint twice, because the two builds see different code. The test build has
+# cfg(test) on, so anything only a test uses still counts as used; the binary
+# build is what actually ships, and it is the one that finds code nothing calls.
+# Neither pass alone catches everything.
 clippy:
 	$(TEST_ENV) cargo clippy --all --benches --tests --examples --all-features -- -D warnings
+	cargo clippy --all-features -- -D warnings
 
 build:
 	cargo build

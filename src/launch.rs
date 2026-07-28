@@ -13,6 +13,11 @@ extern "C" {
     fn execvp(file: *const c_char, argv: *const *const c_char) -> i32;
 }
 
+/// Byte capacity of a URL the launcher builds or opens. Larger than the search
+/// URL template it is built from (config::SEARCH_URL_CAP), since the
+/// percent-encoded query goes in as well.
+pub const URL_CAP: usize = 2048;
+
 /// Launch an application from its desktop entry.
 ///
 /// The Exec value is tokenized per the Desktop Entry spec and exec'd directly,
@@ -122,9 +127,6 @@ fn has_allowed_scheme(url: &str) -> bool {
     const ALLOWED: [&str; 4] = ["http://", "https://", "file://", "mailto:"];
     ALLOWED.iter().any(|scheme| url.starts_with(scheme))
 }
-
-/// Byte capacity of a URL the launcher builds or opens.
-pub const URL_CAP: usize = 2048;
 
 /// Open a web search for the given query using the configured search URL.
 pub fn launch_search(search_url: &str, query: &str) -> Result<()> {
