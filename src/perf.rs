@@ -154,6 +154,7 @@ fn measure_all() -> Vec<Measurement> {
                 &font,
                 true,
                 &caret,
+                &crate::ui::Theme::DEFAULT,
             );
         }),
     ]

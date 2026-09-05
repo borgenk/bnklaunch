@@ -126,31 +126,39 @@ impl Default for KeyRepeat {
 }
 
 impl KeyRepeat {
+    /// Milliseconds until the held key is next due to repeat, zero when it is
+    /// due now. None when no key is held, or when the rate says never. The
+    /// event loop parks for this long, and should_repeat reads the same answer.
+    pub fn time_until_due(&self) -> Option<u32> {
+        let press_time = self.press_time?;
+        let now = Instant::now();
+        self.due_in(
+            now.ms_since(press_time) as u32,
+            self.last_repeat.map(|last| now.ms_since(last) as u32),
+        )
+    }
+
+    /// The same answer from elapsed times, so a test can walk exact moments.
+    pub fn due_in(&self, since_press: u32, since_last: Option<u32>) -> Option<u32> {
+        self.held_key?;
+        if !self.repeating {
+            return Some(self.delay_ms.saturating_sub(since_press));
+        }
+        let Some(since_last) = since_last else {
+            return Some(0);
+        };
+        if self.rate == 0 {
+            return None;
+        }
+        // rate is repeats per second, so the gap between repeats is
+        // 1000 / rate milliseconds.
+        let interval_ms = 1000 / self.rate;
+        Some(interval_ms.saturating_sub(since_last))
+    }
+
     /// Check if it's time to emit a repeat.
     pub fn should_repeat(&self) -> bool {
-        if self.held_key.is_none() {
-            return false;
-        }
-        let Some(press_time) = self.press_time else {
-            return false;
-        };
-
-        let now = Instant::now();
-        let elapsed = now.ms_since(press_time) as u32;
-
-        if !self.repeating {
-            elapsed >= self.delay_ms
-        } else if let Some(last) = self.last_repeat {
-            // rate is repeats per second, so the gap between repeats is
-            // 1000 / rate milliseconds.
-            if self.rate == 0 {
-                return false;
-            }
-            let interval_ms = 1000 / self.rate;
-            now.ms_since(last) as u32 >= interval_ms
-        } else {
-            true
-        }
+        self.time_until_due() == Some(0)
     }
 }
 

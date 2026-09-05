@@ -1,7 +1,7 @@
 //! The launcher application: single-instance lock, desktop-entry resolution,
 //! the io_uring event loop, and input handling.
 
-use crate::client::{Client, PendingAction};
+use crate::client::{Client, KeyRepeat, PendingAction};
 use crate::clipboard;
 use crate::desktop::{self, DesktopEntry};
 use crate::platform::error::elog;
@@ -9,7 +9,7 @@ use crate::platform::error::{Error, Result};
 use crate::platform::time::Instant;
 use crate::platform::xkb::{keycode, Xkb};
 use crate::platform::{arena, env, fs, syscall, uring};
-use crate::ui::{calculate_height, draw_ui, MAX_RESULTS, WINDOW_WIDTH};
+use crate::ui::{calculate_height, draw_ui, Theme, MAX_RESULTS, WINDOW_WIDTH};
 use crate::{cache, config, denylist, font, launch, ui};
 
 /// Caret blink half-period in milliseconds: solid this long, then hidden this
@@ -20,9 +20,11 @@ const CURSOR_BLINK_MS: u64 = 530;
 /// at a time, the socket poll and the tick, and each is re-armed as it fires.
 const RING_ENTRIES: u32 = 32;
 
-/// Event-loop timer period. Paces key repeat and the caret blink; the socket
-/// poll wakes the loop independently the moment events arrive.
+/// Longest tick the loop parks for. The caret blink needs a wake this often.
 const TICK_NANOS: i64 = 33_000_000;
+
+/// Shortest tick the loop arms, so a deadline already past cannot spin it.
+const MIN_TICK_NANOS: i64 = 1_000_000;
 
 /// io_uring user_data tags identifying which submission a completion belongs to.
 const K_WAYLAND: u64 = 1;
@@ -204,9 +206,6 @@ pub(crate) fn run() -> Result<()> {
     // Load system font
     let font = font::Font::load()?;
 
-    // User configuration: hidden app names plus the optional search URL. The
-    // s: search prefix works only when a search URL is set; without one the
-    // prefix is left as literal text.
     let cfg = config::load();
     let search_enabled = cfg.search_url.is_some();
 
@@ -289,12 +288,27 @@ pub(crate) fn run() -> Result<()> {
     // Wait for input devices
     client.roundtrip()?;
 
-    event_loop(&mut client, &mut state, &font, search_enabled)?;
+    event_loop(&mut client, &mut state, &font, search_enabled, &cfg.theme)?;
 
     if client.pending_action == PendingAction::Launch {
         dispatch_launch(&client, &mut state, &cfg, recents_offset, search_enabled);
     }
     Ok(())
+}
+
+/// How long to park before the loop next has something to do. Only a held key
+/// asks for less than a full tick; parking for exactly its remaining time is
+/// what lands each repeat on its interval.
+fn next_tick(repeat: &KeyRepeat) -> i64 {
+    clamp_tick(repeat.time_until_due())
+}
+
+/// A due time in milliseconds as a tick to park for.
+fn clamp_tick(due_ms: Option<u32>) -> i64 {
+    match due_ms {
+        Some(ms) => (ms as i64 * 1_000_000).clamp(MIN_TICK_NANOS, TICK_NANOS),
+        None => TICK_NANOS,
+    }
 }
 
 /// Run until something dismisses the launcher: Enter, Escape, focus loss, or the
@@ -304,6 +318,7 @@ fn event_loop(
     state: &mut AppState,
     font: &font::Font,
     search_enabled: bool,
+    theme: &Theme,
 ) -> Result<()> {
     // Caret blink state. The caret is solid for one interval then toggles; any
     // input activity resets it to solid below.
@@ -325,6 +340,7 @@ fn event_loop(
         &results,
         font,
         search_enabled,
+        theme,
         cursor_visible,
     )?;
 
@@ -340,7 +356,7 @@ fn event_loop(
     // tick is declared ahead of the ring so it is dropped after it: the kernel
     // reads the timespec asynchronously, and the ring must be gone (its ops
     // cancelled) before the memory behind that pointer goes away.
-    let tick = syscall::kernel_timespec {
+    let mut tick = syscall::kernel_timespec {
         tv_sec: 0,
         tv_nsec: TICK_NANOS,
     };
@@ -377,17 +393,18 @@ fn event_loop(
                         }
                     }
                 }
-                K_TIMER => {
-                    // Re-arm the one-shot timer for the next tick.
-                    // SAFETY: tick outlives the ring, as above.
-                    unsafe { ring.prep_timeout(&tick, K_TIMER) }.map_err(|_| arm_failed())?;
-                    timer_fired = true;
-                }
+                K_TIMER => timer_fired = true,
                 _ => {}
             }
         }
         if timer_fired {
             client.process_key_repeat();
+            // Armed after the repeat has gone out: before it, the held key is
+            // still due and the answer would be the floor. The one timeout in
+            // flight has completed, so nothing is reading tick.
+            tick.tv_nsec = next_tick(&client.key_repeat);
+            // SAFETY: tick outlives the ring, as above.
+            unsafe { ring.prep_timeout(&tick, K_TIMER) }.map_err(|_| arm_failed())?;
         }
 
         // Handle pending actions. Up and Down wrap around the result list. A
@@ -454,6 +471,7 @@ fn event_loop(
                 &results,
                 font,
                 search_enabled,
+                theme,
                 cursor_visible,
             )?;
         } else if selection_moved {
@@ -465,6 +483,7 @@ fn event_loop(
                 &results,
                 font,
                 search_enabled,
+                theme,
                 cursor_visible,
             )?;
         } else if last_blink.elapsed_ms() >= CURSOR_BLINK_MS {
@@ -476,6 +495,7 @@ fn event_loop(
                 &results,
                 font,
                 search_enabled,
+                theme,
                 cursor_visible,
             )?;
         }
@@ -535,6 +555,7 @@ fn repaint(
     results: &[&DesktopEntry],
     font: &font::Font,
     search_enabled: bool,
+    theme: &Theme,
     cursor_visible: bool,
 ) -> Result<()> {
     let text = client.editor.text_owned();
@@ -547,7 +568,16 @@ fn repaint(
         let Some(pixels) = client.pixels() else {
             return;
         };
-        draw_ui(pixels, &text, state, results, font, search_enabled, &caret);
+        draw_ui(
+            pixels,
+            &text,
+            state,
+            results,
+            font,
+            search_enabled,
+            &caret,
+            theme,
+        );
     })
 }
 
@@ -579,11 +609,7 @@ fn handle_pointer_input(
         }
     }
 
-    // Check if pointer is in the input box region
-    let in_input_box = py >= ui::INPUT_START_Y as f64
-        && py < (ui::INPUT_START_Y + ui::INPUT_BOX_H) as f64
-        && px >= ui::TEXT_X as f64
-        && px < (WINDOW_WIDTH - ui::MARGIN_X) as f64;
+    let in_input_box = ui::input_box_contains(px, py);
 
     if client.pointer.clicked && in_input_box {
         let text_offset_px = (px - ui::TEXT_X as f64).max(0.0) as f32;
@@ -651,6 +677,94 @@ mod tests {
         let mut out: arena::ArrayString<URL_CAP> = arena::ArrayString::new();
         normalize_url(url, &mut out);
         out.as_str().to_string()
+    }
+
+    /// Step the event loop: park for what the tick asks, then see whether the
+    /// key is due. Returns the gap between each repeat and the one before it,
+    /// in milliseconds.
+    fn repeat_gaps(repeat: &KeyRepeat, rounds: usize) -> Vec<u32> {
+        let mut since_last = 0;
+        let mut gaps = Vec::new();
+        for _ in 0..rounds {
+            let waited = (clamp_tick(repeat.due_in(0, Some(since_last))) / 1_000_000) as u32;
+            since_last += waited;
+            if repeat.due_in(0, Some(since_last)) == Some(0) {
+                gaps.push(since_last);
+                since_last = 0;
+            }
+        }
+        gaps
+    }
+
+    #[test]
+    fn a_repeat_lands_on_its_interval_rather_than_on_the_next_tick() {
+        // The default rate of 25 wants a repeat every 40ms, against a 33ms
+        // tick. Waiting a fixed tick misses every deadline and takes the tick
+        // after it, which comes out a steady 66.
+        let repeat = KeyRepeat {
+            held_key: Some(1),
+            repeating: true,
+            ..Default::default()
+        };
+        assert_eq!(1000 / repeat.rate, 40);
+        let gaps = repeat_gaps(&repeat, 60);
+        assert!(gaps.len() >= 5, "not enough repeats to judge: {gaps:?}");
+        assert!(
+            gaps.iter().all(|&g| g == 40),
+            "every gap should be the interval: {gaps:?}"
+        );
+    }
+
+    #[test]
+    fn a_repeat_rate_that_divides_the_tick_is_exact_too() {
+        // 20 a second is 50ms, which no number of 33ms ticks lands on either.
+        let repeat = KeyRepeat {
+            held_key: Some(1),
+            repeating: true,
+            rate: 20,
+            ..Default::default()
+        };
+        assert!(repeat_gaps(&repeat, 60).iter().all(|&g| g == 50));
+    }
+
+    #[test]
+    fn the_tick_never_runs_long_or_spins() {
+        // Nothing held parks for the full tick, so the caret keeps blinking.
+        let idle = KeyRepeat::default();
+        assert_eq!(clamp_tick(idle.time_until_due()), TICK_NANOS);
+
+        // A deadline further out than a tick still parks only a tick.
+        let waiting = KeyRepeat {
+            held_key: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(clamp_tick(waiting.due_in(0, None)), TICK_NANOS);
+        // One already past parks briefly rather than not at all.
+        assert_eq!(clamp_tick(Some(0)), MIN_TICK_NANOS);
+
+        // A repeat that has just gone out is not due again for an interval.
+        // Asked before it goes out, the same key is due now: the floor.
+        let held = KeyRepeat {
+            held_key: Some(1),
+            repeating: true,
+            ..Default::default()
+        };
+        assert_eq!(clamp_tick(held.due_in(0, Some(0))), TICK_NANOS);
+        assert_eq!(clamp_tick(held.due_in(0, Some(40))), MIN_TICK_NANOS);
+    }
+
+    #[test]
+    fn a_held_key_waits_out_its_delay_before_the_first_repeat() {
+        let repeat = KeyRepeat {
+            held_key: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(repeat.delay_ms, 400);
+        // Most of the delay is longer than a tick, so it parks a tick at a
+        // time, then exactly the remainder.
+        assert_eq!(clamp_tick(repeat.due_in(0, None)), TICK_NANOS);
+        assert_eq!(clamp_tick(repeat.due_in(390, None)), 10_000_000);
+        assert_eq!(repeat.due_in(400, None), Some(0));
     }
 
     /// The editing keys and the modifiers are layout-independent, so these read

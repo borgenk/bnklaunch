@@ -12,6 +12,7 @@ use crate::platform::freetype;
 use crate::platform::fs::ScanPath;
 use crate::platform::syscall::{self, Fd, AT_FDCWD, DT_DIR, DT_LNK, DT_REG, O_RDONLY};
 use crate::platform::{env, fs};
+use crate::shm;
 
 /// Font sizes for UI elements.
 pub const INPUT_SIZE: f32 = 20.0;
@@ -363,6 +364,9 @@ fn blit_coverage(
         return;
     }
 
+    // Most of a glyph is fully covered; an opaque colour needs no blend there.
+    let opaque = color >> 24 == 0xFF;
+
     // Clip once for the whole glyph rather than testing every pixel against
     // four bounds. What is left is the rectangle of the glyph that lands inside
     // the buffer and inside the text box, and every pixel in it is in range.
@@ -385,29 +389,13 @@ fn blit_coverage(
                 continue;
             }
             let offset = left + i;
-            pixels[offset] = if coverage == u8::MAX {
-                // The inside of a glyph is fully covered, and most of a glyph is
-                // inside: only its edges are partial. A full pixel is the colour
-                // itself, so there is nothing to blend it with.
+            pixels[offset] = if coverage == u8::MAX && opaque {
                 color
             } else {
-                blend(pixels[offset], color, coverage)
+                shm::blend(pixels[offset], color, coverage)
             };
         }
     }
-}
-
-/// Alpha-blend foreground color over background using glyph coverage.
-fn blend(bg: u32, fg: u32, coverage: u8) -> u32 {
-    let a = coverage as u32;
-    let inv = 255 - a;
-
-    let r = ((fg >> 16 & 0xFF) * a + (bg >> 16 & 0xFF) * inv) / 255;
-    let g = ((fg >> 8 & 0xFF) * a + (bg >> 8 & 0xFF) * inv) / 255;
-    let b = ((fg & 0xFF) * a + (bg & 0xFF) * inv) / 255;
-    let out_a = a + ((bg >> 24 & 0xFF) * inv) / 255;
-
-    (out_a << 24) | (r << 16) | (g << 8) | b
 }
 
 /// Walk a directory tree, recording every preferred name it holds against that
@@ -606,11 +594,41 @@ mod tests {
         let font = load_fixture_font();
         let (w, h) = (200u32, 40u32);
         let mut pixels = vec![0u32; (w * h) as usize];
-        let width = font.render_text(&mut pixels, w, h, 2, 2, "Hi", 0x00FF_FFFF, w, NAME_SIZE);
+        let width = font.render_text(&mut pixels, w, h, 2, 2, "Hi", 0xFFFF_FFFF, w, NAME_SIZE);
         assert!(width > 0, "rendered width should be positive");
         assert!(
             pixels.iter().any(|&p| p != 0),
             "rendering should leave at least one blended pixel"
+        );
+    }
+
+    /// Text is drawn with the same premultiplied compositing as everything else,
+    /// so a colour carrying alpha lands over what is under it rather than
+    /// replacing it, and a colour with no alpha at all covers nothing.
+    #[test]
+    fn render_text_composites_a_translucent_colour() {
+        let font = load_fixture_font();
+        let (w, h) = (200u32, 40u32);
+        let black = 0xFF00_0000;
+
+        let mut pixels = vec![black; (w * h) as usize];
+        font.render_text(&mut pixels, w, h, 2, 2, "Hi", 0x8080_8080, w, NAME_SIZE);
+        assert!(
+            pixels.iter().any(|&p| p != black),
+            "half-alpha white should still mark the buffer"
+        );
+        // Half alpha over black tops out at half grey. A pixel brighter than
+        // that would mean the colour had been stamped rather than composited.
+        assert!(
+            pixels.iter().all(|&p| p >> 16 & 0xFF <= 0x80),
+            "no channel should exceed the colour's own alpha"
+        );
+
+        let mut pixels = vec![black; (w * h) as usize];
+        font.render_text(&mut pixels, w, h, 2, 2, "Hi", 0x0000_0000, w, NAME_SIZE);
+        assert!(
+            pixels.iter().all(|&p| p == black),
+            "a colour with no alpha should leave the buffer alone"
         );
     }
 
@@ -633,7 +651,7 @@ mod tests {
             w - 4,
             2,
             "WWWWWWWW",
-            0x00FF_FFFF,
+            0xFFFF_FFFF,
             w * 4,
             NAME_SIZE,
         );
@@ -642,12 +660,12 @@ mod tests {
         // Drawn at the very top, where a glyph's ink rises above the baseline
         // and out of the buffer.
         let mut pixels = vec![0u32; (w * h) as usize];
-        font.render_text(&mut pixels, w, h, 0, 0, "Wg", 0x00FF_FFFF, w, NAME_SIZE);
+        font.render_text(&mut pixels, w, h, 0, 0, "Wg", 0xFFFF_FFFF, w, NAME_SIZE);
 
         // And with the text box ending before the buffer does, which is the case
         // the input field draws: the glyph fits the buffer but not the box.
         let mut pixels = vec![0u32; (w * h) as usize];
-        font.render_text(&mut pixels, w, h, 0, 2, "WW", 0x00FF_FFFF, 6, NAME_SIZE);
+        font.render_text(&mut pixels, w, h, 0, 2, "WW", 0xFFFF_FFFF, 6, NAME_SIZE);
     }
 
     #[test]
@@ -657,7 +675,7 @@ mod tests {
         let mut full = vec![0u32; (w * h) as usize];
         let mut clipped = vec![0u32; (w * h) as usize];
 
-        let full_w = font.render_text(&mut full, w, h, 0, 2, "WWWWWW", 0x00FF_FFFF, w, NAME_SIZE);
+        let full_w = font.render_text(&mut full, w, h, 0, 2, "WWWWWW", 0xFFFF_FFFF, w, NAME_SIZE);
         // A max_width well under the full extent must cut the run short.
         let narrow = full_w / 2;
         let clipped_w = font.render_text(
@@ -667,7 +685,7 @@ mod tests {
             0,
             2,
             "WWWWWW",
-            0x00FF_FFFF,
+            0xFFFF_FFFF,
             narrow,
             NAME_SIZE,
         );

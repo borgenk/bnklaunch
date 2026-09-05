@@ -94,24 +94,45 @@ impl PixelBuffer {
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr() as *mut u32, len) }
     }
 
-    /// Fill the entire buffer with a single color.
+    /// Stamp one colour over the whole buffer, replacing the frame it held.
     pub fn fill(&mut self, color: u32) {
-        for pixel in self.pixels_u32() {
-            *pixel = color;
-        }
+        self.pixels_u32().fill(color);
     }
 
-    /// Draw a filled rectangle.
-    pub fn fill_rect(&mut self, x: u32, y: u32, w: u32, h: u32, color: u32) {
-        let width = self.width;
-        let x_end = (x + w).min(width);
+    /// The rows of a rectangle, clipped to the buffer. Empty when it starts
+    /// past an edge, which is where the caret ends up behind long enough text.
+    fn rows(&mut self, x: u32, y: u32, w: u32, h: u32) -> impl Iterator<Item = &mut [u32]> {
+        let width = self.width as usize;
+        let x_end = (x + w).min(self.width);
         let y_end = (y + h).min(self.height);
+        let empty = x >= x_end || y >= y_end;
+        let (first, last) = if empty {
+            (0, 0)
+        } else {
+            (y as usize * width, y_end as usize * width)
+        };
+        let (x, x_end) = (x as usize, x_end as usize);
 
-        let pixels = self.pixels_u32();
-        for py in y..y_end {
-            for px in x..x_end {
-                let offset = (py * width + px) as usize;
-                pixels[offset] = color;
+        // The rows the rectangle spans, then its columns out of each.
+        self.pixels_u32()[first..last]
+            .chunks_mut(width)
+            .map(move |row| &mut row[x..x_end])
+    }
+
+    /// Draw a filled rectangle. An opaque colour replaces what is there; one
+    /// carrying alpha composites over it.
+    pub fn fill_rect(&mut self, x: u32, y: u32, w: u32, h: u32, color: u32) {
+        let alpha = color >> 24;
+        if alpha == 0 {
+            return;
+        }
+        for row in self.rows(x, y, w, h) {
+            if alpha == 0xFF {
+                row.fill(color);
+            } else {
+                for pixel in row.iter_mut() {
+                    *pixel = blend(*pixel, color, u8::MAX);
+                }
             }
         }
     }
@@ -153,6 +174,20 @@ impl Drop for PixelBuffer {
     }
 }
 
+/// Composite src over dst, both premultiplied ARGB8888, with src scaled by
+/// coverage first: 255 for a solid fill, a glyph's coverage byte for text.
+pub fn blend(dst: u32, src: u32, coverage: u8) -> u32 {
+    let cov = coverage as u32;
+    let inv = 255 - ((src >> 24 & 0xFF) * cov) / 255;
+
+    let a = ((src >> 24 & 0xFF) * cov + (dst >> 24 & 0xFF) * inv) / 255;
+    let r = ((src >> 16 & 0xFF) * cov + (dst >> 16 & 0xFF) * inv) / 255;
+    let g = ((src >> 8 & 0xFF) * cov + (dst >> 8 & 0xFF) * inv) / 255;
+    let b = ((src & 0xFF) * cov + (dst & 0xFF) * inv) / 255;
+
+    (a << 24) | (r << 16) | (g << 8) | b
+}
+
 /// Create an anonymous file using memfd_create. The name is a fixed program
 /// constant, checked into a CPath for the syscall.
 fn memfd_create(name: &str) -> Result<Fd> {
@@ -168,7 +203,7 @@ fn memfd_create(name: &str) -> Result<Fd> {
 mod tests {
     use super::*;
 
-    // PixelBuffer has no Debug impl, so the test matches on the Result by hand.
+    // PixelBuffer has no Debug impl, so the Result is matched, not unwrapped.
     fn expect_overflow(width: u32, height: u32) {
         match PixelBuffer::new(width, height) {
             Ok(_) => panic!("expected an overflow error for {width}x{height}"),
@@ -188,5 +223,99 @@ mod tests {
     fn new_rejects_size_overflow() {
         // stride fits in u32 but stride * height exceeds off_t::MAX.
         expect_overflow(1_000_000_000, 3_000_000_000);
+    }
+
+    const BLACK: u32 = 0xFF00_0000;
+    const WHITE: u32 = 0xFFFF_FFFF;
+    /// White at half alpha, premultiplied: every channel is scaled, not just
+    /// the alpha.
+    const HALF_WHITE: u32 = 0x8080_8080;
+
+    #[test]
+    fn blend_leaves_an_opaque_source_alone() {
+        // Full coverage of an opaque colour is the colour, whatever is under it.
+        assert_eq!(blend(BLACK, WHITE, 255), WHITE);
+        assert_eq!(blend(WHITE, BLACK, 255), BLACK);
+    }
+
+    #[test]
+    fn blend_covering_nothing_changes_nothing() {
+        // Two ways to cover nothing: no coverage, or no alpha to cover with.
+        assert_eq!(blend(BLACK, WHITE, 0), BLACK);
+        assert_eq!(blend(BLACK, 0x0000_0000, 255), BLACK);
+        assert_eq!(blend(BLACK, 0x0000_0000, 128), BLACK);
+    }
+
+    #[test]
+    fn blend_composites_a_translucent_source() {
+        // Half white over black is half grey, and the result is still opaque:
+        // the destination's own alpha survives what is laid over it.
+        assert_eq!(blend(BLACK, HALF_WHITE, 255), 0xFF80_8080);
+
+        // The same colour over nothing keeps its own alpha and no more, which is
+        // what makes a translucent window's rows as see-through as its body.
+        assert_eq!(blend(0x0000_0000, HALF_WHITE, 255), HALF_WHITE);
+    }
+
+    #[test]
+    fn blend_never_leaves_a_channel_above_the_alpha() {
+        // Premultiplied is an invariant, not a convention: a channel brighter
+        // than its own alpha is a colour the compositor cannot read. Walk a
+        // spread of sources, destinations and coverages and hold the line.
+        for &dst in &[0x0000_0000, 0x8040_2010, BLACK, WHITE, HALF_WHITE] {
+            for &src in &[0x0000_0000, 0x4020_1008, BLACK, WHITE, HALF_WHITE] {
+                for coverage in [0u8, 1, 63, 128, 200, 254, 255] {
+                    let out = blend(dst, src, coverage);
+                    let a = out >> 24 & 0xFF;
+                    for shift in [16, 8, 0] {
+                        let c = out >> shift & 0xFF;
+                        assert!(
+                            c <= a,
+                            "channel {c} above alpha {a} blending {src:08x} over \
+                             {dst:08x} at coverage {coverage}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fill_replaces_what_the_buffer_held() {
+        // A frame starts by filling over the frame before last, so a
+        // translucent background has to replace those pixels, not land on them.
+        let mut buf = PixelBuffer::new(4, 2).expect("buffer");
+        buf.fill(WHITE);
+        buf.fill(HALF_WHITE);
+        assert!(buf.pixels_u32().iter().all(|&p| p == HALF_WHITE));
+    }
+
+    #[test]
+    fn fill_rect_stamps_an_opaque_colour_and_composites_a_translucent_one() {
+        let mut buf = PixelBuffer::new(4, 2).expect("buffer");
+        buf.fill(BLACK);
+
+        buf.fill_rect(0, 0, 2, 1, WHITE);
+        assert_eq!(buf.pixels_u32()[0], WHITE);
+
+        buf.fill_rect(2, 0, 2, 1, HALF_WHITE);
+        assert_eq!(buf.pixels_u32()[2], 0xFF80_8080);
+
+        // The row below was never drawn into.
+        assert_eq!(buf.pixels_u32()[4], BLACK);
+    }
+
+    #[test]
+    fn fill_rect_stops_at_the_buffer_edges() {
+        let mut buf = PixelBuffer::new(2, 2).expect("buffer");
+        buf.fill(BLACK);
+        // Wider and taller than the buffer, which is what a rect anchored near
+        // the right edge of the window is.
+        buf.fill_rect(1, 1, 10, 10, WHITE);
+        assert_eq!(buf.pixels_u32(), &[BLACK, BLACK, BLACK, WHITE]);
+        // Starting past the edge altogether, which is where the caret ends up
+        // behind long enough text, draws nothing.
+        buf.fill_rect(5, 0, 2, 1, WHITE);
+        assert_eq!(buf.pixels_u32(), &[BLACK, BLACK, BLACK, WHITE]);
     }
 }
