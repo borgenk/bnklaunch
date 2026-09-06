@@ -5,15 +5,14 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # The toolchain is nightly and floats, so a lint that did not exist yesterday
-  # can fail a build nobody touched. Monday morning is a better time to find
-  # that than the moment a tag goes out.
+  # Weekly, to catch drift in the runner image and the packages it installs.
   schedule:
     - cron: "0 6 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
 
+# Actions are pinned to a commit, with the version beside it.
 jobs:
   rust:
     name: Rust
@@ -21,7 +20,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The binary links libfreetype and libxkbcommon by name. The runner ships
       # the runtime shared objects but not the unversioned .so symlinks the
@@ -32,18 +31,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libfreetype-dev libxkbcommon-dev
 
-      # Nightly with rust-src: the build relies on -Z build-std, which rebuilds
-      # the standard library from source.
+      # The channel and the components come from rust-toolchain.toml.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt, clippy, rust-src
+        run: rustup toolchain install
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: make fmt-check
+
+      - name: Test the installer and the ABI floor
+        run: make test-install test-abi
 
       - name: Clippy
         run: make clippy

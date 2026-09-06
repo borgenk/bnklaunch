@@ -11,28 +11,20 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Actions are pinned to a commit, with the version beside it.
 jobs:
-  release:
-    name: Build and publish
+  version:
+    name: Verify tag matches Cargo.toml version
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # The binary links libfreetype and libxkbcommon by name. The runner ships
-      # the runtime shared objects but not the unversioned .so symlinks the
-      # linker resolves -lfreetype and -lxkbcommon against, which the -dev
-      # packages provide.
-      - name: Install system libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libfreetype-dev libxkbcommon-dev
-
-      # The release tarball is named from the Cargo.toml version, and
-      # install.sh fetches it by the release tag. A mismatch would publish
-      # an asset the installer cannot find, so fail fast before building.
-      - name: Verify tag matches Cargo.toml version
+      # The release tarball is named from the Cargo.toml version, and install.sh
+      # fetches it by the release tag. A mismatch would publish an asset the
+      # installer cannot find, so fail before anything is built.
+      - name: Compare tag against Cargo.toml
         run: |
           cargo_version="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           if [ "$cargo_version" != "$GITHUB_REF_NAME" ]; then
@@ -40,20 +32,80 @@ jobs:
             exit 1
           fi
 
+  # CI does not run on tags, so the gate runs here before anything is built.
+  gate:
+    name: Gate
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfreetype-dev libxkbcommon-dev
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src
+        run: rustup toolchain install
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      - name: Check
+        run: make check
+
+  release:
+    name: Build and publish
+    needs: gate
+    runs-on: ubuntu-latest
+    # The tarball takes its glibc and system libraries from whatever builds it,
+    # so it is built in the oldest distribution it runs on.
+    container: debian:12
+    timeout-minutes: 30
+    steps:
+      # Ahead of the checkout, so the action has git to clone with. The binary
+      # resolves -lfreetype and -lxkbcommon at link time, which needs the
+      # unversioned .so symlinks the -dev packages carry.
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            curl \
+            git \
+            make \
+            libfreetype6-dev \
+            libxkbcommon-dev
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The image has no rustup, and the toolchain it installs is the one
+      # rust-toolchain.toml names.
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" toolchain install
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Checks the ABI floor and writes the checksum the installer verifies.
       - name: Build release tarball
         run: make build-linux
 
       - name: Publish to GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          files: dist/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true

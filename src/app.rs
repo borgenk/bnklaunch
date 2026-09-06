@@ -355,7 +355,7 @@ fn event_loop(
     let wl_fd = client.socket.fd();
     // tick is declared ahead of the ring so it is dropped after it: the kernel
     // reads the timespec asynchronously, and the ring must be gone (its ops
-    // cancelled) before the memory behind that pointer goes away.
+    // canceled) before the memory behind that pointer goes away.
     let mut tick = syscall::kernel_timespec {
         tv_sec: 0,
         tv_nsec: TICK_NANOS,

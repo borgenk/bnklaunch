@@ -1,0 +1,8 @@
+# What the frame in src/dev/screenshot.rs measures out to, colors as the
+# frame holds them, premultiplied. Rewritten by `make frame-update`;
+# look at assets/screenshot.png before committing.
+size 800 304
+band 0 54 1d1f22
+band 54 104 282a2d
+band 104 304 1d1f22
+ink 4639 15 15 183 296

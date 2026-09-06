@@ -161,7 +161,7 @@ pub enum KeyboardInteractivity {
     OnDemand = 2,
 }
 
-/// Anchor edges for a layer surface. Anchoring to none of them centres it. The
+/// Anchor edges for a layer surface. Anchoring to none of them centers it. The
 /// launcher only ever anchors to the top and offsets with a margin, so the other
 /// three edges are left out until something needs them.
 pub mod anchor {

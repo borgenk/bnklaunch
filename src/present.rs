@@ -119,7 +119,7 @@ impl Present {
             &[Arg::Uint(width), Arg::Uint(height)],
         )?;
         // Anchored to the top edge and then pushed down by the margin, so the
-        // launcher sits in the upper third rather than dead centre.
+        // launcher sits in the upper third rather than dead center.
         conn.request(
             layer_surface_id,
             proto::zwlr_layer_surface_v1::SET_ANCHOR,

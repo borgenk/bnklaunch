@@ -1,3 +1,6 @@
+# An exact nightly, not the floating channel: the build rebuilds the standard
+# library from source, so a nightly that breaks that fails a run against a commit
+# nobody touched.
 [toolchain]
-channel = "nightly"
-components = ["rust-src"]
+channel = "nightly-2026-08-26"
+components = ["rust-src", "rustfmt", "clippy"]

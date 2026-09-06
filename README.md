@@ -5,6 +5,8 @@
 
 A minimal Wayland application launcher written in Rust.
 
+![bnklaunch](assets/screenshot.png)
+
 _Disclaimer: learning project, non-standard Rust, built mainly for my own use, AI-assisted._
 
 ## Requirements

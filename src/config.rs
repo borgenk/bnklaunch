@@ -7,7 +7,7 @@
 //! version still loads. A field may repeat: hidden takes one app name per line
 //! and they accumulate.
 //!
-//! A colour is #RRGGBB, or #RRGGBBAA to carry alpha. One that does not parse
+//! A color is #RRGGBB, or #RRGGBBAA to carry alpha. One that does not parse
 //! leaves its field at the default, as an unknown field does.
 
 use crate::desktop::NAME_CAP;
@@ -36,7 +36,7 @@ pub struct Config {
     pub search_url: Option<ArrayString<SEARCH_URL_CAP>>,
     /// App names to hide from results, one per hidden line, deduplicated.
     pub denied: ArrayVec<ArrayString<NAME_CAP>, MAX_DENY>,
-    /// The colours to draw with; one the file leaves out keeps its default.
+    /// The colors to draw with; one the file leaves out keeps its default.
     pub theme: Theme,
 }
 
@@ -115,7 +115,7 @@ fn parse(text: &str) -> Config {
     config
 }
 
-/// Set a theme colour, leaving it as it was when the value does not parse.
+/// Set a theme color, leaving it as it was when the value does not parse.
 fn set_color(field: &mut Color, value: &str) {
     if let Some(color) = parse_color(value) {
         *field = color;
@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_reads_every_colour_field() {
+    fn parse_reads_every_color_field() {
         let cfg = parse(
             "background #101112\n\
              text #eeeeee\n\
@@ -246,10 +246,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_reads_the_alpha_of_an_eight_digit_colour() {
+    fn parse_reads_the_alpha_of_an_eight_digit_color() {
         let cfg = parse("background #292b30e6\n");
         assert_eq!(cfg.theme.background, Color::rgba(0x29, 0x2b, 0x30, 0xE6));
-        // Six digits is the same colour at full alpha, not a different one.
+        // Six digits is the same color at full alpha, not a different one.
         assert_eq!(
             parse("background #292b30\n").theme.background,
             Color::rgba(0x29, 0x2b, 0x30, 0xFF)
@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_colour_takes_either_case_and_an_optional_hash() {
+    fn parse_color_takes_either_case_and_an_optional_hash() {
         let want = Color::rgba(0xAB, 0xCD, 0xEF, 0x12);
         assert_eq!(parse("caret #ABCDEF12\n").theme.caret, want);
         assert_eq!(parse("caret #abcdef12\n").theme.caret, want);
@@ -265,9 +265,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_keeps_the_default_for_a_colour_it_cannot_read() {
+    fn parse_keeps_the_default_for_a_color_it_cannot_read() {
         // Wrong length, a digit that is not hex, and a word: none of them refuse
-        // the file, they just leave the shipped colour standing.
+        // the file, they just leave the shipped color standing.
         for line in [
             "background #fff\n",
             "background #12345\n",
@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_leaves_unnamed_colours_at_their_defaults() {
+    fn parse_leaves_unnamed_colors_at_their_defaults() {
         let cfg = parse("background #000000ff\n");
         assert_eq!(cfg.theme.text, Theme::DEFAULT.text);
         assert_eq!(cfg.theme.highlight, Theme::DEFAULT.highlight);
@@ -294,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_last_colour_wins() {
+    fn parse_last_color_wins() {
         let cfg = parse("caret #ffffff\ncaret #000000\n");
         assert_eq!(cfg.theme.caret, Color::rgba(0, 0, 0, 0xFF));
     }

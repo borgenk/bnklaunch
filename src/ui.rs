@@ -7,15 +7,15 @@ use crate::launch::URL_CAP;
 use crate::platform::arena;
 use crate::{font, shm};
 
-/// A colour as the buffer holds it: premultiplied ARGB8888, the colour channels
+/// A color as the buffer holds it: premultiplied ARGB8888, the color channels
 /// already scaled by the alpha, so compositing is a multiply and an add.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Color(u32);
 
 impl Color {
-    /// A colour from straight channels, as the config file spells one.
+    /// A color from straight channels, as the config file spells one.
     pub(crate) const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
-        // Rounded to nearest, so an opaque colour comes out exactly as written.
+        // Rounded to nearest, so an opaque color comes out exactly as written.
         let a = a as u32;
         let r = (r as u32 * a + 127) / 255;
         let g = (g as u32 * a + 127) / 255;
@@ -29,9 +29,9 @@ impl Color {
     }
 }
 
-/// How the window looks. A dark palette by default: one flat background shade,
-/// and the selected row is the only part that lifts off it. A colour carrying
-/// alpha composites, so a translucent background shows the desktop through.
+/// How the window looks. A dark palette by default: one background shade the
+/// desktop shows a little through, and the selected row is the only part that
+/// lifts off it. A color carrying alpha composites over what is under it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Theme {
     /// The window's fill; its alpha is the window's own transparency.
@@ -50,13 +50,12 @@ pub(crate) struct Theme {
 
 impl Theme {
     pub(crate) const DEFAULT: Self = Self {
-        background: Color::rgba(0x29, 0x2b, 0x30, 0xff),
+        background: Color::rgba(0x1f, 0x21, 0x24, 0xf0),
         text: Color::rgba(0xec, 0xec, 0xec, 0xff),
         subtitle: Color::rgba(0x88, 0x88, 0x88, 0xff),
-        // White at 4% over the background, as one opaque shade.
-        highlight: Color::rgba(50, 51, 56, 0xff),
-        caret: Color::rgba(0xff, 0x00, 0xaa, 0xff),
-        selection: Color::rgba(0x60, 0x28, 0x52, 0xff),
+        highlight: Color::rgba(0xff, 0xff, 0xff, 0x0d),
+        caret: Color::rgba(0x6f, 0xd3, 0xef, 0xff),
+        selection: Color::rgba(0x2f, 0x7b, 0xa6, 0xff),
     };
 }
 
@@ -83,7 +82,7 @@ pub(crate) const TEXT_X: u32 = 15;
 /// Right edge of every text run, as a width from TEXT_X. The trailing gutter is
 /// the wider of the two, so a name that fills the row stops well short of the
 /// window edge.
-const TEXT_W: u32 = WINDOW_WIDTH - TEXT_X - 115;
+pub(crate) const TEXT_W: u32 = WINDOW_WIDTH - TEXT_X - 115;
 
 /// Y position where results start, flush under the input field
 const RESULTS_START_Y: u32 = INPUT_BOX_H;
@@ -213,6 +212,13 @@ pub(crate) fn draw_ui(
     }
 }
 
+/// The color of the selected row: the wash over the background, worked out once.
+/// Every pixel under the row is the background the frame started with, so
+/// blending across the row lands on this same color.
+fn wash(theme: &Theme) -> u32 {
+    shm::blend(theme.background.argb(), theme.highlight.argb(), u8::MAX)
+}
+
 /// Draw the result rows. They butt up against each other with no gaps; only the
 /// selected row gets a wash so it stands out from the body.
 fn draw_results(
@@ -226,7 +232,7 @@ fn draw_results(
         let y = RESULTS_START_Y + (i as u32 * RESULT_HEIGHT);
 
         if i == state.selected {
-            pixels.fill_rect(0, y, WINDOW_WIDTH, RESULT_HEIGHT, theme.highlight.argb());
+            pixels.stamp_rect(0, y, WINDOW_WIDTH, RESULT_HEIGHT, wash(theme));
         }
 
         // The subtitle previews the resolved command with field codes dropped.
@@ -282,7 +288,7 @@ fn draw_preview_row(
     theme: &Theme,
 ) {
     let y = RESULTS_START_Y;
-    pixels.fill_rect(0, y, WINDOW_WIDTH, RESULT_HEIGHT, theme.highlight.argb());
+    pixels.stamp_rect(0, y, WINDOW_WIDTH, RESULT_HEIGHT, wash(theme));
     draw_row(pixels, y, title, subtitle, font, theme);
 }
 
@@ -299,9 +305,9 @@ mod tests {
     const CLEAR_X: u32 = WINDOW_WIDTH - 1;
 
     #[test]
-    fn an_opaque_colour_survives_premultiplication_unchanged() {
+    fn an_opaque_color_survives_premultiplication_unchanged() {
         // Truncating instead of rounding would dim every channel by a step here,
-        // which is a colour the user did not ask for.
+        // which is a color the user did not ask for.
         assert_eq!(Color::rgba(0xFF, 0xFF, 0xFF, 0xFF).argb(), 0xFFFF_FFFF);
         assert_eq!(Color::rgba(0x29, 0x2b, 0x30, 0xFF).argb(), 0xFF29_2B30);
         assert_eq!(Color::rgba(0x01, 0x7F, 0xFE, 0xFF).argb(), 0xFF01_7FFE);
@@ -311,32 +317,32 @@ mod tests {
     fn alpha_scales_every_channel() {
         assert_eq!(Color::rgba(0xFF, 0xFF, 0xFF, 0x80).argb(), 0x8080_8080);
         assert_eq!(Color::rgba(0xFF, 0x00, 0x00, 0x40).argb(), 0x4040_0000);
-        // No alpha is no colour at all, whatever channels were written with it.
+        // No alpha is no color at all, whatever channels were written with it.
         assert_eq!(Color::rgba(0xFF, 0xFF, 0xFF, 0x00).argb(), 0x0000_0000);
     }
 
     #[test]
-    fn every_default_colour_is_opaque() {
-        // The shipped look predates transparency and has to stay exactly as it
-        // was: a config that sets no colours changes no pixels.
+    fn the_shipped_look_is_the_one_written_down() {
+        // A config that sets no colors draws these.
         let t = Theme::DEFAULT;
-        for color in [
-            t.background,
-            t.text,
-            t.subtitle,
-            t.highlight,
-            t.caret,
-            t.selection,
-        ] {
+        assert_eq!(t.background.argb(), 0xF01D_1F22);
+        assert_eq!(t.text.argb(), 0xFFEC_ECEC);
+        assert_eq!(t.subtitle.argb(), 0xFF88_8888);
+        assert_eq!(t.highlight.argb(), 0x0D0D_0D0D);
+        assert_eq!(t.caret.argb(), 0xFF6F_D3EF);
+        assert_eq!(t.selection.argb(), 0xFF2F_7BA6);
+
+        // Two carry alpha, the rest do not.
+        assert!(t.background.argb() >> 24 > 0xE0);
+        assert!(t.highlight.argb() >> 24 < 0x20);
+        for solid in [t.text, t.subtitle, t.caret, t.selection] {
             assert_eq!(
-                color.argb() >> 24,
+                solid.argb() >> 24,
                 0xFF,
                 "{:08x} is not opaque",
-                color.argb()
+                solid.argb()
             );
         }
-        assert_eq!(t.background.argb(), 0xFF29_2B30);
-        assert_eq!(t.highlight.argb(), 0xFF32_3338);
     }
 
     #[test]
@@ -473,7 +479,7 @@ mod tests {
         );
 
         // Every pixel is still premultiplied. A channel above its own alpha is
-        // a colour the compositor cannot read.
+        // a color the compositor cannot read.
         for (i, &p) in frame.iter().enumerate() {
             for shift in [16, 8, 0] {
                 assert!(
@@ -485,11 +491,16 @@ mod tests {
     }
 
     #[test]
-    fn the_default_theme_leaves_no_transparent_pixel() {
+    fn the_default_theme_is_as_see_through_as_it_asked_to_be() {
         let frame = frame_with(&Theme::DEFAULT);
+        let background = alpha_of(Theme::DEFAULT.background.argb());
         assert!(
-            frame.iter().all(|&p| alpha_of(p) == 0xFF),
-            "the shipped look is opaque edge to edge"
+            frame.iter().all(|&p| alpha_of(p) >= background),
+            "nothing is more transparent than the window asked to be"
+        );
+        assert!(
+            frame.iter().any(|&p| alpha_of(p) == 0xFF),
+            "text stays opaque over it"
         );
     }
 

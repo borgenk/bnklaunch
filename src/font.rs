@@ -364,7 +364,7 @@ fn blit_coverage(
         return;
     }
 
-    // Most of a glyph is fully covered; an opaque colour needs no blend there.
+    // Most of a glyph is fully covered; an opaque color needs no blend there.
     let opaque = color >> 24 == 0xFF;
 
     // Clip once for the whole glyph rather than testing every pixel against
@@ -603,10 +603,10 @@ mod tests {
     }
 
     /// Text is drawn with the same premultiplied compositing as everything else,
-    /// so a colour carrying alpha lands over what is under it rather than
-    /// replacing it, and a colour with no alpha at all covers nothing.
+    /// so a color carrying alpha lands over what is under it rather than
+    /// replacing it, and a color with no alpha at all covers nothing.
     #[test]
-    fn render_text_composites_a_translucent_colour() {
+    fn render_text_composites_a_translucent_color() {
         let font = load_fixture_font();
         let (w, h) = (200u32, 40u32);
         let black = 0xFF00_0000;
@@ -617,18 +617,18 @@ mod tests {
             pixels.iter().any(|&p| p != black),
             "half-alpha white should still mark the buffer"
         );
-        // Half alpha over black tops out at half grey. A pixel brighter than
-        // that would mean the colour had been stamped rather than composited.
+        // Half alpha over black tops out at half gray. A pixel brighter than
+        // that would mean the color had been stamped rather than composited.
         assert!(
             pixels.iter().all(|&p| p >> 16 & 0xFF <= 0x80),
-            "no channel should exceed the colour's own alpha"
+            "no channel should exceed the color's own alpha"
         );
 
         let mut pixels = vec![black; (w * h) as usize];
         font.render_text(&mut pixels, w, h, 2, 2, "Hi", 0x0000_0000, w, NAME_SIZE);
         assert!(
             pixels.iter().all(|&p| p == black),
-            "a colour with no alpha should leave the buffer alone"
+            "a color with no alpha should leave the buffer alone"
         );
     }
 

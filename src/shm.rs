@@ -94,7 +94,7 @@ impl PixelBuffer {
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr() as *mut u32, len) }
     }
 
-    /// Stamp one colour over the whole buffer, replacing the frame it held.
+    /// Stamp one color over the whole buffer, replacing the frame it held.
     pub fn fill(&mut self, color: u32) {
         self.pixels_u32().fill(color);
     }
@@ -119,7 +119,7 @@ impl PixelBuffer {
             .map(move |row| &mut row[x..x_end])
     }
 
-    /// Draw a filled rectangle. An opaque colour replaces what is there; one
+    /// Draw a filled rectangle. An opaque color replaces what is there; one
     /// carrying alpha composites over it.
     pub fn fill_rect(&mut self, x: u32, y: u32, w: u32, h: u32, color: u32) {
         let alpha = color >> 24;
@@ -134,6 +134,15 @@ impl PixelBuffer {
                     *pixel = blend(*pixel, color, u8::MAX);
                 }
             }
+        }
+    }
+
+    /// Stamp one color over a rectangle, replacing what it held. For a color
+    /// already composited against what is under it, which is cheaper to work out
+    /// once than to blend pixel by pixel.
+    pub fn stamp_rect(&mut self, x: u32, y: u32, w: u32, h: u32, color: u32) {
+        for row in self.rows(x, y, w, h) {
+            row.fill(color);
         }
     }
 
@@ -233,7 +242,7 @@ mod tests {
 
     #[test]
     fn blend_leaves_an_opaque_source_alone() {
-        // Full coverage of an opaque colour is the colour, whatever is under it.
+        // Full coverage of an opaque color is the color, whatever is under it.
         assert_eq!(blend(BLACK, WHITE, 255), WHITE);
         assert_eq!(blend(WHITE, BLACK, 255), BLACK);
     }
@@ -248,11 +257,11 @@ mod tests {
 
     #[test]
     fn blend_composites_a_translucent_source() {
-        // Half white over black is half grey, and the result is still opaque:
+        // Half white over black is half gray, and the result is still opaque:
         // the destination's own alpha survives what is laid over it.
         assert_eq!(blend(BLACK, HALF_WHITE, 255), 0xFF80_8080);
 
-        // The same colour over nothing keeps its own alpha and no more, which is
+        // The same color over nothing keeps its own alpha and no more, which is
         // what makes a translucent window's rows as see-through as its body.
         assert_eq!(blend(0x0000_0000, HALF_WHITE, 255), HALF_WHITE);
     }
@@ -260,7 +269,7 @@ mod tests {
     #[test]
     fn blend_never_leaves_a_channel_above_the_alpha() {
         // Premultiplied is an invariant, not a convention: a channel brighter
-        // than its own alpha is a colour the compositor cannot read. Walk a
+        // than its own alpha is a color the compositor cannot read. Walk a
         // spread of sources, destinations and coverages and hold the line.
         for &dst in &[0x0000_0000, 0x8040_2010, BLACK, WHITE, HALF_WHITE] {
             for &src in &[0x0000_0000, 0x4020_1008, BLACK, WHITE, HALF_WHITE] {
@@ -291,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_rect_stamps_an_opaque_colour_and_composites_a_translucent_one() {
+    fn fill_rect_stamps_an_opaque_color_and_composites_a_translucent_one() {
         let mut buf = PixelBuffer::new(4, 2).expect("buffer");
         buf.fill(BLACK);
 

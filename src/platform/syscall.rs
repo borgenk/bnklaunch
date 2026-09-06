@@ -234,7 +234,7 @@ pub const IORING_OP_CLOSE: u8 = 19;
 pub const IORING_OP_READ: u8 = 22;
 
 /// poll_add len bit requesting a multishot poll: the ring keeps reporting
-/// readiness until the poll is cancelled, instead of firing once.
+/// readiness until the poll is canceled, instead of firing once.
 pub const IORING_POLL_ADD_MULTI: u32 = 1;
 
 /// timeout flag requesting a recurring timer that re-arms after each fire.
@@ -1046,7 +1046,7 @@ pub unsafe fn cmsg_firsthdr(msg: *const msghdr) -> *mut cmsghdr {
 /// Equivalent to CMSG_NXTHDR macro.
 ///
 /// The bounds test is done on integers, not pointers. Forming the one-past
-/// address of a candidate header and comparing it is undefined behaviour when
+/// address of a candidate header and comparing it is undefined behavior when
 /// that address lands outside the control buffer, which is exactly the case this
 /// has to detect.
 #[inline]

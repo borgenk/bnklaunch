@@ -8,11 +8,11 @@ mod clipboard;
 mod config;
 mod denylist;
 mod desktop;
+#[cfg(test)]
+mod dev;
 mod editor;
 mod font;
 mod launch;
-#[cfg(test)]
-mod perf;
 mod platform;
 mod present;
 mod shm;
