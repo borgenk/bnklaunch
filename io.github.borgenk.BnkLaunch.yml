@@ -47,6 +47,15 @@ modules:
     buildsystem: simple
     build-commands:
       - cargo --offline --locked build --release --target x86_64-unknown-linux-gnu
+      # Three system libraries and no crates. A fourth name means something
+      # started linking what the runtime may not carry.
+      - |
+        needed=$(objdump -p target/x86_64-unknown-linux-gnu/release/bnklaunch |
+          awk '$1 == "NEEDED" { print $2 }' | sort | paste -sd' ')
+        if [ "$needed" != "libc.so.6 libfreetype.so.6 libxkbcommon.so.0" ]; then
+          echo "the binary links $needed" >&2
+          exit 1
+        fi
       - install -Dm755 target/x86_64-unknown-linux-gnu/release/bnklaunch /app/bin/bnklaunch
       - install -Dm644 assets/io.github.borgenk.BnkLaunch.desktop
         /app/share/applications/io.github.borgenk.BnkLaunch.desktop

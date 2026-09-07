@@ -80,19 +80,6 @@ jobs:
           # so a key without it restores another commit's build.
           cache-key: flatpak-builder-${{ github.sha }}
 
-      # Three system libraries and no crates. A fourth name means something
-      # started linking what the runtime may not carry.
-      - name: Verify what the binary links
-        run: |
-          # objdump comes from the SDK inside the build sandbox, not the image.
-          needed=$(flatpak-builder --run build-dir io.github.borgenk.BnkLaunch.yml \
-            objdump -p /app/bin/bnklaunch | awk '$1 == "NEEDED" { print $2 }' | sort)
-          expected=$(printf 'libc.so.6\nlibfreetype.so.6\nlibxkbcommon.so.0\n')
-          if [ "$needed" != "$expected" ]; then
-            echo "::error::the Flatpak binary links $(echo "$needed" | tr '\n' ' ')"
-            exit 1
-          fi
-
       # The errors this project accepts are in flatpak-lint-exceptions.json,
       # keyed by app id the way the linter reads them. Every other error fails.
       - name: Lint against Flathub's rules

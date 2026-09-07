@@ -85,17 +85,6 @@ jobs:
           # below, under a name the publish job can ask for.
           upload-artifact: false
 
-      # The same check CI runs: three system libraries, no crates.
-      - name: Verify what the binary links
-        run: |
-          needed=$(flatpak-builder --run build-dir io.github.borgenk.BnkLaunch.yml \
-            objdump -p /app/bin/bnklaunch | awk '$1 == "NEEDED" { print $2 }' | sort)
-          expected=$(printf 'libc.so.6\nlibfreetype.so.6\nlibxkbcommon.so.0\n')
-          if [ "$needed" != "$expected" ]; then
-            echo "::error::the Flatpak binary links $(echo "$needed" | tr '\n' ' ')"
-            exit 1
-          fi
-
       - name: Hand the bundle to the publish job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
