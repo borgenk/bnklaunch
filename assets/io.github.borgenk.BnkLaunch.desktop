@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=BNK Launch
+Comment=Application launcher for Wayland
+Exec=bnklaunch
+Icon=io.github.borgenk.BnkLaunch
+Terminal=false
+# The launcher is bound to a compositor hotkey, and a visible entry would list
+# itself among its own results.
+NoDisplay=true
+StartupNotify=false
+Categories=Utility;
+Keywords=launcher;search;run;

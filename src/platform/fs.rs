@@ -142,6 +142,11 @@ fn stat_path(path: &str, flags: i32) -> Option<stat> {
     syscall::newfstatat(AT_FDCWD, &cp, flags)
 }
 
+/// Whether a path exists, whatever its type (following symlinks).
+pub fn exists(path: &str) -> bool {
+    stat_path(path, 0).is_some()
+}
+
 /// Whether a path resolves to a directory (following symlinks).
 pub fn is_dir(path: &str) -> bool {
     stat_path(path, 0).is_some_and(|st| st.st_mode & S_IFMT == S_IFDIR)

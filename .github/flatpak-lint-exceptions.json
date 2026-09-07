@@ -1,0 +1,14 @@
+{
+  "io.github.borgenk.BnkLaunch": [
+    "appstream-external-screenshot-url",
+    "appstream-screenshots-not-mirrored-in-ostree",
+    "desktop-file-is-nodisplay",
+    "finish-args-flatpak-spawn-access",
+    "finish-args-flatpak-system-folder-exports-share-ro-access",
+    "finish-args-host-os-ro-filesystem-access",
+    "finish-args-only-wayland",
+    "finish-args-unnecessary-xdg-config-bnklaunch-ro-access",
+    "finish-args-unnecessary-xdg-data-applications-ro-access",
+    "finish-args-unnecessary-xdg-data-flatpak-ro-access"
+  ]
+}

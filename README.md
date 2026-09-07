@@ -24,3 +24,15 @@ curl -fsSL https://raw.githubusercontent.com/borgenk/bnklaunch/main/install.sh |
 
 This drops the binary in `~/.local/bin`. bnklaunch has no desktop entry: bind it to a
 compositor hotkey instead.
+
+### Flatpak
+
+Download the bundle from the
+[releases page](https://github.com/borgenk/bnklaunch/releases/latest):
+
+```sh
+flatpak install --user ./bnklaunch-*.flatpak
+```
+
+The global keybind runs `flatpak run io.github.borgenk.BnkLaunch` rather than
+the binary.

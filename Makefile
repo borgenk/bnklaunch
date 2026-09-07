@@ -1,13 +1,24 @@
 .PHONY: fmt fmt-check clippy build build-release build-small build-linux install \
 	run test perf perf-update scan-bench screenshot frame-update test-install \
-	test-abi check bump clean
+	test-abi flatpak flatpak-lint check bump clean
 
 APP_NAME := bnklaunch
+APP_ID := io.github.borgenk.BnkLaunch
 TARGET := x86_64-unknown-linux-gnu
 VERSION := $(shell grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 RELEASE_BIN := target/$(TARGET)/release/$(APP_NAME)
 BIN_DIR := ~/.local/bin
 TARBALL := $(APP_NAME)-v$(VERSION)-$(TARGET).tar.gz
+# flatpak-builder and its linter usually ship as the org.flatpak.Builder
+# Flatpak. A copy on PATH wins.
+FLATPAK_BUILDER := $(shell command -v flatpak-builder 2>/dev/null || echo "flatpak run org.flatpak.Builder")
+FLATPAK_BUILDER_LINT := $(shell command -v flatpak-builder-lint 2>/dev/null \
+	|| echo "flatpak run --command=flatpak-builder-lint org.flatpak.Builder")
+LINT_EXCEPTIONS := --exceptions --user-exceptions .github/flatpak-lint-exceptions.json
+# Where a bundle sends an installer that does not have the runtime. The release
+# workflow's action embeds the same URL by default.
+RUNTIME_REPO := https://flathub.org/repo/flathub.flatpakrepo
+
 # The oldest glibc a downloaded tarball runs on, which is Debian 12's. The
 # release builds in that image and checks the binary against this.
 GLIBC_FLOOR := 2.36
@@ -71,14 +82,30 @@ build-linux: build-release
 	@echo "Built dist/$(TARBALL), with a .sha256"
 	@echo "Publish with: gh release create v$(VERSION) dist/$(TARBALL)*"
 
+# The bundle the release workflow publishes, into dist/.
+flatpak:
+	mkdir -p dist
+	$(FLATPAK_BUILDER) --force-clean --repo=flatpak-repo build-dir $(APP_ID).yml
+	flatpak build-bundle --runtime-repo=$(RUNTIME_REPO) flatpak-repo \
+		dist/$(APP_NAME)-v$(VERSION)-x86_64.flatpak $(APP_ID)
+	@echo "Built dist/$(APP_NAME)-v$(VERSION)-x86_64.flatpak"
+	@echo "Install with: flatpak install --user dist/$(APP_NAME)-v$(VERSION)-x86_64.flatpak"
+
+# What CI checks the manifest and the repo against. The accepted errors are in
+# .github/flatpak-lint-exceptions.json.
+flatpak-lint: flatpak
+	$(FLATPAK_BUILDER_LINT) $(LINT_EXCEPTIONS) manifest $(APP_ID).yml
+	$(FLATPAK_BUILDER_LINT) $(LINT_EXCEPTIONS) repo flatpak-repo
+
 # Bump version, commit, and tag: make bump V=0.2.0
 # Pushing the tag triggers the release workflow, which rejects any tag whose
 # name does not match this version, so the two stay in lockstep.
 bump:
 	@test -n "$(V)" || (echo "Current: $(VERSION). Usage: make bump V=0.2.0" && exit 1)
 	sed -i '0,/^version = ".*"/{s//version = "$(V)"/}' Cargo.toml
+	sed -i 's|<releases>|<releases>\n    <release version="$(V)" date="'"$$(date -u +%F)"'"/>|' assets/$(APP_ID).metainfo.xml
 	cargo update --workspace
-	git add Cargo.toml Cargo.lock
+	git add Cargo.toml Cargo.lock assets/$(APP_ID).metainfo.xml
 	git commit -m "Bump version to $(V)"
 	git tag "v$(V)"
 	@echo "Bumped to v$(V). Push with: git push origin main --tags"

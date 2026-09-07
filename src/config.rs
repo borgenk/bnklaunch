@@ -41,12 +41,28 @@ pub struct Config {
 }
 
 fn config_path() -> Option<ArrayString<{ fs::PATH_CAP }>> {
+    config_path_in(
+        env::in_flatpak(),
+        env::var("XDG_CONFIG_HOME"),
+        env::var("HOME"),
+    )
+}
+
+/// The path, with the environment passed in. Inside a Flatpak sandbox
+/// XDG_CONFIG_HOME is the app's private directory, so the config is read from
+/// HOME instead and one file serves both installs.
+fn config_path_in(
+    in_flatpak: bool,
+    config_home: Option<&str>,
+    home: Option<&str>,
+) -> Option<ArrayString<{ fs::PATH_CAP }>> {
     let mut p: ArrayString<{ fs::PATH_CAP }> = ArrayString::new();
-    if let Some(dir) = env::var("XDG_CONFIG_HOME") {
-        p.push_str(dir).ok()?;
-    } else {
-        p.push_str(env::var("HOME")?).ok()?;
-        p.push_str("/.config").ok()?;
+    match config_home.filter(|_| !in_flatpak) {
+        Some(dir) => p.push_str(dir).ok()?,
+        None => {
+            p.push_str(home?).ok()?;
+            p.push_str("/.config").ok()?;
+        }
     }
     p.push_str("/bnklaunch/").ok()?;
     p.push_str(FILENAME).ok()?;
@@ -304,6 +320,44 @@ mod tests {
         assert_eq!(
             load_from("/nonexistent/path/should/not/exist/config"),
             Config::default()
+        );
+    }
+
+    fn path(in_flatpak: bool, config_home: Option<&str>, home: Option<&str>) -> Option<String> {
+        config_path_in(in_flatpak, config_home, home).map(|p| p.as_str().to_string())
+    }
+
+    #[test]
+    fn config_path_takes_xdg_config_home() {
+        assert_eq!(
+            path(false, Some("/cfg"), Some("/home/u")).as_deref(),
+            Some("/cfg/bnklaunch/config")
+        );
+    }
+
+    #[test]
+    fn config_path_falls_back_to_home() {
+        assert_eq!(
+            path(false, None, Some("/home/u")).as_deref(),
+            Some("/home/u/.config/bnklaunch/config")
+        );
+    }
+
+    #[test]
+    fn config_path_without_home_or_xdg_is_none() {
+        assert_eq!(path(false, None, None), None);
+    }
+
+    #[test]
+    fn flatpak_config_path_is_the_hosts() {
+        assert_eq!(
+            path(
+                true,
+                Some("/home/u/.var/app/io.github.borgenk.BnkLaunch/config"),
+                Some("/home/u"),
+            )
+            .as_deref(),
+            Some("/home/u/.config/bnklaunch/config")
         );
     }
 }

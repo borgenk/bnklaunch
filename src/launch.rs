@@ -5,6 +5,7 @@ use core::fmt::Write;
 
 use crate::desktop::{exec_argv, DesktopEntry, ARG_CAP, MAX_ARGS};
 use crate::platform::arena::{ArrayString, ArrayVec};
+use crate::platform::env;
 use crate::platform::error::{Error, Result};
 use crate::platform::syscall;
 
@@ -12,6 +13,9 @@ extern "C" {
     /// PATH-searching exec; replaces the process image or returns -1 on failure.
     fn execvp(file: *const c_char, argv: *const *const c_char) -> i32;
 }
+
+/// The tokenized command line, plus the two flatpak-spawn takes in front of it.
+const LAUNCH_ARGS: usize = MAX_ARGS + 1;
 
 /// Byte capacity of a URL the launcher builds or opens. Larger than the search
 /// URL template it is built from (config::SEARCH_URL_CAP), since the
@@ -30,15 +34,36 @@ pub fn launch(entry: &DesktopEntry) -> Result<()> {
     // fit: exec'ing a mangled argv is worse than not launching.
     exec_argv(&entry.exec, &mut argv)
         .map_err(|_| Error::msg("exec command has too many arguments"))?;
+
+    let mut args: ArrayVec<&str, LAUNCH_ARGS> = ArrayVec::new();
+    let program = exec_target(&argv, env::in_flatpak(), &mut args)?;
+    spawn::<{ ARG_CAP + 1 }>(program, &args)
+}
+
+/// The program to exec, with its arguments filled into args. Inside a Flatpak
+/// sandbox PATH holds only the runtime's binaries, so flatpak-spawn hands the
+/// command line to the host, which runs it under the session's environment.
+fn exec_target<'a>(
+    argv: &'a [ArrayString<ARG_CAP>],
+    in_flatpak: bool,
+    args: &mut ArrayVec<&'a str, LAUNCH_ARGS>,
+) -> Result<&'a str> {
     let (program, rest) = argv
         .split_first()
         .ok_or_else(|| Error::msg("empty exec command"))?;
-
-    let mut arg_refs: ArrayVec<&str, MAX_ARGS> = ArrayVec::new();
-    for a in rest {
-        let _ = arg_refs.push(a.as_str());
+    // argv holds at most MAX_ARGS tokens, so the two added here still fit.
+    if in_flatpak {
+        let _ = args.push("--host");
+        let _ = args.push(program.as_str());
     }
-    spawn::<{ ARG_CAP + 1 }>(program.as_str(), &arg_refs)
+    for a in rest {
+        let _ = args.push(a.as_str());
+    }
+    Ok(if in_flatpak {
+        "flatpak-spawn"
+    } else {
+        program.as_str()
+    })
 }
 
 /// Open a URL in the user's default browser via xdg-open.
@@ -46,6 +71,9 @@ pub fn launch_url(url: &str) -> Result<()> {
     // xdg-open is a shell wrapper, so only hand it a vetted URL: reject a
     // leading dash (which it could read as an option) and anything without a
     // scheme we are willing to open.
+    //
+    // Not sent to the host: the runtime's xdg-open asks the portal, which needs
+    // no permission and reaches the same browser.
     if url.starts_with('-') || !has_allowed_scheme(url) {
         return Err(Error::msg("refusing to open URL with no allowed scheme"));
     }
@@ -63,7 +91,7 @@ fn spawn<const CAP: usize>(program: &str, args: &[&str]) -> Result<()> {
     // pointer array. Both live on the stack, alive across the exec below. CAP is
     // the per-argument byte budget including the terminator, set by the caller
     // to fit an exec token or a longer URL.
-    let mut cstrings: ArrayVec<ArrayString<CAP>, { MAX_ARGS + 1 }> = ArrayVec::new();
+    let mut cstrings: ArrayVec<ArrayString<CAP>, { LAUNCH_ARGS + 1 }> = ArrayVec::new();
     let mut push_cstr = |s: &str| -> Result<()> {
         let mut c: ArrayString<CAP> = ArrayString::new();
         c.push_str(s)
@@ -78,7 +106,7 @@ fn spawn<const CAP: usize>(program: &str, args: &[&str]) -> Result<()> {
         push_cstr(a)?;
     }
 
-    let mut ptrs: ArrayVec<*const c_char, { MAX_ARGS + 2 }> = ArrayVec::new();
+    let mut ptrs: ArrayVec<*const c_char, { LAUNCH_ARGS + 2 }> = ArrayVec::new();
     for c in cstrings.iter() {
         let _ = ptrs.push(c.as_bytes().as_ptr() as *const c_char);
     }
@@ -251,5 +279,60 @@ mod tests {
         assert!(!has_allowed_scheme("ftp://example.com"));
         assert!(!has_allowed_scheme("example.com"));
         assert!(!has_allowed_scheme("-x"));
+    }
+
+    /// The program and arguments a launch execs for a given Exec value.
+    fn target(exec: &str, in_flatpak: bool) -> (String, Vec<String>) {
+        let mut argv: ArrayVec<ArrayString<ARG_CAP>, MAX_ARGS> = ArrayVec::new();
+        exec_argv(exec, &mut argv).expect("tokenize");
+        let mut args: ArrayVec<&str, LAUNCH_ARGS> = ArrayVec::new();
+        let program = exec_target(&argv, in_flatpak, &mut args).expect("target");
+        (
+            program.to_string(),
+            args.iter().map(|a| a.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn exec_target_runs_the_command_itself() {
+        let (program, args) = target("firefox --new-window", false);
+        assert_eq!(program, "firefox");
+        assert_eq!(args, ["--new-window"]);
+    }
+
+    #[test]
+    fn exec_target_goes_through_the_host_when_sandboxed() {
+        let (program, args) = target("firefox --new-window", true);
+        assert_eq!(program, "flatpak-spawn");
+        assert_eq!(args, ["--host", "firefox", "--new-window"]);
+    }
+
+    #[test]
+    fn exec_target_sandboxed_keeps_a_bare_command_whole() {
+        let (program, args) = target("gimp", true);
+        assert_eq!(program, "flatpak-spawn");
+        assert_eq!(args, ["--host", "gimp"]);
+    }
+
+    #[test]
+    fn exec_target_holds_a_full_length_command_line_when_sandboxed() {
+        // The most a tokenized Exec yields, plus the two flatpak-spawn takes.
+        let exec = (0..MAX_ARGS)
+            .map(|i| format!("a{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (program, args) = target(&exec, true);
+        assert_eq!(program, "flatpak-spawn");
+        assert_eq!(args.len(), MAX_ARGS + 1);
+        assert_eq!(args[0], "--host");
+        assert_eq!(args[1], "a0");
+        assert_eq!(args[MAX_ARGS], format!("a{}", MAX_ARGS - 1));
+    }
+
+    #[test]
+    fn exec_target_refuses_an_empty_command_line() {
+        let argv: ArrayVec<ArrayString<ARG_CAP>, MAX_ARGS> = ArrayVec::new();
+        let mut args: ArrayVec<&str, LAUNCH_ARGS> = ArrayVec::new();
+        assert!(exec_target(&argv, false, &mut args).is_err());
     }
 }

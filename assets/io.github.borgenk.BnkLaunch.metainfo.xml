@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.borgenk.BnkLaunch</id>
+  <name>BNK Launch</name>
+  <summary>Application launcher for Wayland</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.borgenk">
+    <name>BNK Launch contributors</name>
+  </developer>
+
+  <description>
+    <p>
+      BNK Launch is a launcher for Wayland compositors that support the layer
+      shell. It is bound to a hotkey: type to search the installed
+      applications, and press Enter to start the one at the top.
+    </p>
+    <p>
+      Results are ranked by relevance and by what was launched recently. The
+      input field carries a caret, selection, and the system clipboard. Text is
+      drawn with the session's own fonts, and the window follows the colours
+      set in the configuration file.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.borgenk.BnkLaunch.desktop</launchable>
+  <provides>
+    <binary>bnklaunch</binary>
+  </provides>
+  <url type="homepage">https://github.com/borgenk/bnklaunch</url>
+  <url type="bugtracker">https://github.com/borgenk/bnklaunch/issues</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/borgenk/bnklaunch/main/assets/screenshot.png</image>
+      <caption>The launcher over a desktop, with search results</caption>
+    </screenshot>
+  </screenshots>
+
+  <releases>
+    <release version="0.3.2" date="2026-09-07"/>
+    <release version="0.3.1" date="2026-07-28"/>
+    <release version="0.3.0" date="2026-07-28"/>
+    <release version="0.2.0" date="2026-06-12"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>

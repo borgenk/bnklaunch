@@ -52,3 +52,52 @@ jobs:
 
       - name: Test
         run: make test
+
+  # The only job that builds the manifest, and the only one that compiles on the
+  # SDK's nightly rather than the pinned one. Privileged because bwrap needs
+  # user namespaces the runner does not otherwise grant.
+  flatpak:
+    name: Flatpak
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions@sha256:9c6819dd59d5170dc5bdd9ceeb61dcb69e9429ae9f9c70b5554b34e905aaa54c # freedesktop-25.08
+      options: --privileged
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build
+        uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
+        with:
+          manifest-path: io.github.borgenk.BnkLaunch.yml
+          bundle: bnklaunch.flatpak
+          # The manifest skips these two names, so the build cannot fold its own
+          # output back into the app. The action's defaults are not.
+          build-dir: build-dir
+          repo-dir: flatpak-repo
+          # The action's only restore-key is the prefix flatpak-builder-<arch>,
+          # so a key without it restores another commit's build.
+          cache-key: flatpak-builder-${{ github.sha }}
+
+      # Three system libraries and no crates. A fourth name means something
+      # started linking what the runtime may not carry.
+      - name: Verify what the binary links
+        run: |
+          # objdump comes from the SDK inside the build sandbox, not the image.
+          needed=$(flatpak-builder --run build-dir io.github.borgenk.BnkLaunch.yml \
+            objdump -p /app/bin/bnklaunch | awk '$1 == "NEEDED" { print $2 }' | sort)
+          expected=$(printf 'libc.so.6\nlibfreetype.so.6\nlibxkbcommon.so.0\n')
+          if [ "$needed" != "$expected" ]; then
+            echo "::error::the Flatpak binary links $(echo "$needed" | tr '\n' ' ')"
+            exit 1
+          fi
+
+      # The errors this project accepts are in flatpak-lint-exceptions.json,
+      # keyed by app id the way the linter reads them. Every other error fails.
+      - name: Lint against Flathub's rules
+        run: |
+          lint() { flatpak-builder-lint --exceptions \
+            --user-exceptions .github/flatpak-lint-exceptions.json "$@"; }
+          lint manifest io.github.borgenk.BnkLaunch.yml
+          lint repo flatpak-repo

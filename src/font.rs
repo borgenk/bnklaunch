@@ -163,9 +163,16 @@ const PREFERRED_FONTS: [&str; 12] = [
     "SourceSansPro-Regular.ttf",
 ];
 
-/// Directories to search, highest priority first. The user's own is appended at
-/// load time, since it depends on HOME.
+/// The fixed roots. Those that depend on the environment are added by font_roots.
 const FONT_DIRS: [&str; 2] = ["/usr/share/fonts", "/usr/local/share/fonts"];
+
+/// The host's font trees, bound into every Flatpak sandbox whatever its
+/// permissions. The second is the user's own, so HOME is not walked beside it.
+const HOST_FONT_DIRS: [&str; 2] = ["/run/host/fonts", "/run/host/user-fonts"];
+
+/// The two system directories, plus either the user's own tree or the host's
+/// two. The cases never both apply.
+const MAX_FONT_ROOTS: usize = 4;
 
 /// Paths kept per preferred name. The same name turns up under more than one
 /// root, and distributions ship one font under two paths, so a name keeps a few
@@ -177,6 +184,34 @@ const PATHS_PER_NAME: usize = 3;
 /// has its own slots, so no amount of one font crowds out another, and within a
 /// slot the paths sit in the order the directories were walked.
 type FontHits = [ArrayVec<ScanPath, PATHS_PER_NAME>; PREFERRED_FONTS.len()];
+
+/// The trees to walk, highest priority first. Inside a Flatpak sandbox
+/// /usr/share/fonts holds the runtime's own few fonts, so the host's go first
+/// and the launcher renders in the session's face.
+fn font_roots(in_flatpak: bool, home: Option<&str>) -> ArrayVec<ScanPath, MAX_FONT_ROOTS> {
+    let mut roots: ArrayVec<ScanPath, MAX_FONT_ROOTS> = ArrayVec::new();
+    let mut push = |dir: &str| {
+        let mut path = ScanPath::new();
+        if path.push_str(dir).is_ok() {
+            let _ = roots.push(path);
+        }
+    };
+    if in_flatpak {
+        for dir in HOST_FONT_DIRS {
+            push(dir);
+        }
+    }
+    for dir in FONT_DIRS {
+        push(dir);
+    }
+    // Inside a sandbox the user's tree is /run/host/user-fonts, walked above.
+    if !in_flatpak {
+        if let Some(user_fonts) = home.and_then(|h| fs::join(h, ".local/share/fonts")) {
+            let _ = roots.push(user_fonts);
+        }
+    }
+    roots
+}
 
 impl Font {
     /// Load the best available system font.
@@ -191,14 +226,9 @@ impl Font {
         // every UI size has been set on it, which happens below; a corrupt or
         // bitmap-only DejaVuSans.ttf must leave the fallbacks still collected.
         let mut hits: FontHits = core::array::from_fn(|_| ArrayVec::new());
-        for dir in FONT_DIRS {
+        for dir in font_roots(env::in_flatpak(), env::var("HOME")).iter() {
             if fs::is_dir(dir) {
                 collect_fonts(dir, &mut hits);
-            }
-        }
-        if let Some(user_fonts) = env::var("HOME").and_then(|h| fs::join(h, ".local/share/fonts")) {
-            if fs::is_dir(&user_fonts) {
-                collect_fonts(&user_fonts, &mut hits);
             }
         }
 
@@ -691,5 +721,45 @@ mod tests {
         );
         assert!(clipped_w <= narrow, "clipped width stays within max_width");
         assert!(clipped_w < full_w, "clipping should shorten the run");
+    }
+
+    fn roots(in_flatpak: bool, home: Option<&str>) -> Vec<String> {
+        font_roots(in_flatpak, home)
+            .iter()
+            .map(|r| r.as_str().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn font_roots_end_with_the_users_own_tree() {
+        assert_eq!(
+            roots(false, Some("/home/u")),
+            [
+                "/usr/share/fonts",
+                "/usr/local/share/fonts",
+                "/home/u/.local/share/fonts"
+            ]
+        );
+    }
+
+    #[test]
+    fn font_roots_without_home_are_the_system_ones() {
+        assert_eq!(
+            roots(false, None),
+            ["/usr/share/fonts", "/usr/local/share/fonts"]
+        );
+    }
+
+    #[test]
+    fn flatpak_font_roots_put_the_hosts_first_and_walk_home_once() {
+        assert_eq!(
+            roots(true, Some("/home/u")),
+            [
+                "/run/host/fonts",
+                "/run/host/user-fonts",
+                "/usr/share/fonts",
+                "/usr/local/share/fonts"
+            ]
+        );
     }
 }

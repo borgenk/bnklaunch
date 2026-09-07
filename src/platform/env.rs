@@ -8,6 +8,7 @@
 use core::ffi::c_char;
 
 use crate::platform::arena::ArrayString;
+use crate::platform::fs;
 
 /// Longest variable name looked up; the names here (XDG_*, HOME, ...) are short.
 const NAME_CAP: usize = 128;
@@ -39,6 +40,12 @@ pub fn var(name: &str) -> Option<&'static str> {
     core::str::from_utf8(bytes).ok()
 }
 
+/// Whether the process runs inside a Flatpak sandbox. Flatpak writes this file
+/// into every sandbox root; FLATPAK_ID is inherited by what the sandbox starts.
+pub fn in_flatpak() -> bool {
+    fs::exists("/.flatpak-info")
+}
+
 /// View a NUL-terminated C string as a byte slice up to the terminator.
 ///
 /// # Safety
@@ -62,6 +69,14 @@ mod tests {
         if let Ok(expected) = std::env::var("PATH") {
             assert_eq!(var("PATH"), Some(expected.as_str()));
         }
+    }
+
+    #[test]
+    fn in_flatpak_follows_the_sandbox_marker() {
+        assert_eq!(
+            in_flatpak(),
+            std::path::Path::new("/.flatpak-info").exists()
+        );
     }
 
     #[test]

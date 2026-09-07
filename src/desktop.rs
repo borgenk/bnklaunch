@@ -602,38 +602,72 @@ fn desktop_id(root: &str, path: &str) -> Option<ArrayString<ID_CAP>> {
 
 /// Fill out with the XDG data directories to search, highest priority first.
 fn get_data_dirs(out: &mut ArrayVec<ScanPath, MAX_DATA_DIRS>) {
+    collect_data_dirs(
+        out,
+        env::in_flatpak(),
+        env::var("HOME"),
+        env::var("XDG_DATA_HOME"),
+        env::var("XDG_DATA_DIRS"),
+    );
+}
+
+/// The list itself, with the environment passed in so both layouts are testable.
+fn collect_data_dirs(
+    out: &mut ArrayVec<ScanPath, MAX_DATA_DIRS>,
+    in_flatpak: bool,
+    home: Option<&str>,
+    data_home: Option<&str>,
+    data_dirs: Option<&str>,
+) {
     out.clear();
+
+    // The XDG variables describe the sandbox, where nothing is installed. The
+    // host's /usr is bound under /run/host and its home at the usual path, in
+    // the order a host session sees them.
+    if in_flatpak {
+        if let Some(home) = home {
+            push_data_dir(out, home, "/.local/share");
+            push_data_dir(out, home, "/.local/share/flatpak/exports/share");
+        }
+        push_data_dir(out, "/var/lib/flatpak/exports/share", "");
+        push_data_dir(out, "/run/host/usr/local/share", "");
+        push_data_dir(out, "/run/host/usr/share", "");
+        return;
+    }
 
     // User data dir (highest priority). XDG_DATA_HOME stands on its own; HOME
     // only supplies the base for the default when it is unset or empty, so a
     // session that sets XDG_DATA_HOME without HOME still resolves.
-    let mut dir = ScanPath::new();
-    let ok = match env::var("XDG_DATA_HOME").filter(|s| !s.is_empty()) {
-        Some(xdg) => dir.push_str(xdg).is_ok(),
-        None => match env::var("HOME") {
-            Some(home) => dir
-                .push_str(home)
-                .and_then(|_| dir.push_str("/.local/share"))
-                .is_ok(),
-            None => false,
-        },
-    };
-    if ok {
-        let _ = out.push(dir);
+    match data_home.filter(|s| !s.is_empty()) {
+        Some(xdg) => push_data_dir(out, xdg, ""),
+        None => {
+            if let Some(home) = home {
+                push_data_dir(out, home, "/.local/share");
+            }
+        }
     }
 
     // System data dirs. Unset and empty both mean the spec's default.
-    let system_dirs = env::var("XDG_DATA_DIRS")
+    let system_dirs = data_dirs
         .filter(|s| !s.is_empty())
         .unwrap_or("/usr/local/share:/usr/share");
     for dir in system_dirs.split(':') {
         if dir.is_empty() {
             continue;
         }
-        let mut p = ScanPath::new();
-        if p.push_str(dir).is_ok() {
-            let _ = out.push(p);
-        }
+        push_data_dir(out, dir, "");
+    }
+}
+
+/// Push base with suffix appended, dropping it if the two do not fit a path.
+fn push_data_dir(out: &mut ArrayVec<ScanPath, MAX_DATA_DIRS>, base: &str, suffix: &str) {
+    let mut dir = ScanPath::new();
+    if dir
+        .push_str(base)
+        .and_then(|_| dir.push_str(suffix))
+        .is_ok()
+    {
+        let _ = out.push(dir);
     }
 }
 
@@ -1091,5 +1125,80 @@ Exec=myapp --new
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The data directories the two layouts produce, as plain strings.
+    fn data_dirs(
+        in_flatpak: bool,
+        home: Option<&str>,
+        data_home: Option<&str>,
+        data_dirs: Option<&str>,
+    ) -> Vec<String> {
+        let mut out: ArrayVec<ScanPath, MAX_DATA_DIRS> = ArrayVec::new();
+        collect_data_dirs(&mut out, in_flatpak, home, data_home, data_dirs);
+        out.iter().map(|d| d.as_str().to_string()).collect()
+    }
+
+    #[test]
+    fn data_dirs_take_xdg_data_home_first() {
+        assert_eq!(
+            data_dirs(false, Some("/home/u"), Some("/data"), Some("/a:/b")),
+            ["/data", "/a", "/b"]
+        );
+    }
+
+    #[test]
+    fn data_dirs_fall_back_to_home_and_the_spec_defaults() {
+        assert_eq!(
+            data_dirs(false, Some("/home/u"), None, None),
+            ["/home/u/.local/share", "/usr/local/share", "/usr/share"]
+        );
+    }
+
+    #[test]
+    fn data_dirs_treat_an_empty_variable_as_unset() {
+        assert_eq!(
+            data_dirs(false, Some("/home/u"), Some(""), Some("")),
+            ["/home/u/.local/share", "/usr/local/share", "/usr/share"]
+        );
+    }
+
+    #[test]
+    fn data_dirs_skip_empty_entries_in_xdg_data_dirs() {
+        assert_eq!(
+            data_dirs(false, None, Some("/data"), Some("/a::/b")),
+            ["/data", "/a", "/b"]
+        );
+    }
+
+    #[test]
+    fn flatpak_data_dirs_are_the_hosts_not_the_sandboxs() {
+        assert_eq!(
+            data_dirs(
+                true,
+                Some("/home/u"),
+                Some("/home/u/.var/app/io.github.borgenk.BnkLaunch/data"),
+                Some("/app/share:/usr/share"),
+            ),
+            [
+                "/home/u/.local/share",
+                "/home/u/.local/share/flatpak/exports/share",
+                "/var/lib/flatpak/exports/share",
+                "/run/host/usr/local/share",
+                "/run/host/usr/share",
+            ]
+        );
+    }
+
+    #[test]
+    fn flatpak_data_dirs_without_home_keep_the_system_ones() {
+        assert_eq!(
+            data_dirs(true, None, None, None),
+            [
+                "/var/lib/flatpak/exports/share",
+                "/run/host/usr/local/share",
+                "/run/host/usr/share",
+            ]
+        );
     }
 }
