@@ -11,7 +11,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-# Actions are pinned to a commit, with the version beside it.
 jobs:
   version:
     name: Verify tag matches Cargo.toml version
@@ -21,9 +20,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # The release tarball is named from the Cargo.toml version, and install.sh
-      # fetches it by the release tag. A mismatch would publish an asset the
-      # installer cannot find, so fail before anything is built.
       - name: Compare tag against Cargo.toml
         run: |
           cargo_version="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
@@ -32,7 +28,6 @@ jobs:
             exit 1
           fi
 
-  # CI does not run on tags, so the gate runs here before anything is built.
   gate:
     name: Gate
     needs: version
@@ -56,8 +51,6 @@ jobs:
       - name: Check
         run: make check
 
-  # The bundle is built where the tarball cannot be: it needs bwrap and user
-  # namespaces, which the runner grants only to a privileged container.
   flatpak:
     name: Flatpak bundle
     needs: gate
@@ -75,14 +68,9 @@ jobs:
         with:
           manifest-path: io.github.borgenk.BnkLaunch.yml
           bundle: bnklaunch-${{ github.ref_name }}-x86_64.flatpak
-          # The manifest skips these two names, so the build cannot fold its own
-          # output back into the app. The action's defaults are not.
           build-dir: build-dir
           repo-dir: flatpak-repo
-          # What ships is built from the checkout and nothing else.
           cache: false
-          # The action names its artifact from the bundle. The bundle goes up
-          # below, under a name the publish job can ask for.
           upload-artifact: false
 
       - name: Hand the bundle to the publish job
@@ -96,14 +84,10 @@ jobs:
     name: Build and publish
     needs: [gate, flatpak]
     runs-on: ubuntu-latest
-    # The tarball takes its glibc and system libraries from whatever builds it,
-    # so it is built in the oldest distribution it runs on.
+    # Build inside Debian 12, so the binary needs no glibc newer than its 2.36.
     container: debian:12
     timeout-minutes: 30
     steps:
-      # Ahead of the checkout, so the action has git to clone with. The binary
-      # resolves -lfreetype and -lxkbcommon at link time, which needs the
-      # unversioned .so symlinks the -dev packages carry.
       - name: Install system dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -121,8 +105,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # The image has no rustup, and the toolchain it installs is the one
-      # rust-toolchain.toml names.
       - name: Install Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -133,7 +115,6 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      # Checks the ABI floor and writes the checksum the installer verifies.
       - name: Build release tarball
         run: make build-linux
 
@@ -143,7 +124,6 @@ jobs:
           name: flatpak-bundle
           path: dist
 
-      # make build-linux writes one for the tarball; the bundle arrives without.
       - name: Checksum the Flatpak bundle
         run: |
           cd dist
