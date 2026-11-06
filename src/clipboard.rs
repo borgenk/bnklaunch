@@ -20,6 +20,11 @@ use crate::platform::wire::Arg;
 /// huge paste is pointless and the rest is dropped.
 pub const CLIP_CAP: usize = 4096;
 
+/// Most destroyed sources awaiting the compositor's delete_id. Each one is
+/// confirmed a round trip after its destroy, so even a key-repeated copy keeps
+/// only a couple in flight.
+const RETIRED_CAP: usize = 8;
+
 /// Total budget for draining one clipboard pipe.
 ///
 /// The deadline covers the whole transfer, not each wait. A peer that opens the
@@ -150,6 +155,11 @@ pub struct Clipboard {
     source_id: Option<u32>,
     /// The text that source serves.
     source_text: Option<ArrayString<INPUT_CAP>>,
+    /// Sources we destroyed whose deletion the compositor has not confirmed. A
+    /// send it queued for one before reading the destroy still arrives, and its
+    /// pipe fd has to come off the connection's queue, or every later fd lands
+    /// on the event after the one it came with.
+    retired_sources: ArrayVec<u32, RETIRED_CAP>,
     /// The offer the compositor is describing, before it says what it is for.
     pending_offer: Option<u32>,
     /// The best text MIME seen on that offer so far.
@@ -246,15 +256,44 @@ impl Clipboard {
                 }
                 proto::wl_data_source::EV_CANCELLED => {
                     // Another app took the clipboard.
-                    self.source_id = None;
-                    self.source_text = None;
+                    self.retire_source(conn);
                 }
                 _ => {}
             }
             return Ok(true);
         }
 
+        if self.retired_sources.contains(&object) {
+            if opcode == proto::wl_data_source::EV_SEND {
+                // Closing the fd unread gives the reader an empty transfer.
+                drop(conn.take_fd());
+            }
+            return Ok(true);
+        }
+
         Ok(false)
+    }
+
+    /// Destroy the source we own, keeping its id until the compositor confirms
+    /// the deletion.
+    fn retire_source(&mut self, conn: &mut Connection) {
+        self.source_text = None;
+        let Some(source) = self.source_id.take() else {
+            return;
+        };
+        let _ = conn.request(source, proto::wl_data_source::DESTROY, &[]);
+        // Full only when the compositor has stopped confirming deletions. The
+        // oldest is then the least likely to still be sent to.
+        if self.retired_sources.is_full() {
+            self.retired_sources.remove(0);
+        }
+        let _ = self.retired_sources.push(source);
+    }
+
+    /// The compositor has deleted this id, so no more events can name the
+    /// source it was, and the id may be handed out again.
+    pub fn release_id(&mut self, id: u32) {
+        self.retired_sources.retain(|&retired| retired != id);
     }
 
     /// Take ownership of the clipboard and serve text from it.
@@ -272,9 +311,7 @@ impl Clipboard {
         let manager_id = manager_id.ok_or_else(|| Error::msg("no data device manager"))?;
         let device_id = self.device_id.ok_or_else(|| Error::msg("no data device"))?;
 
-        if let Some(old) = self.source_id.take() {
-            let _ = conn.request(old, proto::wl_data_source::DESTROY, &[]);
-        }
+        self.retire_source(conn);
 
         let source_id = next_id();
         conn.request(

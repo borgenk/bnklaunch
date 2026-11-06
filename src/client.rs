@@ -336,6 +336,7 @@ impl Client {
                 proto::wl_display::EV_DELETE_ID => {
                     let mut r = msg.reader();
                     if let Ok(id) = r.u32() {
+                        self.clipboard.release_id(id);
                         self.ids.recycle(id);
                     }
                 }
@@ -982,9 +983,9 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::client::*;
     use crate::platform::syscall::Fd;
-    use crate::platform::wire::MSG_BODY_CAP;
+    use crate::platform::wire::{self, MSG_BODY_CAP};
 
     /// A client talking to one end of a socketpair, with the other end handed
     /// back so the test can play compositor.
@@ -1027,6 +1028,150 @@ mod tests {
             opcode,
             body,
         }
+    }
+
+    /// Every request the client has flushed to the peer, as object, opcode and
+    /// body.
+    fn sent_requests(peer: &Fd) -> Vec<(u32, u16, Vec<u8>)> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let mut pfd = syscall::pollfd {
+                fd: peer.as_raw_fd(),
+                events: syscall::POLLIN,
+                revents: 0,
+            };
+            if syscall::poll(core::slice::from_mut(&mut pfd), 0) <= 0 {
+                break;
+            }
+            let n = syscall::read_fd(peer.as_raw_fd(), &mut chunk);
+            if n <= 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..n as usize]);
+        }
+        let mut out = Vec::new();
+        let mut rest = &bytes[..];
+        while !rest.is_empty() {
+            let (object, opcode, size) = wire::parse_header(rest).expect("header");
+            out.push((object, opcode, rest[8..size].to_vec()));
+            rest = &rest[size..];
+        }
+        out
+    }
+
+    /// A client holding a data device, ready to copy.
+    fn clipboard_client() -> (Client, Fd) {
+        let (mut client, peer) = test_client();
+        client.bindings.data_device_manager = Some(client.ids.allocate());
+        client.clipboard.device_id = Some(client.ids.allocate());
+        (client, peer)
+    }
+
+    /// Copy text the way Ctrl+C does, and return the id of the data source the
+    /// copy created.
+    fn copy(client: &mut Client, peer: &Fd, text: &str) -> u32 {
+        let mut stored = ArrayString::new();
+        stored.push_str(text).expect("text fits");
+        client.clipboard_op = clipboard::Op::Copy(stored);
+        client.process_clipboard();
+        let manager = client.bindings.data_device_manager.expect("manager");
+        sent_requests(peer)
+            .iter()
+            .find(|(object, opcode, _)| {
+                *object == manager && *opcode == proto::wl_data_device_manager::CREATE_DATA_SOURCE
+            })
+            .map(|(_, _, body)| wire::Reader::new(body).u32().expect("new id"))
+            .expect("the copy created a data source")
+    }
+
+    /// A pipe for a send event: the read end stays with the test, the write end
+    /// goes to the client.
+    fn pipe() -> (Fd, Fd) {
+        let mut fds = [0i32; 2];
+        assert_eq!(syscall::pipe2(&mut fds, syscall::O_CLOEXEC), 0);
+        (Fd::new(fds[0]), Fd::new(fds[1]))
+    }
+
+    /// Have the peer ask a data source for its text, passing the write end of a
+    /// pipe the way the compositor does.
+    fn send_to_source(peer: &Fd, source: u32, write_end: Fd) {
+        let mut msg: ArrayVec<u8, 64> = ArrayVec::new();
+        wire::encode(
+            &mut msg,
+            source,
+            proto::wl_data_source::EV_SEND,
+            &[Arg::Str("text/plain;charset=utf-8")],
+        )
+        .expect("encode");
+        let sent = syscall::send_with_fds(peer.as_raw_fd(), &msg, &[write_end.as_raw_fd()]);
+        assert_eq!(sent as usize, msg.len());
+    }
+
+    /// A clipboard manager reads every new selection, so a held Ctrl+C has the
+    /// compositor send to a source the client already replaced. Each send
+    /// carries a pipe, and the fds queue in arrival order, so the stale send's
+    /// fd has to be taken off the queue even though nothing is written to it.
+    #[test]
+    fn a_send_to_a_replaced_source_takes_its_own_fd() {
+        let (mut client, peer) = clipboard_client();
+        let first = copy(&mut client, &peer, "first");
+        let second = copy(&mut client, &peer, "second");
+
+        let (stale_read, stale_write) = pipe();
+        let (live_read, live_write) = pipe();
+        send_to_source(&peer, first, stale_write);
+        send_to_source(&peer, second, live_write);
+        client.dispatch().expect("the stale send");
+        client.dispatch().expect("the live send");
+
+        // The stale pipe closes with nothing in it. Read first, because if its
+        // fd stayed queued, the live send took it and wrote here instead.
+        assert_eq!(clipboard::read_text(stale_read).expect("stale pipe"), "");
+        assert_eq!(
+            clipboard::read_text(live_read).expect("live pipe"),
+            "second"
+        );
+    }
+
+    /// The compositor cancels a source when another client takes the
+    /// clipboard. The client destroys it, and once the compositor confirms the
+    /// id is gone, the clipboard stops claiming messages for it: that id is
+    /// handed out again, and its next owner's events must reach it.
+    #[test]
+    fn a_cancelled_source_is_destroyed_and_released_with_its_id() {
+        let (mut client, peer) = clipboard_client();
+        let source = copy(&mut client, &peer, "text");
+
+        client
+            .handle_message(event(source, proto::wl_data_source::EV_CANCELLED, &[]))
+            .expect("cancelled");
+        client.socket.flush().expect("flush");
+        assert!(
+            sent_requests(&peer)
+                .iter()
+                .any(|(object, opcode, _)| *object == source
+                    && *opcode == proto::wl_data_source::DESTROY),
+            "the cancelled source was destroyed"
+        );
+
+        client
+            .handle_message(event(
+                proto::WL_DISPLAY,
+                proto::wl_display::EV_DELETE_ID,
+                &[source],
+            ))
+            .expect("delete_id");
+        let claimed = client
+            .clipboard
+            .handle(
+                &mut client.socket,
+                source,
+                proto::wl_buffer::EV_RELEASE,
+                &[],
+            )
+            .expect("handle");
+        assert!(!claimed, "a deleted id belongs to whoever gets it next");
     }
 
     #[test]
