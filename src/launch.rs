@@ -3,19 +3,28 @@
 use core::ffi::c_char;
 use core::fmt::Write;
 
-use crate::desktop::{exec_argv, DesktopEntry, ARG_CAP, MAX_ARGS};
+use crate::desktop::{exec_argv, Catalog, DesktopEntry, ARG_CAP, MAX_ARGS};
 use crate::platform::arena::{ArrayString, ArrayVec};
-use crate::platform::env;
 use crate::platform::error::{Error, Result};
 use crate::platform::syscall;
+use crate::platform::{env, fs};
 
 extern "C" {
     /// PATH-searching exec; replaces the process image or returns -1 on failure.
     fn execvp(file: *const c_char, argv: *const *const c_char) -> i32;
 }
 
-/// The tokenized command line, plus the two flatpak-spawn takes in front of it.
-const LAUNCH_ARGS: usize = MAX_ARGS + 1;
+/// The arguments after the program: the tokenized command line, with up to two
+/// more in front of it, flatpak-spawn's --host and the terminal runner.
+const LAUNCH_ARGS: usize = MAX_ARGS + 2;
+
+/// What a Terminal=true entry starts through. It opens the user's preferred
+/// terminal running the command line after it.
+const TERMINAL_RUNNER: &str = "xdg-terminal-exec";
+
+/// The host's program directories, seen from inside a Flatpak sandbox: the
+/// manifest binds the host's /usr under /run/host.
+const HOST_BIN_DIRS: [&str; 2] = ["/run/host/usr/local/bin", "/run/host/usr/bin"];
 
 /// Byte capacity of a URL the launcher builds or opens. Larger than the search
 /// URL template it is built from (config::SEARCH_URL_CAP), since the
@@ -36,34 +45,70 @@ pub fn launch(entry: &DesktopEntry) -> Result<()> {
         .map_err(|_| Error::msg("exec command has too many arguments"))?;
 
     let mut args: ArrayVec<&str, LAUNCH_ARGS> = ArrayVec::new();
-    let program = exec_target(&argv, env::in_flatpak(), &mut args)?;
+    let program = exec_target(&argv, entry.terminal, env::in_flatpak(), &mut args)?;
     spawn::<{ ARG_CAP + 1 }>(program, &args)
 }
 
-/// The program to exec, with its arguments filled into args. Inside a Flatpak
-/// sandbox PATH holds only the runtime's binaries, so flatpak-spawn hands the
-/// command line to the host, which runs it under the session's environment.
+/// The program to exec, with its arguments filled into args. A terminal app
+/// starts through the terminal runner. Inside a Flatpak sandbox PATH holds only
+/// the runtime's binaries, so flatpak-spawn hands the command line to the host,
+/// which runs it under the session's environment.
 fn exec_target<'a>(
     argv: &'a [ArrayString<ARG_CAP>],
+    terminal: bool,
     in_flatpak: bool,
     args: &mut ArrayVec<&'a str, LAUNCH_ARGS>,
 ) -> Result<&'a str> {
-    let (program, rest) = argv
+    let (command, command_args) = argv
         .split_first()
         .ok_or_else(|| Error::msg("empty exec command"))?;
-    // argv holds at most MAX_ARGS tokens, so the two added here still fit.
+    // What goes in front of the command, program first.
+    let mut prefix: ArrayVec<&'static str, 3> = ArrayVec::new();
     if in_flatpak {
-        let _ = args.push("--host");
-        let _ = args.push(program.as_str());
+        let _ = prefix.push("flatpak-spawn");
+        let _ = prefix.push("--host");
     }
-    for a in rest {
+    if terminal {
+        let _ = prefix.push(TERMINAL_RUNNER);
+    }
+    // argv holds at most MAX_ARGS tokens, so the prefix still fits beside it.
+    let program = match prefix.split_first() {
+        Some((&front, prefix_args)) => {
+            for &a in prefix_args {
+                let _ = args.push(a);
+            }
+            let _ = args.push(command.as_str());
+            front
+        }
+        None => command.as_str(),
+    };
+    for a in command_args {
         let _ = args.push(a.as_str());
     }
-    Ok(if in_flatpak {
-        "flatpak-spawn"
-    } else {
-        program.as_str()
-    })
+    Ok(program)
+}
+
+/// Drop the entries that cannot start here. A Terminal=true app starts through
+/// the terminal runner, and without one it would run with no window at all.
+/// in_flatpak and path are the sandbox check and PATH, passed in.
+pub fn drop_unlaunchable(entries: &mut Catalog, in_flatpak: bool, path: Option<&str>) {
+    if !entries.iter().any(|e| e.terminal) || terminal_runner_found(in_flatpak, path) {
+        return;
+    }
+    entries.retain(|e| !e.terminal);
+}
+
+/// Whether the terminal runner is installed: on PATH, or in the host's program
+/// directories when sandboxed, since flatpak-spawn runs it on the host.
+fn terminal_runner_found(in_flatpak: bool, path: Option<&str>) -> bool {
+    let found = |dir: &str| fs::join(dir, TERMINAL_RUNNER).is_some_and(|p| fs::is_executable(&p));
+    if in_flatpak {
+        return HOST_BIN_DIRS.iter().any(|dir| found(dir));
+    }
+    path.unwrap_or_default()
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .any(found)
 }
 
 /// Open a URL in the user's default browser via xdg-open.
@@ -293,10 +338,19 @@ mod tests {
 
     /// The program and arguments a launch execs for a given Exec value.
     fn target(exec: &str, in_flatpak: bool) -> (String, Vec<String>) {
+        target_of(exec, false, in_flatpak)
+    }
+
+    /// The same, for an entry with Terminal=true.
+    fn terminal_target(exec: &str, in_flatpak: bool) -> (String, Vec<String>) {
+        target_of(exec, true, in_flatpak)
+    }
+
+    fn target_of(exec: &str, terminal: bool, in_flatpak: bool) -> (String, Vec<String>) {
         let mut argv: ArrayVec<ArrayString<ARG_CAP>, MAX_ARGS> = ArrayVec::new();
         exec_argv(exec, &mut argv).expect("tokenize");
         let mut args: ArrayVec<&str, LAUNCH_ARGS> = ArrayVec::new();
-        let program = exec_target(&argv, in_flatpak, &mut args).expect("target");
+        let program = exec_target(&argv, terminal, in_flatpak, &mut args).expect("target");
         (
             program.to_string(),
             args.iter().map(|a| a.to_string()).collect(),
@@ -337,6 +391,67 @@ mod tests {
         assert_eq!(args[0], "--host");
         assert_eq!(args[1], "a0");
         assert_eq!(args[MAX_ARGS], format!("a{}", MAX_ARGS - 1));
+
+        // A terminal app adds the runner in front as well.
+        let (program, args) = terminal_target(&exec, true);
+        assert_eq!(program, "flatpak-spawn");
+        assert_eq!(args.len(), MAX_ARGS + 2);
+        assert_eq!(args[..3], ["--host", "xdg-terminal-exec", "a0"]);
+        assert_eq!(args[MAX_ARGS + 1], format!("a{}", MAX_ARGS - 1));
+    }
+
+    #[test]
+    fn exec_target_opens_a_terminal_app_through_xdg_terminal_exec() {
+        let (program, args) = terminal_target("btop --utf-force", false);
+        assert_eq!(program, "xdg-terminal-exec");
+        assert_eq!(args, ["btop", "--utf-force"]);
+
+        let (program, args) = terminal_target("btop --utf-force", true);
+        assert_eq!(program, "flatpak-spawn");
+        assert_eq!(args, ["--host", "xdg-terminal-exec", "btop", "--utf-force"]);
+    }
+
+    /// Without xdg-terminal-exec a terminal app has nothing to open its window,
+    /// so it is not offered. Only an executable file counts as the program.
+    #[test]
+    fn terminal_apps_are_offered_only_when_xdg_terminal_exec_is_installed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = format!(
+            "{}/bnk_launch_runner_{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let runner = format!("{dir}/xdg-terminal-exec");
+        let path = format!("/nonexistent:{dir}");
+
+        let offered = |path: &str| {
+            let mut btop = DesktopEntry::new("btop", "btop").expect("entry");
+            btop.terminal = true;
+            let mut entries = Catalog::new();
+            entries
+                .push(DesktopEntry::new("Files", "nautilus").expect("entry"))
+                .expect("room");
+            entries.push(btop).expect("room");
+            drop_unlaunchable(&mut entries, false, Some(path));
+            entries
+                .iter()
+                .map(|e| e.name.as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(offered(&path), ["Files"], "no runner on PATH");
+
+        std::fs::write(&runner, "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert_eq!(offered(&path), ["Files"], "a runner that cannot execute");
+
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(offered(&path), ["Files", "btop"], "a runner on PATH");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// exec keeps an ignored signal and the signal mask, so whatever the
@@ -445,8 +560,12 @@ mod tests {
 
     #[test]
     fn exec_target_refuses_an_empty_command_line() {
+        // Refused whatever goes in front, so nothing runs a bare flatpak-spawn
+        // or xdg-terminal-exec.
         let argv: ArrayVec<ArrayString<ARG_CAP>, MAX_ARGS> = ArrayVec::new();
-        let mut args: ArrayVec<&str, LAUNCH_ARGS> = ArrayVec::new();
-        assert!(exec_target(&argv, false, &mut args).is_err());
+        for (terminal, in_flatpak) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut args: ArrayVec<&str, LAUNCH_ARGS> = ArrayVec::new();
+            assert!(exec_target(&argv, terminal, in_flatpak, &mut args).is_err());
+        }
     }
 }

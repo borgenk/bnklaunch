@@ -107,6 +107,9 @@ pub struct DesktopEntry {
     name_chars: u32,
     /// Raw Exec value, tokenized per the spec at launch time (see exec_argv).
     pub exec: ArrayString<EXEC_CAP>,
+    /// Terminal=true: the program runs in a terminal window, which the launch
+    /// has to open for it.
+    pub terminal: bool,
 }
 
 impl DesktopEntry {
@@ -127,6 +130,7 @@ impl DesktopEntry {
             name_lower: ArrayString::new(),
             name_chars: 0,
             exec: ArrayString::new(),
+            terminal: false,
         }
     }
 
@@ -156,6 +160,7 @@ impl DesktopEntry {
         let mut exec: Option<&str> = None;
         let mut no_display = false;
         let mut hidden = false;
+        let mut terminal = false;
 
         for line in content.lines() {
             let line = line.trim();
@@ -192,6 +197,7 @@ impl DesktopEntry {
                     "Exec" => exec = Some(value),
                     "NoDisplay" => no_display = value == "true",
                     "Hidden" => hidden = value == "true",
+                    "Terminal" => terminal = value == "true",
                     _ => {}
                 }
             }
@@ -211,6 +217,7 @@ impl DesktopEntry {
         let mut e = DesktopEntry::blank();
         unescape_into(&mut e.name, name?).ok()?;
         unescape_into(&mut e.exec, exec?).ok()?;
+        e.terminal = terminal;
         e.derive_search_keys();
         Some(e)
     }
@@ -750,6 +757,19 @@ Icon=firefox
         assert_eq!(entry.name, "Firefox");
         // Exec is stored raw; field codes are handled at launch time.
         assert_eq!(entry.exec, "firefox %u");
+    }
+
+    #[test]
+    fn parse_reads_whether_the_app_runs_in_a_terminal() {
+        let parse = |terminal_line: &str| {
+            let content = format!(
+                "[Desktop Entry]\nType=Application\nName=btop\nExec=btop\n{terminal_line}\n"
+            );
+            DesktopEntry::parse(&content).expect("entry")
+        };
+        assert!(parse("Terminal=true").terminal);
+        assert!(!parse("Terminal=false").terminal);
+        assert!(!parse("").terminal);
     }
 
     #[test]

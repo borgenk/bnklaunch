@@ -234,8 +234,9 @@ pub(crate) fn run() -> Result<()> {
 
     // Refresh against the application directories. When their fingerprint matches
     // the cache this is skipped; otherwise rediscover and persist the fresh set.
-    // The cache keeps the unfiltered set (so toggling the denylist needs no
-    // rescan), and the denylist is applied afterward to what gets shown.
+    // The cache keeps the unfiltered set, so toggling the denylist or installing
+    // a terminal runner needs no rescan; both filters apply afterward to what
+    // gets shown.
     let fingerprint = desktop::dirs_fingerprint();
     if Some(fingerprint) != cache_fingerprint {
         desktop::discover_entries(&mut entries);
@@ -244,6 +245,7 @@ pub(crate) fn run() -> Result<()> {
         }
     }
     denylist::apply(&mut entries, &cfg.denied);
+    launch::drop_unlaunchable(&mut entries, env::in_flatpak(), env::var("PATH"));
 
     let mut state = AppState::new(entries, recents);
 

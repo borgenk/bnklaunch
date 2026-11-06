@@ -345,6 +345,7 @@ pub struct stat {
 /// File-type mask and directory bit within st_mode.
 pub const S_IFMT: u32 = 0o170000;
 pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFREG: u32 = 0o100000;
 
 /// d_type value marking a regular file in a getdents64 record.
 pub const DT_REG: u8 = 8;

@@ -10,7 +10,7 @@ use crate::platform::bytes;
 use crate::platform::error::{elog, Error, Result};
 use crate::platform::syscall::{
     self, linux_dirent64, stat, Fd, RawFd, AT_FDCWD, AT_SYMLINK_NOFOLLOW, EEXIST, EINTR, O_CREAT,
-    O_DIRECTORY, O_RDONLY, O_TRUNC, O_WRONLY, S_IFDIR, S_IFMT,
+    O_DIRECTORY, O_RDONLY, O_TRUNC, O_WRONLY, S_IFDIR, S_IFMT, S_IFREG,
 };
 
 /// Longest path the helpers handle.
@@ -145,6 +145,12 @@ fn stat_path(path: &str, flags: i32) -> Option<stat> {
 /// Whether a path exists, whatever its type (following symlinks).
 pub fn exists(path: &str) -> bool {
     stat_path(path, 0).is_some()
+}
+
+/// Whether a path resolves to a regular file with an execute bit set
+/// (following symlinks).
+pub fn is_executable(path: &str) -> bool {
+    stat_path(path, 0).is_some_and(|st| st.st_mode & S_IFMT == S_IFREG && st.st_mode & 0o111 != 0)
 }
 
 /// Whether a path resolves to a directory (following symlinks).
