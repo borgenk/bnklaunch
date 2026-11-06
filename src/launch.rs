@@ -123,11 +123,16 @@ fn spawn<const CAP: usize>(program: &str, args: &[&str]) -> Result<()> {
     if pid == 0 {
         // Child: own process group, stdio to /dev/null, then exec.
         syscall::setpgid(0, 0);
-        // An ignored signal stays ignored across exec, and the launcher ignores
-        // SIGPIPE. Hand the application back the default, or its own pipelines
-        // would see writes to a closed reader fail with EPIPE forever instead of
-        // ending the process the way every tool expects.
-        syscall::signal_disposition(syscall::SIGPIPE, syscall::SIG_DFL);
+        // exec keeps an ignored signal ignored and keeps the mask. The launcher
+        // ignores SIGPIPE, and whatever started it may have ignored or blocked
+        // more: nohup ignores SIGHUP, and sh -c 'bnklaunch &' ignores SIGINT and
+        // SIGQUIT. So the application gets every signal back at its default,
+        // with nothing blocked. SIGKILL and SIGSTOP refuse the change, which is
+        // harmless.
+        for signum in 1..=syscall::SIGRTMAX {
+            syscall::signal_disposition(signum, syscall::SIG_DFL);
+        }
+        syscall::set_signal_mask(0);
         if let Some(ref devnull_path) = devnull_path {
             let devnull = syscall::openat(syscall::AT_FDCWD, devnull_path, syscall::O_RDWR, 0);
             if devnull >= 0 {
@@ -212,7 +217,7 @@ fn percent_encode<const N: usize>(s: &str, out: &mut ArrayString<N>) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::launch::*;
 
     fn enc(s: &str) -> String {
         let mut out: ArrayString<256> = ArrayString::new();
@@ -327,6 +332,62 @@ mod tests {
         assert_eq!(args[0], "--host");
         assert_eq!(args[1], "a0");
         assert_eq!(args[MAX_ARGS], format!("a{}", MAX_ARGS - 1));
+    }
+
+    /// exec keeps an ignored signal and the signal mask, so whatever the
+    /// launcher ignores or blocks, every app it starts would too. Something
+    /// that starts the launcher under nohup or with & ignores SIGHUP, SIGINT or
+    /// SIGQUIT; SIGUSR2 stands in for those, and SIGUSR1 for a blocked signal.
+    /// Nothing in the suite uses either.
+    #[test]
+    fn a_launched_app_starts_with_every_signal_at_its_default() {
+        const SIGUSR1: i32 = 10;
+        const SIGUSR2: i32 = 12;
+        assert_eq!(syscall::signal_disposition(SIGUSR2, syscall::SIG_IGN), 0);
+
+        let out = format!(
+            "{}/bnk_launch_signals_{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_file(&out);
+        // The mask is per thread, and a forked child takes the forking thread's,
+        // so the block lives on a thread of its own.
+        let script = "exec cat /proc/self/status > \"$1\"";
+        let spawned = std::thread::spawn({
+            let out = out.clone();
+            move || {
+                assert_eq!(syscall::set_signal_mask(1 << (SIGUSR1 - 1)), 0);
+                spawn::<{ ARG_CAP + 1 }>("sh", &["-c", script, "sh", &out])
+            }
+        })
+        .join()
+        .expect("spawning thread");
+        spawned.expect("spawn sh");
+
+        let start = std::time::Instant::now();
+        let status = loop {
+            let text = std::fs::read_to_string(&out).unwrap_or_default();
+            if text.contains("SigBlk:") && text.contains("SigIgn:") {
+                break text;
+            }
+            assert!(
+                start.elapsed().as_secs() < 5,
+                "the child never wrote its status"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let _ = std::fs::remove_file(&out);
+
+        let mask = |field: &str| {
+            let line = status
+                .lines()
+                .find(|l| l.starts_with(field))
+                .expect("field");
+            u64::from_str_radix(line[field.len()..].trim(), 16).expect("hex mask")
+        };
+        assert_eq!(mask("SigIgn:"), 0, "ignored signals, bit N-1 is signal N");
+        assert_eq!(mask("SigBlk:"), 0, "blocked signals, bit N-1 is signal N");
     }
 
     #[test]

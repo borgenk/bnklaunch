@@ -107,6 +107,7 @@ mod nr {
     pub const IO_URING_SETUP: usize = 425;
     pub const IO_URING_ENTER: usize = 426;
     pub const RT_SIGACTION: usize = 13;
+    pub const RT_SIGPROCMASK: usize = 14;
     pub const PIPE2: usize = 293;
     pub const SOCKETPAIR: usize = 53;
 }
@@ -719,6 +720,8 @@ struct kernel_sigaction {
 }
 
 pub const SIGPIPE: i32 = 13;
+/// The highest signal number on Linux, and the width of the kernel's sigset_t.
+pub const SIGRTMAX: i32 = 64;
 /// Signal dispositions, as the integer values the kernel reads for them.
 pub const SIG_DFL: usize = 0;
 pub const SIG_IGN: usize = 1;
@@ -745,6 +748,23 @@ pub fn signal_disposition(signum: i32, disposition: usize) -> i32 {
             nr::RT_SIGACTION,
             signum as usize,
             &act as *const kernel_sigaction as usize,
+            0,
+            core::mem::size_of::<u64>(),
+        ) as i32
+    }
+}
+
+/// Replace the calling thread's signal mask: bit N-1 blocks signal N. Returns 0
+/// or a negated errno.
+pub fn set_signal_mask(mask: u64) -> i32 {
+    const SIG_SETMASK: usize = 2;
+    // SAFETY: mask is a live u64, the size the last argument names; the
+    // old-mask pointer is null, which the kernel reads as "do not report it".
+    unsafe {
+        syscall4(
+            nr::RT_SIGPROCMASK,
+            SIG_SETMASK,
+            &mask as *const u64 as usize,
             0,
             core::mem::size_of::<u64>(),
         ) as i32
