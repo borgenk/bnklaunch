@@ -26,9 +26,12 @@ const GLYPH_SLOTS: usize = 512;
 
 /// Coverage bytes held for all cached glyphs together. At the sizes drawn here
 /// a glyph's ink is a few hundred bytes, so this holds the whole working set
-/// several times over. When it does fill, glyphs are still drawn, just not
-/// cached.
+/// several times over. A glyph evicted from its slot leaves its ink behind, so
+/// the arena does fill eventually, and then the cache starts over empty.
 const INK_CAP: usize = 256 * 1024;
+
+// A cache that has just started over can take any glyph.
+const _: () = assert!(freetype::GLYPH_MAX <= INK_CAP);
 
 /// A glyph that has been rasterized once: its metrics, and where its coverage
 /// sits in the ink arena.
@@ -47,7 +50,7 @@ struct Cached {
     ink_len: usize,
 }
 
-/// Rasterized glyphs, kept for the life of the font.
+/// Rasterized glyphs, kept until the ink arena fills.
 ///
 /// Rasterizing means decomposing an outline and filling scanlines, and every
 /// frame drew the same handful of characters afresh. A launcher opens, shows a
@@ -97,26 +100,15 @@ impl GlyphCache {
         face.set_pixel_size(px).ok()?;
         let glyph = face.rasterize(ch);
 
-        let ink_at = self.ink.len();
-        if self.ink.extend_from_slice(&glyph.coverage).is_err() {
-            // The arena is full. The glyph is still usable, it just cannot be
-            // kept, so hand it back without caching it.
-            self.ink.truncate(ink_at);
-            // No ink means no blit, so it must claim no size either. The
-            // advance is still right, so the line lays out as it should and the
-            // glyph is merely blank.
-            return Some(Cached {
-                ch,
-                px,
-                left: glyph.left,
-                top: glyph.top,
-                width: 0,
-                rows: 0,
-                advance: glyph.advance,
-                ink_at,
-                ink_len: 0,
-            });
+        // Nothing records which ink an evicted glyph left behind, so a full
+        // arena is cleared whole. Every caller is done with the glyph it got
+        // before asking for the next, so no live glyph points into it.
+        if self.ink.remaining() < glyph.coverage.len() {
+            self.slots = [None; GLYPH_SLOTS];
+            self.ink.clear();
         }
+        let ink_at = self.ink.len();
+        self.ink.extend_from_slice(&glyph.coverage).ok()?;
 
         let cached = Cached {
             ch,
@@ -490,7 +482,7 @@ fn mmap_file(path: &str) -> Result<(*mut core::ffi::c_void, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::font::*;
 
     const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-font.ttf");
 
@@ -617,6 +609,67 @@ mod tests {
         assert_eq!(font.char_offset_at_x(text, -5.0, INPUT_SIZE), 0);
         let full = font.x_at_char_offset(text, count, INPUT_SIZE);
         assert_eq!(font.char_offset_at_x(text, full + 50.0, INPUT_SIZE), count);
+    }
+
+    /// Two glyphs that share a cache slot evict each other on every draw, and
+    /// each one stores its ink again when it comes back. Redrawing them until
+    /// that has filled the arena twice over must leave the cache still able to
+    /// draw a glyph it has never seen, one with more ink than either of them.
+    #[test]
+    fn glyphs_that_share_a_slot_never_run_the_cache_out_of_ink() {
+        let font = load_fixture_font();
+        let ink = |ch: char, size: f32| {
+            font.face.set_pixel_size(pixel_size(size)).expect("size");
+            font.face.rasterize(ch).coverage.len()
+        };
+
+        // The cache's own slot function picks the pair, so the test follows it
+        // if the hash changes.
+        let sizes = [INPUT_SIZE, NAME_SIZE, SUBTITLE_SIZE];
+        let mut pair = None;
+        'search: for &size_a in &sizes {
+            for &size_b in sizes.iter().filter(|&&s| s != size_a) {
+                for a in ' '..='~' {
+                    for b in ' '..='~' {
+                        let shared = GlyphCache::slot(a, pixel_size(size_a))
+                            == GlyphCache::slot(b, pixel_size(size_b));
+                        if shared && ink(a, size_a) + ink(b, size_b) > 0 {
+                            pair = Some(((a, size_a), (b, size_b)));
+                            break 'search;
+                        }
+                    }
+                }
+            }
+        }
+        let ((a, size_a), (b, size_b)) = pair.expect("two printable glyphs share a slot");
+        let per_round = ink(a, size_a) + ink(b, size_b);
+        let (fresh, fresh_size) = ('@', INPUT_SIZE);
+        assert!(ink(fresh, fresh_size) > ink(a, size_a).max(ink(b, size_b)));
+
+        let (w, h) = (64u32, 40u32);
+        let mut scratch = vec![0u32; (w * h) as usize];
+        for _ in 0..2 * (INK_CAP / per_round + 1) {
+            for (ch, size) in [(a, size_a), (b, size_b)] {
+                font.render_text(&mut scratch, w, h, 0, 0, &ch.to_string(), !0, w, size);
+            }
+        }
+
+        let mut pixels = vec![0u32; (w * h) as usize];
+        font.render_text(
+            &mut pixels,
+            w,
+            h,
+            0,
+            0,
+            &fresh.to_string(),
+            !0,
+            w,
+            fresh_size,
+        );
+        assert!(
+            pixels.iter().any(|&p| p != 0),
+            "a new glyph drawn after the churn still lays down ink"
+        );
     }
 
     #[test]
