@@ -145,6 +145,11 @@ fn spawn<const CAP: usize>(program: &str, args: &[&str]) -> Result<()> {
                 }
             }
         }
+        // Only stdio goes to the application. The launcher's own fds are
+        // close-on-exec, but one it inherited without the flag is not.
+        // SAFETY: the child execs or exits next, so none of the Fd values it
+        // copied from the parent is ever dropped.
+        unsafe { syscall::close_range(3, u32::MAX) };
         // SAFETY: ptrs[0] and ptrs point at the NUL-terminated argv built above,
         // alive on the stack; execvp only reads them.
         unsafe { execvp(ptrs[0], ptrs.as_ptr()) };
@@ -388,6 +393,54 @@ mod tests {
         };
         assert_eq!(mask("SigIgn:"), 0, "ignored signals, bit N-1 is signal N");
         assert_eq!(mask("SigBlk:"), 0, "blocked signals, bit N-1 is signal N");
+    }
+
+    /// A launched app gets stdio and nothing else. An fd the launcher holds
+    /// without close-on-exec, one it inherited or one a peer passed it, would
+    /// otherwise stay open in the app for its whole life: a clipboard pipe's
+    /// reader would wait on an EOF that never comes.
+    #[test]
+    fn a_launched_app_inherits_only_stdio() {
+        // A number no shell picks for its own redirections, opened the way an
+        // inherited fd would be: without close-on-exec.
+        const HELD: i32 = 517;
+        let devnull = syscall::CPath::new("/dev/null").expect("path");
+        let fd = syscall::openat(syscall::AT_FDCWD, &devnull, syscall::O_RDWR, 0);
+        assert!(fd >= 0, "open /dev/null");
+        assert_eq!(syscall::dup2(fd, HELD), HELD);
+        // SAFETY: fd was opened above and nothing else owns it.
+        unsafe { syscall::close(fd) };
+
+        let out = format!(
+            "{}/bnk_launch_fds_{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_file(&out);
+        // Written aside and renamed, so the file appears whole.
+        let script = "ls -1 /proc/self/fd > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"";
+        let spawned = spawn::<{ ARG_CAP + 1 }>("sh", &["-c", script, "sh", &out]);
+
+        let start = std::time::Instant::now();
+        let listing = loop {
+            if let Ok(text) = std::fs::read_to_string(&out) {
+                break text;
+            }
+            assert!(
+                start.elapsed().as_secs() < 5,
+                "the child never listed its fds"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let _ = std::fs::remove_file(&out);
+        // SAFETY: HELD was made by the dup2 above and nothing else owns it.
+        unsafe { syscall::close(HELD) };
+        spawned.expect("spawn sh");
+
+        assert!(
+            !listing.lines().any(|l| l == HELD.to_string()),
+            "the app inherited fd {HELD}: {listing:?}"
+        );
     }
 
     #[test]

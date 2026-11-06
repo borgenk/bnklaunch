@@ -108,6 +108,7 @@ mod nr {
     pub const IO_URING_ENTER: usize = 426;
     pub const RT_SIGACTION: usize = 13;
     pub const RT_SIGPROCMASK: usize = 14;
+    pub const CLOSE_RANGE: usize = 436;
     pub const PIPE2: usize = 293;
     pub const SOCKETPAIR: usize = 53;
 }
@@ -127,6 +128,8 @@ pub const SCM_RIGHTS: i32 = 0x01;
 /// msg_flags bit set by recvmsg when the ancillary buffer was too small to
 /// hold the passed fds.
 pub const MSG_CTRUNC: i32 = 0x8;
+/// recvmsg flag: install every passed fd with close-on-exec set.
+const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
 /// sendmsg flag: report a write to a hung-up peer as EPIPE instead of raising
 /// SIGPIPE, whose default action would kill the process before any error path
 /// in this program runs.
@@ -857,6 +860,17 @@ pub unsafe fn close(fd: RawFd) -> i32 {
     syscall1(nr::CLOSE, fd as usize) as i32
 }
 
+/// Close every file descriptor from first to last, inclusive. Returns 0 or a
+/// negated errno.
+///
+/// # Safety
+///
+/// No live Fd may own a descriptor in the range: it would close that number
+/// again when dropped, by then possibly someone else's.
+pub unsafe fn close_range(first: u32, last: u32) -> i32 {
+    syscall3(nr::CLOSE_RANGE, first as usize, last as usize, 0) as i32
+}
+
 /// Write a buffer to a file descriptor. Returns the bytes written or a negated
 /// errno.
 pub fn write_fd(fd: RawFd, buf: &[u8]) -> isize {
@@ -1165,7 +1179,7 @@ pub fn recv_with_fds<const N: usize>(
             // has to offer the full ancillary buffer.
             msg.msg_controllen = cmsg_buf.len();
             msg.msg_flags = 0;
-            let r = recvmsg(fd, &mut msg, 0);
+            let r = recvmsg(fd, &mut msg, MSG_CMSG_CLOEXEC);
             if r == -(EINTR as isize) {
                 continue;
             }

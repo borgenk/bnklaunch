@@ -567,6 +567,12 @@ mod tests {
         let mut got = [0u8; 1];
         assert_eq!(syscall::read_fd(received.as_raw_fd(), &mut got), 1);
         assert_eq!(&got, b"k");
+
+        // Close-on-exec, like every fd the launcher opens itself, so a launched
+        // app cannot inherit it.
+        const F_GETFD: i32 = 1;
+        let flags = syscall::fcntl(received.as_raw_fd(), F_GETFD, 0);
+        assert_eq!(flags & syscall::FD_CLOEXEC, syscall::FD_CLOEXEC);
     }
 
     #[test]
