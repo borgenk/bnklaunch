@@ -133,15 +133,28 @@ pub(crate) fn normalize_url(url: &str, out: &mut arena::ArrayString<URL_CAP>) {
     let _ = out.push_str(url);
 }
 
-/// Try to acquire an exclusive lock. Returns the owned lock fd on success; the
-/// lock is held until the fd is dropped (and closed).
-fn try_acquire_lock() -> Result<syscall::Fd> {
+/// The single-instance lock, as try_acquire_lock found it.
+enum Lock {
+    /// This process holds it until the fd is dropped (and closed).
+    Held(syscall::Fd),
+    /// Another instance holds it.
+    Busy,
+}
+
+/// Where the single-instance lock lives. Every instance of a Flatpak shares the
+/// sandbox's runtime dir, so the lock works there too.
+fn lock_path() -> Result<arena::ArrayString<{ fs::PATH_CAP }>> {
     let runtime_dir = env::var("XDG_RUNTIME_DIR").unwrap_or("/tmp");
     let mut path: arena::ArrayString<{ fs::PATH_CAP }> = arena::ArrayString::new();
     path.push_str(runtime_dir)
         .and_then(|_| path.push_str("/bnklaunch.lock"))
         .map_err(|_| Error::msg("lock path too long"))?;
-    let cp = fs::cpath(path.as_str())?;
+    Ok(path)
+}
+
+/// Take the lock at path without waiting.
+fn try_acquire_lock(path: &str) -> Result<Lock> {
+    let cp = fs::cpath(path)?;
 
     // O_CLOEXEC so a launched app does not inherit the lock fd and hold the
     // single-instance flock for its whole lifetime.
@@ -157,10 +170,11 @@ fn try_acquire_lock() -> Result<syscall::Fd> {
     let fd = syscall::Fd::new(fd);
 
     let result = syscall::flock(fd.as_raw_fd(), syscall::LOCK_EX | syscall::LOCK_NB);
-    if result == 0 {
-        Ok(fd)
-    } else {
-        Err(Error::msg("another instance is already running"))
+    match result {
+        0 => Ok(Lock::Held(fd)),
+        // EWOULDBLOCK, which Linux defines as EAGAIN.
+        r if r == -syscall::EAGAIN => Ok(Lock::Busy),
+        r => Err(Error::from_errno(-r)),
     }
 }
 
@@ -197,10 +211,17 @@ pub(crate) fn run() -> Result<()> {
     // pipelines rely on.
     syscall::signal_disposition(syscall::SIGPIPE, syscall::SIG_IGN);
 
-    // Single instance check - exit silently if another instance is running
-    let _lock = match try_acquire_lock() {
-        Ok(lock) => lock,
-        Err(_) => return Ok(()),
+    // One launcher at a time: while one is open, a second hotkey press does
+    // nothing. A lock that cannot be taken at all is reported and the launcher
+    // runs without it, since refusing to start would leave a hotkey that
+    // silently does nothing.
+    let _lock = match lock_path().and_then(|path| try_acquire_lock(&path)) {
+        Ok(Lock::Held(fd)) => Some(fd),
+        Ok(Lock::Busy) => return Ok(()),
+        Err(e) => {
+            elog!("bnklaunch: running without the single-instance lock: {e}");
+            None
+        }
     };
 
     // Load system font
@@ -665,7 +686,35 @@ fn resolve_results<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::app::*;
+
+    /// A second instance finds the lock busy and leaves quietly. A lock that
+    /// cannot be taken at all is an error the caller reports, not a busy lock:
+    /// otherwise the launcher exits silently and the hotkey does nothing.
+    #[test]
+    fn the_lock_tells_another_instance_apart_from_a_failure() {
+        let dir = format!(
+            "{}/bnk_lock_{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = format!("{dir}/bnklaunch.lock");
+
+        let first = try_acquire_lock(&path).expect("first");
+        assert!(matches!(first, Lock::Held(_)));
+        // flock belongs to the open file, so a second open in this process
+        // contends with the first exactly as another instance would.
+        assert!(matches!(try_acquire_lock(&path), Ok(Lock::Busy)));
+        drop(first);
+        assert!(matches!(try_acquire_lock(&path), Ok(Lock::Held(_))));
+
+        let unreachable = format!("{dir}/missing/bnklaunch.lock");
+        assert!(try_acquire_lock(&unreachable).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn entries(names: &[(&str, &str)]) -> desktop::Catalog {
         let mut out = desktop::Catalog::new();
