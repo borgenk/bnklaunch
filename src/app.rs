@@ -400,8 +400,10 @@ fn event_loop(
     // A burst ran past the dispatch budget, and the rest is waiting.
     let mut input_pending = false;
 
-    // Event loop
-    while client.running {
+    // Event loop. Enter or a click on a row ends it, except that a launch waits
+    // for a paste still arriving, until it lands or runs out of time, so the
+    // launch sees the pasted text the way it was typed.
+    while client.running || launch_awaits_paste(client) {
         // Paint what the last turn changed, if the compositor is ready for a
         // frame, then send what is queued, as far as the socket takes it. The
         // first turn paints the opening frame this way, before any wait.
@@ -560,6 +562,11 @@ fn event_loop(
         }
     }
     Ok(())
+}
+
+/// Whether the loop has ended on a launch while a paste is still arriving.
+fn launch_awaits_paste(client: &Client) -> bool {
+    client.pending_action == PendingAction::Launch && client.paste.is_some()
 }
 
 /// Handle the messages that have arrived, up to DISPATCH_BUDGET of them. True

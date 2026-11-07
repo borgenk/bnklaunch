@@ -23,7 +23,7 @@ use crate::platform::conn::Connection;
 use crate::platform::protocol as proto;
 use crate::platform::syscall::{self, Fd, RawFd};
 use crate::platform::wire::{self, Arg};
-use crate::platform::xkb::keycode::{KEY_A, KEY_C, KEY_RIGHT, KEY_V};
+use crate::platform::xkb::keycode::{KEY_A, KEY_C, KEY_ENTER, KEY_RIGHT, KEY_V};
 use crate::ui::Theme;
 
 const FIXTURE_FONT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-font.ttf");
@@ -887,6 +887,37 @@ fn paste_from_a_trickling_owner() -> String {
     )
 }
 
+/// Enter pressed right after Ctrl+V, before the owner has written.
+fn enter_during_a_paste() -> String {
+    let mut h = Harness::start("stall-enter");
+    h.peer.offer_selection();
+    h.ctrl_tap(KEY_V);
+    let asked = h
+        .peer
+        .pump_until(Instant::now() + Duration::from_secs(1), |p| {
+            !p.paste_pipes.is_empty()
+        });
+    assert!(asked, "the paste never asked for the data");
+    h.tap(KEY_ENTER);
+    h.peer.pump_for(Duration::from_millis(50));
+    let pipe = h.peer.paste_pipes.pop().expect("pipe");
+    // EPIPE when the launcher has already gone and closed its end.
+    let wrote = syscall::write_fd(pipe.as_raw_fd(), b"xyz") == 3;
+    drop(pipe);
+    h.peer.pump_for(Duration::from_millis(100));
+    let out = h.finish();
+    let text = out.as_ref().map(|o| o.text.clone()).unwrap_or_default();
+    let pipe = if wrote {
+        ""
+    } else {
+        ", its pipe already closed"
+    };
+    format!(
+        "Enter 50 ms before the owner wrote launched with {text:?}{pipe}{}",
+        ended(&out)
+    )
+}
+
 /// A copy served to a requester whose pipe is already full.
 fn copy_to_a_full_pipe() -> String {
     let mut h = Harness::start("stall-copy");
@@ -1149,10 +1180,11 @@ type Scenario = (&'static str, fn() -> String);
 #[test]
 #[ignore]
 fn stall_report() {
-    let scenarios: [Scenario; 10] = [
+    let scenarios: [Scenario; 11] = [
         ("startup", first_frame),
         ("paste, owner never writes", paste_from_a_silent_owner),
         ("paste, owner trickles", paste_from_a_trickling_owner),
+        ("paste, then Enter", enter_during_a_paste),
         ("copy, requester's pipe full", copy_to_a_full_pipe),
         ("resize, configure withheld", resize_without_a_configure),
         (
