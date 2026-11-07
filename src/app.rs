@@ -22,6 +22,11 @@ const CURSOR_BLINK_MS: u64 = 530;
 /// poll that has yet to complete.
 const RING_ENTRIES: u32 = 32;
 
+/// Most messages one loop turn handles. A burst bigger than this is finished
+/// over the next turns, with deadlines and painting in between, so a flood of
+/// events cannot hold either off. Real input is a few messages a turn.
+const DISPATCH_BUDGET: usize = 64;
+
 /// io_uring user_data of the socket's read poll.
 const K_WAYLAND: u64 = 1;
 /// io_uring user_data of the socket's write poll.
@@ -392,6 +397,8 @@ fn event_loop(
     // The serial of the paste whose pipe has a poll in flight.
     let mut paste_armed: Option<u64> = None;
     let mut output_armed = false;
+    // A burst ran past the dispatch budget, and the rest is waiting.
+    let mut input_pending = false;
 
     // Event loop
     while client.running {
@@ -423,39 +430,41 @@ fn event_loop(
         if let Some(paste) = &client.paste {
             park = park.min(paste.remaining_ms());
         }
+        // Messages left over from a burst are handled first, without parking.
+        if input_pending {
+            park = 0;
+        }
         ring.submit_and_wait_timeout(park * 1_000_000)
             .map_err(Error::from_errno)?;
+        let mut readable = input_pending;
         while let Some(cqe) = ring.next_cqe() {
-            if cqe.user_data == K_PASTE | client.paste_serial {
-                paste_armed = None;
-            }
-            if cqe.user_data == K_OUTPUT {
-                output_armed = false;
-                if cqe.res < 0 {
-                    return Err(Error::from_errno(-cqe.res));
-                }
-                client.socket.flush()?;
-                continue;
-            }
-            if cqe.user_data != K_WAYLAND {
-                continue;
-            }
             // A poll completes with the events that are ready, or a negated
             // errno when the poll itself failed.
-            if cqe.res < 0 {
-                return Err(Error::from_errno(-cqe.res));
-            }
-            // Re-arm the one-shot poll for the next readiness.
-            ring.prep_poll_add(wl_fd, syscall::POLLIN as u32, K_WAYLAND)
-                .map_err(|_| arm_failed())?;
-            // Readiness means at least one message; drain them all.
-            loop {
-                match client.dispatch() {
-                    Ok(()) => {}
-                    Err(ref e) if e.would_block() => break,
-                    Err(e) => return Err(e),
+            match cqe.user_data {
+                K_WAYLAND => {
+                    if cqe.res < 0 {
+                        return Err(Error::from_errno(-cqe.res));
+                    }
+                    ring.prep_poll_add(wl_fd, syscall::POLLIN as u32, K_WAYLAND)
+                        .map_err(|_| arm_failed())?;
+                    readable = true;
                 }
+                K_OUTPUT => {
+                    output_armed = false;
+                    if cqe.res < 0 {
+                        return Err(Error::from_errno(-cqe.res));
+                    }
+                    client.socket.flush()?;
+                }
+                // The paste's pipe is read below, every turn; its poll only
+                // wakes the loop.
+                tag if tag == K_PASTE | client.paste_serial => paste_armed = None,
+                // An earlier paste's poll, completing after its paste ended.
+                _ => {}
             }
+        }
+        if readable {
+            input_pending = dispatch_some(client)?;
         }
         client.process_key_repeat();
         client.advance_paste();
@@ -550,6 +559,19 @@ fn event_loop(
         client.socket.flush()?;
     }
     Ok(())
+}
+
+/// Handle the messages that have arrived, up to DISPATCH_BUDGET of them. True
+/// when the budget ran out with more waiting.
+fn dispatch_some(client: &mut Client) -> Result<bool> {
+    for _ in 0..DISPATCH_BUDGET {
+        match client.dispatch() {
+            Ok(()) => {}
+            Err(ref e) if e.would_block() => return Ok(false),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
 }
 
 /// Launch whatever the input resolved to, and record an application launch as

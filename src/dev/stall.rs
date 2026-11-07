@@ -1050,6 +1050,7 @@ fn input_during_a_pointer_flood() -> String {
         syscall::poll(core::slice::from_mut(&mut pfd), 0);
         h.peer.read_available();
         h.peer.handle_requests();
+        h.peer.fire_frame_callbacks();
         if let Some((at, before)) = key_sent {
             if key_latency.is_none() && h.peer.commits.len() > before {
                 key_latency = Some(at.elapsed());
