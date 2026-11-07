@@ -17,8 +17,8 @@ use crate::platform::arena::{ArrayString, ArrayVec};
 use crate::platform::env;
 use crate::platform::error::{Error, Result};
 use crate::platform::syscall::{
-    self, pollfd, sockaddr_un, Fd, RawFd, AF_UNIX, EAGAIN, EINTR, F_GETFL, F_SETFL, O_NONBLOCK,
-    POLLIN, POLLOUT, SOCK_CLOEXEC, SOCK_STREAM,
+    self, pollfd, sockaddr_un, Fd, RawFd, AF_UNIX, EAGAIN, EINTR, F_DUPFD_CLOEXEC, F_GETFL,
+    F_SETFL, O_NONBLOCK, POLLIN, SOCK_CLOEXEC, SOCK_STREAM,
 };
 use crate::platform::wire::{self, Arg, Message, HEADER_SIZE, MSG_BODY_CAP};
 
@@ -40,14 +40,23 @@ const OUT_CAP: usize = 8 * 1024;
 const REQUEST_CAP: usize = 1024;
 /// Most received fds awaiting consumption at once.
 const MAX_RECV_FDS: usize = 16;
+/// Most fds queued to send at once. Each rides with one request: a frame
+/// pool's memfd or a paste's pipe, a few at a time at most.
+const MAX_OUT_FDS: usize = 8;
 /// How long to wait for the compositor's parting words after a failed send.
 const DIAGNOSE_TIMEOUT_MS: i32 = 200;
 
 /// A connection to the compositor.
 pub struct Connection {
     fd: RawFd,
-    /// Requests buffered since the last flush.
+    /// Requests not yet written to the socket. The bytes before out_pos have
+    /// gone; the rest wait for the socket to take them, whole and in order.
     out: ArrayVec<u8, OUT_CAP>,
+    out_pos: usize,
+    /// Fds waiting to go, each with the offset in out of the request that
+    /// declares it. An fd is sent with the first byte of its request, so a
+    /// write starts at one fd's request and stops short of the next one's.
+    out_fds: ArrayVec<(usize, Fd), MAX_OUT_FDS>,
     in_buf: ArrayVec<u8, RECV_CAP>,
     /// Landing buffer for one recvmsg, holding one whole acceptable message.
     /// Owned by the connection and zeroed once at connect: a local of this size
@@ -122,6 +131,8 @@ impl Connection {
         Ok(Self {
             fd,
             out: ArrayVec::new(),
+            out_pos: 0,
+            out_fds: ArrayVec::new(),
             in_buf: ArrayVec::new(),
             chunk: [0; MAX_ACCEPTED],
             in_pos: 0,
@@ -140,6 +151,8 @@ impl Connection {
         let conn = Self {
             fd: fds[0],
             out: ArrayVec::new(),
+            out_pos: 0,
+            out_fds: ArrayVec::new(),
             in_buf: ArrayVec::new(),
             chunk: [0; MAX_ACCEPTED],
             in_pos: 0,
@@ -156,12 +169,16 @@ impl Connection {
 
     /// Queue a request for the next flush.
     pub fn request(&mut self, object: u32, opcode: u16, args: &[Arg]) -> Result<()> {
-        wire::encode(&mut self.out, object, opcode, args)
+        if wire::encode(&mut self.out, object, opcode, args).is_err() {
+            self.compact_out();
+            wire::encode(&mut self.out, object, opcode, args)?;
+        }
+        Ok(())
     }
 
-    /// Send everything queued so far, then send one request carrying fds as
-    /// ancillary data. Flushing first keeps the fds attached to the request that
-    /// declares them, with no earlier bytes riding along.
+    /// Queue a request that carries fds as ancillary data. Each fd is
+    /// duplicated, so the caller's copy may close at once; the queue's copy
+    /// closes once it has gone.
     pub fn request_with_fd(
         &mut self,
         object: u32,
@@ -169,87 +186,103 @@ impl Connection {
         args: &[Arg],
         fds: &[RawFd],
     ) -> Result<()> {
-        self.flush()?;
-
+        if self.out_fds.len() + fds.len() > MAX_OUT_FDS {
+            return Err(Error::msg("too many fds queued for the compositor"));
+        }
         let mut msg: ArrayVec<u8, REQUEST_CAP> = ArrayVec::new();
         wire::encode(&mut msg, object, opcode, args)?;
-
-        let sent = loop {
-            let r = syscall::send_with_fds(self.fd, &msg, fds);
-            if r >= 0 {
-                break r as usize;
+        let mut dups: ArrayVec<Fd, MAX_OUT_FDS> = ArrayVec::new();
+        for &fd in fds {
+            let dup = syscall::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+            if dup < 0 {
+                return Err(Error::from_errno(-dup));
             }
-            match -r as i32 {
-                EINTR => continue,
-                EAGAIN => {
-                    self.wait_writable()?;
-                    continue;
-                }
-                e => return Err(self.diagnose_send_error(Error::from_errno(e))),
-            }
-        };
+            let _ = dups.push(Fd::new(dup));
+        }
 
-        // The fds ride with the first byte, so any remainder is plain data. Push
-        // it through the buffered path, which knows how to finish a short write.
-        if sent < msg.len() {
-            self.out
-                .extend_from_slice(&msg[sent..])
-                .map_err(|_| Error::msg("wayland send buffer full"))?;
-            self.flush()?;
+        if self.out.remaining() < msg.len() {
+            self.compact_out();
+        }
+        let offset = self.out.len();
+        self.out
+            .extend_from_slice(&msg)
+            .map_err(|_| Error::msg("wayland send buffer full"))?;
+        while let Some(fd) = dups.remove(0) {
+            let _ = self.out_fds.push((offset, fd));
         }
         Ok(())
     }
 
-    /// Write every queued request to the socket.
-    ///
-    /// A partial write followed by EAGAIN is the case this exists for. The
-    /// socket is non-blocking, so a compositor that is slow to drain its end
-    /// leaves half a request in flight; returning an error there would strand
-    /// the tail and the next request would be appended straight onto it, which
-    /// the compositor reads as a corrupt stream and kills the connection over.
-    /// Wait for the socket to become writable and finish the job.
+    /// Whether requests are still waiting for the socket to take them.
+    pub fn has_pending_output(&self) -> bool {
+        self.out_pos < self.out.len()
+    }
+
+    /// Write as much of the queue as the socket takes without waiting. What it
+    /// cannot take stays queued, whole and in order, and the next flush picks
+    /// up where this one stopped; the event loop calls it again once the socket
+    /// is writable. On a blocking socket, as during bring-up, the send waits
+    /// instead, and the queue is empty when this returns.
     pub fn flush(&mut self) -> Result<()> {
-        let mut sent = 0;
-        while sent < self.out.len() {
-            let r = syscall::send_with_fds(self.fd, &self.out[sent..], &[]);
-            if r >= 0 {
-                sent += r as usize;
+        while self.out_pos < self.out.len() {
+            let pos = self.out_pos;
+            let riding = self
+                .out_fds
+                .iter()
+                .take_while(|(offset, _)| *offset == pos)
+                .count();
+            let end = self
+                .out_fds
+                .iter()
+                .map(|(offset, _)| *offset)
+                .find(|&offset| offset > pos)
+                .unwrap_or(self.out.len());
+            let mut fds: ArrayVec<RawFd, MAX_OUT_FDS> = ArrayVec::new();
+            for (_, fd) in &self.out_fds.as_slice()[..riding] {
+                let _ = fds.push(fd.as_raw_fd());
+            }
+
+            let r = syscall::send_with_fds(self.fd, &self.out[pos..end], fds.as_slice());
+            if r > 0 {
+                self.out_pos += r as usize;
+                // The fds went with the first byte; the queue's copies close.
+                for _ in 0..riding {
+                    self.out_fds.remove(0);
+                }
                 continue;
             }
             match -r as i32 {
                 EINTR => continue,
-                EAGAIN => self.wait_writable()?,
+                EAGAIN => return Ok(()),
                 e => {
                     // The connection is dead; drop the queue rather than let a
                     // later flush resend a fragment of it.
                     self.out.clear();
+                    self.out_pos = 0;
+                    self.out_fds.clear();
                     return Err(self.diagnose_send_error(Error::from_errno(e)));
                 }
             }
         }
         self.out.clear();
+        self.out_pos = 0;
         Ok(())
     }
 
-    /// Block until the socket can take more bytes. Only reached mid-write, when
-    /// the compositor's receive buffer is full, which is exactly when a blocking
-    /// socket would have parked in write anyway.
-    fn wait_writable(&self) -> Result<()> {
-        let mut pfd = pollfd {
-            fd: self.fd,
-            events: POLLOUT,
-            revents: 0,
-        };
-        loop {
-            let r = syscall::poll(core::slice::from_mut(&mut pfd), -1);
-            if r == -(EINTR as isize) {
-                continue;
-            }
-            if r < 0 {
-                return Err(Error::from_errno(-r as i32));
-            }
-            return Ok(());
+    /// Move the unsent tail of the output queue to the front, reclaiming the
+    /// room the sent part took.
+    fn compact_out(&mut self) {
+        let pos = self.out_pos;
+        if pos == 0 {
+            return;
         }
+        let len = self.out.len();
+        self.out.as_mut_slice().copy_within(pos..len, 0);
+        self.out.truncate(len - pos);
+        for (offset, _) in self.out_fds.as_mut_slice() {
+            *offset -= pos;
+        }
+        self.out_pos = 0;
     }
 
     /// A send failed, typically with EPIPE: the compositor closed the socket. On
@@ -601,18 +634,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_flush_finishes_a_write_the_socket_could_not_take_at_once() {
-        // On a non-blocking socket a write can take some bytes and then say
-        // EAGAIN. Reporting that as an error would strand the tail of a half-sent
-        // request, and the next request would be appended straight onto the
-        // fragment, which the compositor reads as a corrupt stream. So the flush
-        // has to wait for the socket and finish what it started.
-        let (mut conn, peer) = Connection::pair();
-        conn.set_nonblocking(true).expect("nonblocking");
-
-        // Stuff the socket until the kernel will not take another byte, so the
-        // flush below is guaranteed to meet EAGAIN rather than merely risk it.
+    /// Fill the socket from the connection's side until the kernel takes no
+    /// more, so the next flush is sure to meet EAGAIN. Returns the bytes sent.
+    fn stuff(conn: &Connection) -> usize {
         let stuffing = [b'.'; 4096];
         let mut prefill = 0usize;
         loop {
@@ -624,42 +648,106 @@ mod tests {
             prefill += n as usize;
         }
         assert!(prefill > 0, "the socket took nothing at all");
+        prefill
+    }
 
-        // Now queue a real request. Its first send cannot make any progress.
+    #[test]
+    fn a_flush_the_socket_cannot_take_keeps_the_rest_whole_for_the_next() {
+        // On a non-blocking socket a write can take some bytes and then say
+        // EAGAIN. The tail stays queued and the next flush sends it, so the
+        // compositor never reads a request spliced into another, and the flush
+        // returns rather than wait for the compositor to read.
+        let (mut conn, peer) = Connection::pair();
+        conn.set_nonblocking(true).expect("nonblocking");
+        let prefill = stuff(&conn);
+
         conn.request(7, proto::wl_surface::COMMIT, &[])
             .expect("queue");
-        let request_len = conn.out.len();
+        conn.flush().expect("a full socket is not an error");
+        assert!(conn.has_pending_output(), "the request waits for room");
 
-        // The peer starts reading, which is what eventually makes the socket
-        // writable again. flush has to wait for that instead of giving up.
-        let peer_fd = peer.as_raw_fd();
-        let expected = prefill + request_len;
-        let reader = std::thread::spawn(move || {
-            let mut seen = Vec::new();
-            let mut chunk = [0u8; 4096];
-            while seen.len() < expected {
-                let n = syscall::read_fd(peer_fd, &mut chunk);
-                if n <= 0 {
-                    break;
-                }
-                seen.extend_from_slice(&chunk[..n as usize]);
-            }
-            seen
-        });
+        let mut seen = Vec::new();
+        while seen.len() < prefill + 8 {
+            seen.extend_from_slice(&drain(&peer));
+            conn.flush().expect("flush");
+        }
+        assert!(!conn.has_pending_output());
+        assert_eq!(seen.len(), prefill + 8, "every byte arrived once");
 
-        conn.flush()
-            .expect("flush completes across the would-block");
-        assert!(conn.out.is_empty());
-
-        let seen = reader.join().expect("reader");
-        assert_eq!(seen.len(), expected, "every byte arrived");
-
-        // The request is whole and sits after the stuffing, not spliced into it.
+        // The request is whole and sits after the stuffing.
         let tail = &seen[prefill..];
         let (object, opcode, size) = wire::parse_header(tail).expect("header");
         assert_eq!((object, opcode, size), (7, proto::wl_surface::COMMIT, 8));
-        assert_eq!(size, tail.len());
+    }
 
-        core::mem::forget(peer); // the reader thread owns the fd now
+    #[test]
+    fn an_fd_waits_in_the_queue_with_its_request() {
+        // A request carrying an fd, queued behind bytes the socket cannot take
+        // yet. The fd has to reach the compositor with that request, not ride
+        // along with an earlier one or come after it, and the queue's copy has
+        // to close once it has gone.
+        let (mut conn, peer) = Connection::pair();
+        conn.set_nonblocking(true).expect("nonblocking");
+        let prefill = stuff(&conn);
+
+        let mut pipe = [0i32; 2];
+        assert_eq!(syscall::pipe2(&mut pipe, syscall::O_CLOEXEC), 0);
+        let (read_end, write_end) = (Fd::new(pipe[0]), Fd::new(pipe[1]));
+        conn.request(7, proto::wl_surface::COMMIT, &[])
+            .expect("queue");
+        conn.request_with_fd(
+            9,
+            proto::wl_data_offer::RECEIVE,
+            &[Arg::Str("text/plain")],
+            &[write_end.as_raw_fd()],
+        )
+        .expect("queue with fd");
+        drop(write_end);
+        conn.request(7, proto::wl_surface::COMMIT, &[])
+            .expect("queue");
+        conn.flush().expect("flush");
+        assert!(conn.has_pending_output());
+
+        // Read until everything is in, noting the span of each read and which
+        // one brought the fd.
+        let receive_at = prefill + 8;
+        let mut total = 0usize;
+        let mut chunk = [0u8; 4096];
+        let mut received: Option<(usize, usize, Fd)> = None;
+        while total < prefill || conn.has_pending_output() || !drain_done(&peer) {
+            let mut fds: ArrayVec<Fd, MAX_RECV_FDS> = ArrayVec::new();
+            let n = syscall::recv_with_fds(peer.as_raw_fd(), &mut chunk, &mut fds).expect("recv");
+            if n > 0 {
+                if let Some(fd) = fds.remove(0) {
+                    assert!(received.is_none(), "one fd was sent");
+                    received = Some((total, total + n as usize, fd));
+                }
+                total += n as usize;
+            }
+            conn.flush().expect("flush");
+        }
+        let (from, to, fd) = received.expect("the fd arrived");
+        assert!(
+            from <= receive_at && receive_at < to,
+            "the fd came with bytes {from}..{to}, its request starts at {receive_at}"
+        );
+
+        // It is the pipe's write end, and the queue kept no copy of it: once the
+        // received one closes, the pipe reads end-of-file.
+        assert_eq!(syscall::write_fd(fd.as_raw_fd(), b"k"), 1);
+        drop(fd);
+        let mut got = [0u8; 2];
+        assert_eq!(syscall::read_fd(read_end.as_raw_fd(), &mut got), 1);
+        assert_eq!(syscall::read_fd(read_end.as_raw_fd(), &mut got), 0);
+    }
+
+    /// Whether the peer has nothing left to read right now.
+    fn drain_done(peer: &Fd) -> bool {
+        let mut pfd = pollfd {
+            fd: peer.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        };
+        syscall::poll(core::slice::from_mut(&mut pfd), 0) == 0
     }
 }

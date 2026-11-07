@@ -17,12 +17,15 @@ use crate::{cache, config, denylist, font, launch, ui};
 const CURSOR_BLINK_MS: u64 = 530;
 
 /// Submission-queue depth for the event-loop ring. A few polls are in flight
-/// at a time, each re-armed as it fires: the socket and a paste's pipe, plus a
-/// finished paste's poll that has yet to complete.
+/// at a time, each re-armed as it fires: the socket for reading and, while
+/// requests are backed up, for writing; a paste's pipe; and a finished paste's
+/// poll that has yet to complete.
 const RING_ENTRIES: u32 = 32;
 
-/// io_uring user_data of the socket poll.
+/// io_uring user_data of the socket's read poll.
 const K_WAYLAND: u64 = 1;
+/// io_uring user_data of the socket's write poll.
+const K_OUTPUT: u64 = 2;
 /// io_uring user_data of a paste pipe's poll: this tag, ored with the paste's
 /// serial, so a poll left over from a finished paste is told apart from the
 /// current one's.
@@ -388,9 +391,18 @@ fn event_loop(
         .map_err(|_| arm_failed())?;
     // The serial of the paste whose pipe has a poll in flight.
     let mut paste_armed: Option<u64> = None;
+    let mut output_armed = false;
 
     // Event loop
     while client.running {
+        // Requests the socket could not take wait for it to have room. The loop
+        // goes on handling input meanwhile; nothing waits on the compositor.
+        if client.socket.has_pending_output() && !output_armed {
+            ring.prep_poll_add(wl_fd, syscall::POLLOUT as u32, K_OUTPUT)
+                .map_err(|_| arm_failed())?;
+            output_armed = true;
+        }
+
         // Watch a pending paste's pipe. A poll is armed once per readiness, and
         // its completion clears the mark so the next turn arms it again.
         if let Some(paste) = &client.paste {
@@ -416,6 +428,14 @@ fn event_loop(
         while let Some(cqe) = ring.next_cqe() {
             if cqe.user_data == K_PASTE | client.paste_serial {
                 paste_armed = None;
+            }
+            if cqe.user_data == K_OUTPUT {
+                output_armed = false;
+                if cqe.res < 0 {
+                    return Err(Error::from_errno(-cqe.res));
+                }
+                client.socket.flush()?;
+                continue;
             }
             if cqe.user_data != K_WAYLAND {
                 continue;
@@ -525,6 +545,9 @@ fn event_loop(
         {
             needs_paint = false;
         }
+
+        // Send what this turn queued, as far as the socket takes it.
+        client.socket.flush()?;
     }
     Ok(())
 }

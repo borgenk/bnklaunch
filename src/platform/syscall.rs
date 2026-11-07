@@ -201,6 +201,8 @@ pub const F_SETFL: i32 = 4;
 /// hands back a descriptor that openat's O_CLOEXEC cannot reach, so its
 /// close-on-exec is set after the fact.
 pub const F_SETFD: i32 = 2;
+/// fcntl command: duplicate an fd onto the lowest free number, close-on-exec.
+pub const F_DUPFD_CLOEXEC: i32 = 1030;
 pub const FD_CLOEXEC: i32 = 1;
 
 /// A Unix-domain socket address. sun_path holds the filesystem path, and the
