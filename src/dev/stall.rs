@@ -44,9 +44,6 @@ const CTRL_MASK: u32 = 1 << 2;
 
 const TEXT_MIME: &str = "text/plain;charset=utf-8";
 
-/// wl_surface.frame, which the launcher does not send yet.
-const SURFACE_FRAME: u16 = 3;
-
 /// Ids the compositor allocates start here.
 const SERVER_ID_BASE: u32 = 0xff00_0000;
 
@@ -359,7 +356,7 @@ impl Peer {
                 let buffer = r.u32().expect("buffer");
                 self.attached = (buffer != 0).then_some(buffer);
             }
-            (Kind::Surface, SURFACE_FRAME) => {
+            (Kind::Surface, proto::wl_surface::FRAME) => {
                 self.frame_callbacks.push(r.u32().expect("callback"));
             }
             (Kind::Surface, proto::wl_surface::COMMIT) => self.commit(),

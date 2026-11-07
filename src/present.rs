@@ -37,8 +37,11 @@ pub struct Surface {
     pub id: u32,
     pub layer_surface_id: u32,
     pub configured: bool,
+    /// The size the last configure gave, which is what frames are drawn at.
     pub width: u32,
     pub height: u32,
+    /// The size last asked for with set_size.
+    pub requested: (u32, u32),
 }
 
 /// One shared-memory frame, with the protocol objects that expose it.
@@ -152,6 +155,7 @@ impl Present {
             configured: false,
             width,
             height,
+            requested: (width, height),
         });
         conn.flush()
     }
@@ -216,9 +220,34 @@ impl Present {
         })
     }
 
+    /// Make the next frame ready to draw into: reallocate the frames when a
+    /// configure has changed the surface's size, then say whether the next one
+    /// is free. Fresh frames always are, whatever the old ones' state.
+    pub fn prepare_frame(
+        &mut self,
+        conn: &mut Connection,
+        next_id: &mut impl FnMut() -> u32,
+        shm_id: u32,
+    ) -> Result<bool> {
+        if self.frames_stale() {
+            self.resize_frames(conn, next_id, shm_id)?;
+        }
+        Ok(self.ready())
+    }
+
+    /// Whether a configure has given the surface a size the frames were not
+    /// drawn at, so the picture on screen is out of date.
+    pub fn frames_stale(&self) -> bool {
+        let Some(size) = self.size() else {
+            return false;
+        };
+        self.frames
+            .first()
+            .is_some_and(|f| (f.pixels.width, f.pixels.height) != size)
+    }
+
     /// Whether the next frame to draw into is free. False means the compositor
-    /// is still holding both, and the caller has to dispatch until it lets one
-    /// go.
+    /// is still holding both, and the next one waits for a release.
     pub fn ready(&self) -> bool {
         match self.frames.get(self.current) {
             Some(frame) => !frame.held,
@@ -242,8 +271,9 @@ impl Present {
             .map(|f| &mut f.pixels)
     }
 
-    /// Show the frame just drawn, and turn to the other one for the next.
-    pub fn commit(&mut self, conn: &mut Connection) -> Result<()> {
+    /// Show the frame just drawn with a frame callback, the compositor's signal
+    /// that it is ready for the next, and turn to the other frame.
+    pub fn commit(&mut self, conn: &mut Connection, frame_callback: u32) -> Result<()> {
         let (surface_id, width, height) = {
             let surface = self
                 .surface
@@ -259,6 +289,11 @@ impl Present {
             .map(|f| f.buffer_id)
             .ok_or_else(|| Error::msg("no frame to commit"))?;
 
+        conn.request(
+            surface_id,
+            proto::wl_surface::FRAME,
+            &[Arg::NewId(frame_callback)],
+        )?;
         conn.request(
             surface_id,
             proto::wl_surface::ATTACH,
@@ -303,7 +338,7 @@ impl Present {
 
     /// Retire every frame and allocate a fresh set at the new size. The old ones
     /// stay mapped until their release arrives.
-    pub fn resize_frames(
+    fn resize_frames(
         &mut self,
         conn: &mut Connection,
         next_id: &mut impl FnMut() -> u32,

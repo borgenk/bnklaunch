@@ -35,6 +35,7 @@ pub mod wl_compositor {
 pub mod wl_surface {
     pub const ATTACH: u16 = 1;
     pub const DAMAGE: u16 = 2;
+    pub const FRAME: u16 = 3;
     pub const COMMIT: u16 = 6;
 }
 

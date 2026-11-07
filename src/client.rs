@@ -200,6 +200,9 @@ pub struct Client {
     sync_callback: Option<u32>,
     /// Sync completed flag
     sync_done: bool,
+    /// The frame callback of the last frame shown, until the compositor says
+    /// it is time for the next one.
+    frame_callback: Option<u32>,
     /// Keyboard state
     pub keyboard: Keyboard,
     /// Key repeat state
@@ -237,6 +240,7 @@ impl Client {
             running: true,
             sync_callback: None,
             sync_done: false,
+            frame_callback: None,
             keyboard: Keyboard {
                 id: None,
                 focused: false,
@@ -314,6 +318,15 @@ impl Client {
     /// Handle a received message.
     fn handle_message(&mut self, msg: Message) -> Result<()> {
         let registry_id = self.bindings.registry;
+
+        // wl_callback.done for the last frame: the compositor is ready for the
+        // next one.
+        if Some(msg.object) == self.frame_callback {
+            if msg.opcode == proto::wl_callback::EV_DONE {
+                self.frame_callback = None;
+            }
+            return Ok(());
+        }
 
         // wl_callback.done (for sync)
         if Some(msg.object) == self.sync_callback {
@@ -894,50 +907,28 @@ impl Client {
             .create_frames(&mut self.socket, &mut || ids.allocate(), shm_id)
     }
 
-    /// Resize the layer surface. False when it was already that size, or when
-    /// the compositor closed it instead of acking.
-    pub fn resize_surface(&mut self, new_width: u32, new_height: u32) -> Result<bool> {
+    /// Ask for a new window size. The compositor answers with a configure in
+    /// its own time; frames keep the size they have until then, and the next
+    /// one drawn after it is allocated at the configured size.
+    pub fn request_size(&mut self, width: u32, height: u32) -> Result<()> {
         let surface = self
             .present
             .surface
             .as_mut()
             .ok_or_else(|| Error::msg("no surface"))?;
-
-        if surface.width == new_width && surface.height == new_height {
-            return Ok(false);
+        if surface.requested == (width, height) {
+            return Ok(());
         }
-
+        surface.requested = (width, height);
         let (layer_surface_id, surface_id) = (surface.layer_surface_id, surface.id);
-        surface.configured = false;
         self.socket.request(
             layer_surface_id,
             proto::zwlr_layer_surface_v1::SET_SIZE,
-            &[Arg::Uint(new_width), Arg::Uint(new_height)],
+            &[Arg::Uint(width), Arg::Uint(height)],
         )?;
         self.socket
             .request(surface_id, proto::wl_surface::COMMIT, &[])?;
-        self.socket.flush()?;
-
-        // The configure that answers this carries the size to draw at, so wait
-        // for it. Stop if the compositor closes the surface instead (which
-        // clears running), rather than block on a configure that never comes.
-        self.socket.set_nonblocking(false)?;
-        while self.running && !self.surface_configured() {
-            self.dispatch()?;
-        }
-        self.socket.set_nonblocking(true)?;
-        if !self.running {
-            return Ok(false);
-        }
-
-        let shm_id = self
-            .bindings
-            .shm
-            .ok_or_else(|| Error::msg("wl_shm not bound"))?;
-        let ids = &mut self.ids;
-        self.present
-            .resize_frames(&mut self.socket, &mut || ids.allocate(), shm_id)?;
-        Ok(true)
+        self.socket.flush()
     }
 
     pub fn surface_configured(&self) -> bool {
@@ -948,35 +939,31 @@ impl Client {
             .unwrap_or(false)
     }
 
-    /// Draw the next frame and show it.
-    ///
-    /// The compositor keeps reading a frame after the commit that showed it, so
-    /// the renderer draws into the other one. If it is still holding both, wait
-    /// for it to let one go rather than paint over what is on screen.
-    pub fn render(&mut self, draw: impl FnOnce(&mut Client)) -> Result<()> {
-        // Waiting for a release is a genuine block, so the socket goes blocking
-        // for the duration. The two fcntls sit outside the loop: each turn of it
-        // is one message, and a compositor holding both frames can take several.
-        if self.running && !self.present.ready() {
-            self.socket.set_nonblocking(false)?;
-            let waited = self.wait_for_free_frame();
-            self.socket.set_nonblocking(true)?;
-            waited?;
+    /// Draw the next frame and show it, if one can go now. It waits while the
+    /// compositor has not asked for the next frame yet, or holds both buffers;
+    /// the caller keeps the window marked for a repaint and tries again on a
+    /// later turn, once the frame callback or a release has come in. Returns
+    /// whether a frame went out.
+    pub fn paint(&mut self, draw: impl FnOnce(&mut Client)) -> Result<bool> {
+        if !self.running || self.frame_callback.is_some() {
+            return Ok(false);
         }
-        if !self.running {
-            return Ok(());
+        let shm_id = self
+            .bindings
+            .shm
+            .ok_or_else(|| Error::msg("wl_shm not bound"))?;
+        let ids = &mut self.ids;
+        let ready = self
+            .present
+            .prepare_frame(&mut self.socket, &mut || ids.allocate(), shm_id)?;
+        if !ready {
+            return Ok(false);
         }
         draw(self);
-        self.present.commit(&mut self.socket)
-    }
-
-    /// Dispatch until the frame to draw into comes free, or the surface goes
-    /// away. The caller puts the socket in blocking mode around this.
-    fn wait_for_free_frame(&mut self) -> Result<()> {
-        while self.running && !self.present.ready() {
-            self.dispatch()?;
-        }
-        Ok(())
+        let callback = self.ids.allocate();
+        self.present.commit(&mut self.socket, callback)?;
+        self.frame_callback = Some(callback);
+        Ok(true)
     }
 
     /// The pixels of the frame being drawn into.
@@ -1183,14 +1170,13 @@ mod tests {
         client.bindings.shm = Some(client.ids.allocate());
         client.create_layer_surface(64, 64).expect("layer surface");
         client.create_buffer().expect("frames");
-        client
-            .present
-            .commit(&mut client.socket)
-            .expect("first frame");
-        client
-            .present
-            .commit(&mut client.socket)
-            .expect("second frame");
+        for frame in ["first frame", "second frame"] {
+            let callback = client.ids.allocate();
+            client
+                .present
+                .commit(&mut client.socket, callback)
+                .expect(frame);
+        }
         assert!(!client.present.ready(), "the compositor holds both frames");
 
         let seat = client.ids.allocate();

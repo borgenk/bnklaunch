@@ -354,15 +354,11 @@ fn event_loop(
     // searches the catalog again.
     let (mut results, mut total_rows) =
         resolve_results(&last_query, search_enabled, &state.entries, &state.recents);
-    repaint(
-        client,
-        state,
-        &results,
-        font,
-        search_enabled,
-        theme,
-        cursor_visible,
-    )?;
+
+    // Whatever changes the picture marks it here, and the end of the turn paints
+    // it once, as soon as the compositor is ready for a frame. Until then the
+    // loop keeps handling input; the frame that goes out shows the latest state.
+    let mut needs_paint = true;
 
     // Non-blocking socket: a poll readiness wakeup then drains every queued
     // message in one pass without blocking on the final partial read.
@@ -448,9 +444,8 @@ fn event_loop(
         // Handle pointer clicks on a result row, and click/drag in the input box
         handle_pointer_input(client, &mut state.selected, font, total_rows);
 
-        // Repaint on any of three triggers: the input changed, the selection
-        // moved, or the caret blinked. They differ only in what they settle
-        // first; the drawing itself is one path.
+        // Three things change the picture: the input, the selection, and the
+        // caret blink. They differ only in what they settle first.
         if client.input_changed {
             client.input_changed = false;
             // Activity keeps the caret solid; restart the blink from now.
@@ -472,32 +467,24 @@ fn event_loop(
             }
 
             // The window grows and shrinks with the row count.
-            client.resize_surface(WINDOW_WIDTH, calculate_height(total_rows))?;
-            repaint(
-                client,
-                state,
-                &results,
-                font,
-                search_enabled,
-                theme,
-                cursor_visible,
-            )?;
+            client.request_size(WINDOW_WIDTH, calculate_height(total_rows))?;
+            needs_paint = true;
         } else if selection_moved {
             // The highlight moved. The caret keeps its phase and the window its
             // size, so navigation does not disturb the blink.
-            repaint(
-                client,
-                state,
-                &results,
-                font,
-                search_enabled,
-                theme,
-                cursor_visible,
-            )?;
+            needs_paint = true;
         } else if last_blink.elapsed_ms() >= CURSOR_BLINK_MS {
             cursor_visible = !cursor_visible;
             last_blink = Instant::now();
-            repaint(
+            needs_paint = true;
+        }
+        // A configure that changed the size wants the picture at the new one.
+        if client.present.frames_stale() {
+            needs_paint = true;
+        }
+
+        if needs_paint
+            && repaint(
                 client,
                 state,
                 &results,
@@ -505,7 +492,9 @@ fn event_loop(
                 search_enabled,
                 theme,
                 cursor_visible,
-            )?;
+            )?
+        {
+            needs_paint = false;
         }
     }
     Ok(())
@@ -556,7 +545,8 @@ fn dispatch_launch(
     }
 }
 
-/// Draw the given rows into the next frame and show it.
+/// Draw the given rows into the next frame and show it, when one can go.
+/// Returns whether it did.
 fn repaint(
     client: &mut Client,
     state: &AppState,
@@ -565,14 +555,14 @@ fn repaint(
     search_enabled: bool,
     theme: &Theme,
     cursor_visible: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let text = client.editor.text_owned();
     let caret = ui::Caret {
         offset: client.editor.cursor(),
         selection: client.editor.selection(),
         visible: cursor_visible,
     };
-    client.render(|client| {
+    client.paint(|client| {
         let Some(pixels) = client.pixels() else {
             return;
         };
