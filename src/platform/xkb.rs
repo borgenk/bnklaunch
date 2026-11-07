@@ -31,6 +31,7 @@ pub mod keycode {
     pub const KEY_RIGHTSHIFT: u32 = 54;
     pub const KEY_LEFTALT: u32 = 56;
     pub const KEY_CAPSLOCK: u32 = 58;
+    pub const KEY_KPENTER: u32 = 96;
     pub const KEY_RIGHTCTRL: u32 = 97;
     pub const KEY_RIGHTALT: u32 = 100;
     pub const KEY_HOME: u32 = 102;

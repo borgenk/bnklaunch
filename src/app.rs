@@ -78,7 +78,7 @@ pub(crate) fn key_action(xkb: &Xkb, keycode: u32) -> KeyAction {
         // A modifier on its own is not an action.
         KEY_LEFTSHIFT | KEY_RIGHTSHIFT | KEY_LEFTCTRL | KEY_RIGHTCTRL | KEY_LEFTALT
         | KEY_RIGHTALT | KEY_CAPSLOCK => return KeyAction::None,
-        KEY_ENTER => return KeyAction::Enter,
+        KEY_ENTER | KEY_KPENTER => return KeyAction::Enter,
         KEY_ESC => return KeyAction::Escape,
         KEY_TAB => return KeyAction::Tab,
         KEY_BACKSPACE => return KeyAction::Backspace,
@@ -824,6 +824,9 @@ mod tests {
     fn the_editing_keys_are_read_off_the_physical_keycode() {
         let xkb = Xkb::new().expect("xkb context");
         assert_eq!(key_action(&xkb, keycode::KEY_ENTER), KeyAction::Enter);
+        // The keypad's Enter launches too; through the layout it would type a
+        // carriage return, which text input drops.
+        assert_eq!(key_action(&xkb, keycode::KEY_KPENTER), KeyAction::Enter);
         assert_eq!(key_action(&xkb, keycode::KEY_ESC), KeyAction::Escape);
         assert_eq!(
             key_action(&xkb, keycode::KEY_BACKSPACE),
