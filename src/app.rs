@@ -270,9 +270,24 @@ pub(crate) fn run() -> Result<()> {
 
     let mut state = AppState::new(entries, recents);
 
-    // Connect to compositor
     let mut client = Client::connect()?;
+    run_window(&mut client, &mut state, &font, search_enabled, &cfg.theme)?;
 
+    if client.pending_action == PendingAction::Launch {
+        dispatch_launch(&client, &mut state, &cfg, recents_offset, search_enabled);
+    }
+    Ok(())
+}
+
+/// Bring the launcher window up on a connected client and run it until
+/// something dismisses it.
+pub(crate) fn run_window(
+    client: &mut Client,
+    state: &mut AppState,
+    font: &font::Font,
+    search_enabled: bool,
+    theme: &Theme,
+) -> Result<()> {
     // Initialize and get registry
     client.init()?;
     client.roundtrip()?;
@@ -311,12 +326,7 @@ pub(crate) fn run() -> Result<()> {
     // Wait for input devices
     client.roundtrip()?;
 
-    event_loop(&mut client, &mut state, &font, search_enabled, &cfg.theme)?;
-
-    if client.pending_action == PendingAction::Launch {
-        dispatch_launch(&client, &mut state, &cfg, recents_offset, search_enabled);
-    }
-    Ok(())
+    event_loop(client, state, font, search_enabled, theme)
 }
 
 /// How long to park before the loop next has something to do. Only a held key

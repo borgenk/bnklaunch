@@ -223,7 +223,11 @@ pub struct Client {
 impl Client {
     /// Connect to the Wayland compositor.
     pub fn connect() -> Result<Self> {
-        let socket = Connection::connect()?;
+        Self::over(Connection::connect()?)
+    }
+
+    /// A client on an open connection that has sent nothing yet.
+    pub fn over(socket: Connection) -> Result<Self> {
         Ok(Self {
             socket,
             ids: IdAllocator::new(),
@@ -991,30 +995,7 @@ mod tests {
     /// back so the test can play compositor.
     fn test_client() -> (Client, Fd) {
         let (socket, peer) = Connection::pair();
-        let client = Client {
-            socket,
-            ids: IdAllocator::new(),
-            globals: ArrayVec::new(),
-            bindings: Bindings::default(),
-            present: Present::new(),
-            running: true,
-            sync_callback: None,
-            sync_done: false,
-            keyboard: Keyboard {
-                id: None,
-                focused: false,
-                xkb: Xkb::new().expect("xkb context"),
-            },
-            key_repeat: KeyRepeat::default(),
-            pointer: Pointer::default(),
-            editor: Editor::new(),
-            clipboard_op: clipboard::Op::None,
-            clipboard: Clipboard::default(),
-            last_serial: 0,
-            input_changed: false,
-            pending_action: PendingAction::None,
-        };
-        (client, peer)
+        (Client::over(socket).expect("client"), peer)
     }
 
     /// An event for an object, carrying the given u32 arguments.

@@ -1,6 +1,6 @@
 .PHONY: fmt fmt-check clippy build build-release build-small build-linux install \
-	run test perf perf-update scan-bench screenshot frame-update test-install \
-	test-abi flatpak flatpak-lint check bump clean
+	run test perf perf-update scan-bench stall-report screenshot frame-update \
+	test-install test-abi flatpak flatpak-lint check bump clean
 
 APP_NAME := bnklaunch
 APP_ID := io.github.borgenk.BnkLaunch
@@ -133,6 +133,11 @@ perf-update:
 # is installed here.
 scan-bench:
 	$(TEST_ENV) cargo test --profile perf -- --ignored --nocapture --test-threads=1 startup_stages
+
+# The ways the UI can stall, each provoked through a fake compositor while the
+# real event loop runs. Prints, never fails. Needs a kernel that allows io_uring.
+stall-report:
+	$(TEST_ENV) cargo test -- --ignored --nocapture --test-threads=1 stall_report
 
 # Paint the scene in src/dev/screenshot.rs with the font this machine would use and
 # write it to assets/screenshot.png, which is the image in the README.
