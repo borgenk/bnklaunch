@@ -631,6 +631,8 @@ struct Harness {
     peer: Peer,
     outcome: mpsc::Receiver<Outcome>,
     thread: &'static str,
+    /// From starting the launcher to its first frame.
+    first_frame: Duration,
 }
 
 impl Harness {
@@ -642,6 +644,7 @@ impl Harness {
         let (socket, peer_fd) = Connection::pair();
         prepare(&socket);
         let (tx, outcome) = mpsc::channel();
+        let started = Instant::now();
         std::thread::Builder::new()
             .name(thread.to_string())
             .spawn(move || {
@@ -682,11 +685,13 @@ impl Harness {
                 peer.closed
             );
         }
+        let first_frame = peer.commits[0] - started;
         peer.pump_for(Duration::from_millis(50));
         Harness {
             peer,
             outcome,
             thread,
+            first_frame,
         }
     }
 
@@ -1106,6 +1111,20 @@ fn frames_during_a_drag() -> String {
     format!("{frames} frames in one second of dragging{}", ended(&out))
 }
 
+/// The first frame, from starting the launcher. Bring-up against the fake
+/// compositor takes a few milliseconds, so anything near the caret's blink
+/// interval is the loop waiting before it paints.
+fn first_frame() -> String {
+    let h = Harness::start("stall-first");
+    let first = h.first_frame;
+    let out = h.finish();
+    format!(
+        "first frame {} ms after start{}",
+        first.as_millis(),
+        ended(&out)
+    )
+}
+
 /// Wakeups while nothing happens.
 fn wakeups_while_idle() -> String {
     let mut h = Harness::start("stall-idle");
@@ -1130,7 +1149,8 @@ type Scenario = (&'static str, fn() -> String);
 #[test]
 #[ignore]
 fn stall_report() {
-    let scenarios: [Scenario; 9] = [
+    let scenarios: [Scenario; 10] = [
+        ("startup", first_frame),
         ("paste, owner never writes", paste_from_a_silent_owner),
         ("paste, owner trickles", paste_from_a_trickling_owner),
         ("copy, requester's pipe full", copy_to_a_full_pipe),

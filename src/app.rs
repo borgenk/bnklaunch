@@ -368,13 +368,13 @@ fn event_loop(
     let (mut results, mut total_rows) =
         resolve_results(&last_query, search_enabled, &state.entries, &state.recents);
 
-    // Whatever changes the picture marks it here, and the end of the turn paints
-    // it once, as soon as the compositor is ready for a frame. Until then the
-    // loop keeps handling input; the frame that goes out shows the latest state.
+    // Whatever changes the picture marks it here, and the next turn paints it
+    // once, as soon as the compositor is ready for a frame. Until then the loop
+    // keeps handling input; the frame that goes out shows the latest state.
     let mut needs_paint = true;
 
-    // Non-blocking socket: a poll readiness wakeup then drains every queued
-    // message in one pass without blocking on the final partial read.
+    // Non-blocking socket: a readiness wakeup reads what has arrived without
+    // blocking on the final partial read, and a flush sends what fits.
     client.socket.set_nonblocking(true)?;
 
     // Drive the loop with io_uring. A one-shot poll on the Wayland socket wakes
@@ -402,6 +402,24 @@ fn event_loop(
 
     // Event loop
     while client.running {
+        // Paint what the last turn changed, if the compositor is ready for a
+        // frame, then send what is queued, as far as the socket takes it. The
+        // first turn paints the opening frame this way, before any wait.
+        if needs_paint
+            && repaint(
+                client,
+                state,
+                &results,
+                font,
+                search_enabled,
+                theme,
+                cursor_visible,
+            )?
+        {
+            needs_paint = false;
+        }
+        client.socket.flush()?;
+
         // Requests the socket could not take wait for it to have room. The loop
         // goes on handling input meanwhile; nothing waits on the compositor.
         if client.socket.has_pending_output() && !output_armed {
@@ -540,23 +558,6 @@ fn event_loop(
         if client.present.frames_stale() {
             needs_paint = true;
         }
-
-        if needs_paint
-            && repaint(
-                client,
-                state,
-                &results,
-                font,
-                search_enabled,
-                theme,
-                cursor_visible,
-            )?
-        {
-            needs_paint = false;
-        }
-
-        // Send what this turn queued, as far as the socket takes it.
-        client.socket.flush()?;
     }
     Ok(())
 }
