@@ -11,7 +11,6 @@
 //! assembly plus the few wrappers that still hand back a raw pointer or a
 //! mapping.
 
-#![allow(dead_code)]
 #![allow(non_camel_case_types)]
 
 use crate::platform::arena::ArrayVec;
@@ -110,6 +109,7 @@ mod nr {
     pub const RT_SIGPROCMASK: usize = 14;
     pub const CLOSE_RANGE: usize = 436;
     pub const PIPE2: usize = 293;
+    #[cfg(test)]
     pub const SOCKETPAIR: usize = 53;
 }
 
@@ -140,10 +140,6 @@ pub const EINTR: i32 = 4;
 
 /// errno returned by a non-blocking read with no data available; retry it.
 pub const EAGAIN: i32 = 11;
-
-/// errno for a write whose reader has hung up. Reachable only because SIGPIPE
-/// is ignored; its default action would have killed the process first.
-pub const EPIPE: i32 = 32;
 
 /// errno returned by mkdir when the directory already exists; not an error for
 /// a make-parents walk.
@@ -224,11 +220,6 @@ pub const IORING_ENTER_GETEVENTS: u32 = 1;
 /// rings share one mapping, so only the SQE array needs a second mmap.
 pub const IORING_FEAT_SINGLE_MMAP: u32 = 1;
 
-/// Completion flag: more completions will follow for this submission, so a
-/// multishot op stays armed. When it is clear, the op ended and must be
-/// re-armed to keep firing.
-pub const IORING_CQE_F_MORE: u32 = 1 << 1;
-
 // io_uring operation codes used here.
 pub const IORING_OP_NOP: u8 = 0;
 pub const IORING_OP_POLL_ADD: u8 = 6;
@@ -236,13 +227,6 @@ pub const IORING_OP_TIMEOUT: u8 = 11;
 pub const IORING_OP_OPENAT: u8 = 18;
 pub const IORING_OP_CLOSE: u8 = 19;
 pub const IORING_OP_READ: u8 = 22;
-
-/// poll_add len bit requesting a multishot poll: the ring keeps reporting
-/// readiness until the poll is canceled, instead of firing once.
-pub const IORING_POLL_ADD_MULTI: u32 = 1;
-
-/// timeout flag requesting a recurring timer that re-arms after each fire.
-pub const IORING_TIMEOUT_MULTISHOT: u32 = 1 << 6;
 
 /// sqe flag: this entry links to the next, which only starts once this one
 /// completes successfully. Used to chain openat then read then close.
@@ -353,9 +337,6 @@ pub const DT_REG: u8 = 8;
 pub const DT_DIR: u8 = 4;
 /// d_type value marking a symbolic link in a getdents64 record.
 pub const DT_LNK: u8 = 10;
-/// d_type value meaning the filesystem did not report the kind; the caller
-/// must stat to find out.
-pub const DT_UNKNOWN: u8 = 0;
 
 /// Ring offsets returned by io_uring_setup, each a byte offset into the SQ
 /// mmap at which that u32 field lives.
@@ -525,26 +506,6 @@ unsafe fn syscall4(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> isi
         in("rsi") a2,
         in("rdx") a3,
         in("r10") a4,
-        lateout("rax") ret,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack, preserves_flags)
-    );
-    ret
-}
-
-/// Perform a raw syscall with 5 arguments
-#[inline(always)]
-unsafe fn syscall5(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
-    let ret: isize;
-    core::arch::asm!(
-        "syscall",
-        in("rax") nr,
-        in("rdi") a1,
-        in("rsi") a2,
-        in("rdx") a3,
-        in("r10") a4,
-        in("r8") a5,
         lateout("rax") ret,
         lateout("rcx") _,
         lateout("r11") _,
@@ -790,6 +751,7 @@ pub fn socket(domain: i32, ty: i32, protocol: i32) -> RawFd {
 
 /// Create a connected pair of sockets, writing both fds into sv. Returns 0 or a
 /// negated errno. Used by the connection tests to stand in for a compositor.
+#[cfg(test)]
 pub fn socketpair(domain: i32, ty: i32, protocol: i32, sv: &mut [i32; 2]) -> i32 {
     // SAFETY: sv is a valid writable array of two ints the kernel fills.
     unsafe {
@@ -1244,7 +1206,9 @@ mod tests {
 
         // Ignored, so the write reports the hangup instead of raising a signal.
         let n = write_fd(write_end.as_raw_fd(), b"data");
-        assert_eq!(n, -(EPIPE as isize), "expected EPIPE, got {n}");
+        // errno for a write whose reader has hung up.
+        const EPIPE: isize = 32;
+        assert_eq!(n, -EPIPE, "expected EPIPE, got {n}");
     }
 
     /// The length handed to `read_mapped` is the compositor's claim about a file
