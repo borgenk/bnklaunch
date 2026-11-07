@@ -7,21 +7,24 @@
 //! to do with it and times how long the launcher takes to act on it.
 //!
 //! The scenarios measure and print; they do not judge. stall_report runs them
-//! all, and it needs a kernel that allows io_uring.
+//! all, and it needs a kernel that allows io_uring. The tests at the end use the
+//! same harness for what only the running loop shows: a second press of the
+//! hotkey closing the launcher.
 
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::IntoRawFd;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::app::{self, AppState};
-use crate::client::Client;
+use crate::client::{Client, PendingAction};
 use crate::desktop::{Catalog, DesktopEntry};
 use crate::font::Font;
+use crate::instance::{self, Claim, Instance};
 use crate::platform::arena::ArrayVec;
 use crate::platform::conn::Connection;
 use crate::platform::protocol as proto;
 use crate::platform::syscall::{self, Fd, RawFd};
+use crate::platform::uring::Ring;
 use crate::platform::wire::{self, Arg};
 use crate::platform::xkb::keycode::{KEY_A, KEY_BACKSPACE, KEY_C, KEY_ENTER, KEY_RIGHT, KEY_V};
 use crate::ui::Theme;
@@ -503,18 +506,20 @@ impl Peer {
         }
     }
 
+    /// The keymap goes in a memfd, the way compositors send it, so harnesses on
+    /// parallel test threads have no file name to share.
     fn send_keymap(&mut self) {
-        let path = std::env::temp_dir().join(format!(
-            "bnk_stall_keymap_{}_{}",
-            std::process::id(),
-            self.keyboard
-        ));
         let mut bytes = KEYMAP.as_bytes().to_vec();
         bytes.push(0);
-        std::fs::write(&path, &bytes).expect("keymap file");
-        let file = std::fs::File::open(&path).expect("keymap open");
-        let _ = std::fs::remove_file(&path);
-        let fd = Fd::new(file.into_raw_fd());
+        let name = syscall::CPath::new("bnk-stall-keymap").expect("name");
+        let fd = syscall::memfd_create(&name, syscall::MFD_CLOEXEC);
+        assert!(fd >= 0, "memfd_create: {fd}");
+        let fd = Fd::new(fd);
+        assert_eq!(
+            syscall::write_fd(fd.as_raw_fd(), &bytes),
+            bytes.len() as isize,
+            "keymap write"
+        );
         self.send_fd(
             self.keyboard,
             proto::wl_keyboard::EV_KEYMAP,
@@ -641,6 +646,8 @@ unsafe extern "C" {
 struct Outcome {
     result: Result<(), String>,
     text: String,
+    /// Whether it ended on a launch.
+    launch: bool,
 }
 
 /// The launcher on one end of a socketpair and the fake compositor on the
@@ -655,10 +662,16 @@ struct Harness {
 
 impl Harness {
     fn start(thread: &'static str) -> Harness {
-        Self::start_with(thread, |_| {})
+        Self::start_with(thread, None, |_| {})
     }
 
-    fn start_with(thread: &'static str, prepare: impl FnOnce(&Connection)) -> Harness {
+    /// Start the launcher as instance, when given one, with prepare run on its
+    /// end of the socket first.
+    fn start_with(
+        thread: &'static str,
+        instance: Option<Instance>,
+        prepare: impl FnOnce(&Connection),
+    ) -> Harness {
         let (socket, peer_fd) = Connection::pair();
         prepare(&socket);
         let (tx, outcome) = mpsc::channel();
@@ -670,17 +683,26 @@ impl Harness {
                     Ok(mut client) => {
                         let font = Font::from_path(FIXTURE_FONT).expect("fixture font");
                         let mut state = AppState::new(catalog(), Default::default());
-                        let result =
-                            app::run_window(&mut client, &mut state, &font, false, &Theme::DEFAULT)
-                                .map_err(|e| e.to_string());
+                        let close_requests = instance.as_ref().and_then(Instance::close_requests);
+                        let result = app::run_window(
+                            &mut client,
+                            &mut state,
+                            &font,
+                            false,
+                            &Theme::DEFAULT,
+                            close_requests,
+                        )
+                        .map_err(|e| e.to_string());
                         Outcome {
                             result,
                             text: client.editor.text_owned().as_str().to_string(),
+                            launch: client.pending_action == PendingAction::Launch,
                         }
                     }
                     Err(e) => Outcome {
                         result: Err(e.to_string()),
                         text: String::new(),
+                        launch: false,
                     },
                 };
                 let _ = tx.send(outcome);
@@ -762,6 +784,22 @@ impl Harness {
                 .sum();
         }
         panic!("{}: no launcher thread", self.thread);
+    }
+
+    /// What the launcher left, once its loop ends with nothing more from the
+    /// compositor. None when it is still running after limit.
+    fn ended_within(&mut self, limit: Duration) -> Option<Outcome> {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            match self.outcome.try_recv() {
+                Ok(outcome) => return Some(outcome),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    panic!("{}: launcher panicked", self.thread)
+                }
+                Err(mpsc::TryRecvError::Empty) => self.peer.pump_for(Duration::from_millis(10)),
+            }
+        }
+        None
     }
 
     /// Dismiss the launcher the way losing focus does, and collect what it
@@ -1033,7 +1071,7 @@ fn key_repeat_while_frames_are_held() -> String {
 /// without drawing, so it is output that can pile up: a repaint would wait for a
 /// frame the compositor never releases first.
 fn output_while_the_compositor_stops_reading() -> String {
-    let mut h = Harness::start_with("stall-output", |socket| {
+    let mut h = Harness::start_with("stall-output", None, |socket| {
         let size: i32 = 4096;
         // SAFETY: setsockopt reads one int through the pointer, which points at
         // a live local.
@@ -1238,4 +1276,85 @@ fn stall_report() {
         println!("  {name:<30} {}", run());
     }
     println!();
+}
+
+/// A runtime dir of the test's own, so its launchers never meet a real one.
+fn runtime_dir(name: &str) -> String {
+    let dir = format!(
+        "{}/bnk_{name}_{}",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    dir
+}
+
+/// The open launcher in dir, and the harness driving it.
+fn open_launcher(dir: &str, thread: &'static str) -> Harness {
+    let Ok(Claim::First(open)) = instance::claim_in(dir) else {
+        panic!("{thread}: the launcher did not take the lock");
+    };
+    Harness::start_with(thread, Some(open), |_| {})
+}
+
+/// Start a second instance in dir, as a second press of the hotkey does, once
+/// the launcher has shown it is still running.
+fn press_again(h: &Harness, dir: &str) {
+    assert!(
+        matches!(h.outcome.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "{}: the launcher ended before the second press",
+        h.thread
+    );
+    assert!(matches!(instance::claim_in(dir), Ok(Claim::Second)));
+}
+
+/// The hotkey pressed while the launcher is open closes it.
+#[test]
+fn a_second_press_closes_the_open_launcher() {
+    // A kernel without io_uring cannot run the loop; that is an environment
+    // limit, not a failure.
+    if Ring::new(8).is_err() {
+        return;
+    }
+    let dir = runtime_dir("sp");
+    let mut h = open_launcher(&dir, "second-press");
+    h.tap_to_frame(KEY_A, Duration::from_secs(1));
+
+    press_again(&h, &dir);
+    let out = h
+        .ended_within(Duration::from_secs(1))
+        .expect("the launcher stayed open");
+    assert_eq!(out.result, Ok(()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// After Enter, the launch waits for a paste still arriving. The hotkey pressed
+/// in that wait closes the launcher at once, and nothing is launched.
+#[test]
+fn a_second_press_while_a_launch_waits_for_a_paste_cancels_it() {
+    if Ring::new(8).is_err() {
+        return;
+    }
+    let dir = runtime_dir("spp");
+    let mut h = open_launcher(&dir, "second-paste");
+    h.peer.offer_selection();
+    h.ctrl_tap(KEY_V);
+    let asked = h
+        .peer
+        .pump_until(Instant::now() + Duration::from_secs(1), |p| {
+            !p.paste_pipes.is_empty()
+        });
+    assert!(asked, "the paste never asked for the data");
+    h.tap(KEY_ENTER);
+    h.peer.pump_for(Duration::from_millis(50));
+
+    press_again(&h, &dir);
+    // Well inside the paste's own deadline, so only the second press ends it.
+    let out = h
+        .ended_within(Duration::from_secs(1))
+        .expect("the launcher stayed open");
+    assert_eq!(out.result, Ok(()));
+    assert!(!out.launch);
+    let _ = std::fs::remove_dir_all(&dir);
 }

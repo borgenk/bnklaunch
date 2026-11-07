@@ -12,6 +12,7 @@ mod desktop;
 mod dev;
 mod editor;
 mod font;
+mod instance;
 mod launch;
 mod platform;
 mod present;

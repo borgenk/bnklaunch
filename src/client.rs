@@ -704,8 +704,7 @@ impl Client {
                 false
             }
             KeyAction::Escape => {
-                self.editor.clear();
-                self.running = false;
+                self.dismiss();
                 false
             }
             // Shift turns the arrows into a select-all; without it they move
@@ -751,6 +750,14 @@ impl Client {
         self.editor.drag(char_offset);
         self.pointer.dragging = false;
         self.input_changed = true;
+    }
+
+    /// Close without launching, as Escape and a second press of the hotkey do.
+    /// That holds after Enter too, while the launch waits for a paste.
+    pub fn dismiss(&mut self) {
+        self.editor.clear();
+        self.pending_action = PendingAction::None;
+        self.running = false;
     }
 
     /// Take what the pending paste's pipe holds, and finish the paste once the

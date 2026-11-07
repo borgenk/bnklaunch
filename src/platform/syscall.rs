@@ -88,6 +88,8 @@ mod nr {
     pub const DUP2: usize = 33;
     pub const SOCKET: usize = 41;
     pub const CONNECT: usize = 42;
+    pub const BIND: usize = 49;
+    pub const LISTEN: usize = 50;
     pub const FORK: usize = 57;
     pub const SETPGID: usize = 109;
     pub const EXIT_GROUP: usize = 231;
@@ -98,6 +100,7 @@ mod nr {
     pub const FTRUNCATE: usize = 77;
     pub const RENAME: usize = 82;
     pub const MKDIR: usize = 83;
+    pub const UNLINK: usize = 87;
     pub const GETDENTS64: usize = 217;
     pub const NEWFSTATAT: usize = 262;
     pub const CLOCK_GETTIME: usize = 228;
@@ -134,6 +137,9 @@ const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
 /// SIGPIPE, whose default action would kill the process before any error path
 /// in this program runs.
 pub const MSG_NOSIGNAL: i32 = 0x4000;
+
+/// errno for a path that does not exist.
+pub const ENOENT: i32 = 2;
 
 /// errno for a syscall interrupted by a signal; retry it.
 pub const EINTR: i32 = 4;
@@ -192,6 +198,8 @@ pub const SOCK_STREAM: i32 = 1;
 /// socket type flag: close the socket on exec, so launched apps do not inherit
 /// the compositor connection. Shares O_CLOEXEC's bit value.
 pub const SOCK_CLOEXEC: i32 = O_CLOEXEC;
+/// socket type flag: open the socket non-blocking. Shares O_NONBLOCK's bit value.
+pub const SOCK_NONBLOCK: i32 = O_NONBLOCK;
 
 // fcntl commands for toggling non-blocking mode on the socket.
 pub const F_GETFL: i32 = 3;
@@ -205,12 +213,37 @@ pub const F_SETFD: i32 = 2;
 pub const F_DUPFD_CLOEXEC: i32 = 1030;
 pub const FD_CLOEXEC: i32 = 1;
 
-/// A Unix-domain socket address. sun_path holds the filesystem path, and the
-/// passed addrlen covers only the family plus the used path bytes and its NUL.
+/// A Unix-domain socket address. sun_path holds the filesystem path.
 #[repr(C)]
-pub struct sockaddr_un {
-    pub sun_family: u16,
-    pub sun_path: [u8; 108],
+struct sockaddr_un {
+    sun_family: u16,
+    sun_path: [u8; 108],
+}
+
+/// The address of a socket on the filesystem, with the length the kernel reads
+/// of it: the family plus the used path bytes and their NUL. Only new builds
+/// one, so that length never runs past the address.
+pub struct UnixAddr {
+    addr: sockaddr_un,
+    len: u32,
+}
+
+impl UnixAddr {
+    /// The address of the socket at path. None when the path leaves no room for
+    /// the trailing NUL the kernel expects.
+    pub fn new(path: &str) -> Option<UnixAddr> {
+        let bytes = path.as_bytes();
+        let mut addr = sockaddr_un {
+            sun_family: AF_UNIX as u16,
+            sun_path: [0; 108],
+        };
+        if bytes.len() >= addr.sun_path.len() {
+            return None;
+        }
+        addr.sun_path[..bytes.len()].copy_from_slice(bytes);
+        let len = (core::mem::size_of::<u16>() + bytes.len() + 1) as u32;
+        Some(UnixAddr { addr, len })
+    }
 }
 
 // io_uring mmap region offsets passed to mmap as the file offset.
@@ -788,19 +821,39 @@ pub fn socketpair(domain: i32, ty: i32, protocol: i32, sv: &mut [i32; 2]) -> i32
     }
 }
 
-/// Connect a socket to an address. addrlen bounds the kernel's read of addr.
-/// Returns 0 or a negated errno.
-pub fn connect(fd: RawFd, addr: &sockaddr_un, addrlen: u32) -> i32 {
-    // SAFETY: addr is a valid sockaddr_un and addrlen is at most its size, so
-    // the kernel reads within it.
+/// Connect a socket to an address. Returns 0 or a negated errno.
+pub fn connect(fd: RawFd, addr: &UnixAddr) -> i32 {
+    // SAFETY: addr.addr is a valid sockaddr_un, and UnixAddr::new keeps addr.len
+    // within its size, so the kernel reads within it.
     unsafe {
         syscall3(
             nr::CONNECT,
             fd as usize,
-            addr as *const sockaddr_un as usize,
-            addrlen as usize,
+            &addr.addr as *const sockaddr_un as usize,
+            addr.len as usize,
         ) as i32
     }
+}
+
+/// Bind a socket to an address. Returns 0 or a negated errno.
+pub fn bind(fd: RawFd, addr: &UnixAddr) -> i32 {
+    // SAFETY: addr.addr is a valid sockaddr_un, and UnixAddr::new keeps addr.len
+    // within its size, so the kernel reads within it.
+    unsafe {
+        syscall3(
+            nr::BIND,
+            fd as usize,
+            &addr.addr as *const sockaddr_un as usize,
+            addr.len as usize,
+        ) as i32
+    }
+}
+
+/// Mark a bound socket as accepting connections, with room for backlog of
+/// them queued. Returns 0 or a negated errno.
+pub fn listen(fd: RawFd, backlog: i32) -> i32 {
+    // SAFETY: no pointer crosses the boundary.
+    unsafe { syscall2(nr::LISTEN, fd as usize, backlog as usize) as i32 }
 }
 
 /// Manipulate a file descriptor (here, to toggle non-blocking mode). Returns a
@@ -948,6 +1001,13 @@ pub fn rename(oldpath: &CPath, newpath: &CPath) -> i32 {
             newpath.as_ptr() as usize,
         ) as i32
     }
+}
+
+/// Remove a name from the filesystem. Returns 0 or a negated errno (ENOENT if
+/// there is none).
+pub fn unlink(path: &CPath) -> i32 {
+    // SAFETY: CPath is a valid C string the kernel only reads.
+    unsafe { syscall1(nr::UNLINK, path.as_ptr() as usize) as i32 }
 }
 
 /// Create a directory. Returns 0 or a negated errno (EEXIST if it already

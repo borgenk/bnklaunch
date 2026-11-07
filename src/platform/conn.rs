@@ -18,8 +18,8 @@ use crate::platform::arena::{ArrayString, ArrayVec};
 use crate::platform::env;
 use crate::platform::error::{Error, Result};
 use crate::platform::syscall::{
-    self, pollfd, sockaddr_un, Fd, RawFd, AF_UNIX, EAGAIN, EINTR, F_DUPFD_CLOEXEC, F_GETFL,
-    F_SETFL, O_NONBLOCK, POLLIN, SOCK_CLOEXEC, SOCK_STREAM,
+    self, pollfd, Fd, RawFd, UnixAddr, AF_UNIX, EAGAIN, EINTR, F_DUPFD_CLOEXEC, F_GETFL, F_SETFL,
+    O_NONBLOCK, POLLIN, SOCK_CLOEXEC, SOCK_STREAM,
 };
 use crate::platform::wire::{self, Arg, Message, HEADER_SIZE, MSG_BODY_CAP};
 
@@ -108,26 +108,14 @@ impl Connection {
 
     /// Connect to a specific socket path.
     pub fn connect_to(path: &str) -> Result<Self> {
-        let bytes = path.as_bytes();
-        // SAFETY: sockaddr_un is a plain C struct of an integer and a byte
-        // array, so an all-zero bit pattern is a valid value and leaves the path
-        // NUL-terminated.
-        let mut addr: sockaddr_un = unsafe { core::mem::zeroed() };
-        addr.sun_family = AF_UNIX as u16;
-        // Leave room for the trailing NUL the kernel expects.
-        if bytes.len() >= addr.sun_path.len() {
-            return Err(Error::msg("socket path too long"));
-        }
-        addr.sun_path[..bytes.len()].copy_from_slice(bytes);
+        let addr = UnixAddr::new(path).ok_or_else(|| Error::msg("socket path too long"))?;
 
         let fd = syscall::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if fd < 0 {
             return Err(Error::from_errno(-fd));
         }
 
-        // addrlen spans the family plus the used path bytes and their NUL.
-        let addrlen = (core::mem::size_of::<u16>() + bytes.len() + 1) as u32;
-        let r = syscall::connect(fd, &addr, addrlen);
+        let r = syscall::connect(fd, &addr);
         if r < 0 {
             // SAFETY: fd is the socket opened just above, closed once on this
             // error path before the owning struct exists.

@@ -1,14 +1,15 @@
-//! The launcher application: single-instance lock, desktop-entry resolution,
-//! the io_uring event loop, and input handling.
+//! The launcher application: desktop-entry resolution, the io_uring event
+//! loop, and input handling.
 
 use crate::client::{Client, PendingAction};
 use crate::clipboard;
 use crate::desktop::{self, DesktopEntry};
+use crate::instance::{self, Claim, Instance};
 use crate::platform::error::elog;
 use crate::platform::error::{Error, Result};
 use crate::platform::time::Instant;
 use crate::platform::xkb::{keycode, Xkb};
-use crate::platform::{arena, env, fs, syscall, uring};
+use crate::platform::{arena, env, syscall, uring};
 use crate::ui::{calculate_height, draw_ui, Theme, MAX_RESULTS, WINDOW_WIDTH};
 use crate::{cache, config, denylist, font, launch, ui};
 
@@ -16,9 +17,10 @@ use crate::{cache, config, denylist, font, launch, ui};
 /// long.
 const CURSOR_BLINK_MS: u64 = 530;
 
-/// Submission-queue depth for the event-loop ring. A turn queues at most three
-/// polls, each one-shot and re-armed as it fires: the socket for reading and,
-/// while requests are backed up, for writing, and a paste's pipe.
+/// Submission-queue depth for the event-loop ring. A turn queues at most four
+/// polls, each one-shot: the socket for reading and, while requests are backed
+/// up, for writing, and a paste's pipe, each re-armed as it fires; and the
+/// listener a second instance connects to, armed once.
 const RING_ENTRIES: u32 = 32;
 
 /// Most messages one loop turn handles. A burst bigger than this is finished
@@ -30,6 +32,8 @@ const DISPATCH_BUDGET: usize = 64;
 const K_WAYLAND: u64 = 1;
 /// io_uring user_data of the socket's write poll.
 const K_OUTPUT: u64 = 2;
+/// io_uring user_data of the poll on the listener a second instance connects to.
+const K_CLOSE: u64 = 3;
 /// io_uring user_data of a paste pipe's poll: this tag, ored with the paste's
 /// serial, so a poll left over from a finished paste is told apart from the
 /// current one's.
@@ -138,51 +142,6 @@ pub(crate) fn normalize_url(url: &str, out: &mut arena::ArrayString<URL_CAP>) {
     let _ = out.push_str(url);
 }
 
-/// The single-instance lock, as try_acquire_lock found it.
-enum Lock {
-    /// This process holds it until the fd is dropped (and closed).
-    Held(syscall::Fd),
-    /// Another instance holds it.
-    Busy,
-}
-
-/// Where the single-instance lock lives. Every instance of a Flatpak shares the
-/// sandbox's runtime dir, so the lock works there too.
-fn lock_path() -> Result<arena::ArrayString<{ fs::PATH_CAP }>> {
-    let runtime_dir = env::var("XDG_RUNTIME_DIR").unwrap_or("/tmp");
-    let mut path: arena::ArrayString<{ fs::PATH_CAP }> = arena::ArrayString::new();
-    path.push_str(runtime_dir)
-        .and_then(|_| path.push_str("/bnklaunch.lock"))
-        .map_err(|_| Error::msg("lock path too long"))?;
-    Ok(path)
-}
-
-/// Take the lock at path without waiting.
-fn try_acquire_lock(path: &str) -> Result<Lock> {
-    let cp = fs::cpath(path)?;
-
-    // O_CLOEXEC so a launched app does not inherit the lock fd and hold the
-    // single-instance flock for its whole lifetime.
-    let fd = syscall::openat(
-        syscall::AT_FDCWD,
-        &cp,
-        syscall::O_RDWR | syscall::O_CREAT | syscall::O_CLOEXEC,
-        0o644,
-    );
-    if fd < 0 {
-        return Err(Error::from_errno(-fd));
-    }
-    let fd = syscall::Fd::new(fd);
-
-    let result = syscall::flock(fd.as_raw_fd(), syscall::LOCK_EX | syscall::LOCK_NB);
-    match result {
-        0 => Ok(Lock::Held(fd)),
-        // EWOULDBLOCK, which Linux defines as EAGAIN.
-        r if r == -syscall::EAGAIN => Ok(Lock::Busy),
-        r => Err(Error::from_errno(-r)),
-    }
-}
-
 /// Application state
 pub(crate) struct AppState {
     entries: desktop::Catalog,
@@ -216,13 +175,13 @@ pub(crate) fn run() -> Result<()> {
     // pipelines rely on.
     syscall::signal_disposition(syscall::SIGPIPE, syscall::SIG_IGN);
 
-    // One launcher at a time: while one is open, a second hotkey press does
-    // nothing. A lock that cannot be taken at all is reported and the launcher
-    // runs without it, since refusing to start would leave a hotkey that
-    // silently does nothing.
-    let _lock = match lock_path().and_then(|path| try_acquire_lock(&path)) {
-        Ok(Lock::Held(fd)) => Some(fd),
-        Ok(Lock::Busy) => return Ok(()),
+    // One launcher at a time: while one is open, a second hotkey press closes
+    // it. A lock that cannot be taken at all is reported and the launcher runs
+    // without it, since refusing to start would leave a hotkey that silently
+    // does nothing.
+    let instance = match instance::claim() {
+        Ok(Claim::First(instance)) => Some(instance),
+        Ok(Claim::Second) => return Ok(()),
         Err(e) => {
             elog!("bnklaunch: running without the single-instance lock: {e}");
             None
@@ -276,7 +235,15 @@ pub(crate) fn run() -> Result<()> {
     let mut state = AppState::new(entries, recents);
 
     let mut client = Client::connect()?;
-    run_window(&mut client, &mut state, &font, search_enabled, &cfg.theme)?;
+    let close_requests = instance.as_ref().and_then(Instance::close_requests);
+    run_window(
+        &mut client,
+        &mut state,
+        &font,
+        search_enabled,
+        &cfg.theme,
+        close_requests,
+    )?;
 
     if client.pending_action == PendingAction::Launch {
         dispatch_launch(&client, &mut state, &cfg, recents_offset, search_enabled);
@@ -285,13 +252,15 @@ pub(crate) fn run() -> Result<()> {
 }
 
 /// Bring the launcher window up on a connected client and run it until
-/// something dismisses it.
+/// something dismisses it. close_requests is the listener a second instance
+/// connects to, when there is one.
 pub(crate) fn run_window(
     client: &mut Client,
     state: &mut AppState,
     font: &font::Font,
     search_enabled: bool,
     theme: &Theme,
+    close_requests: Option<&syscall::Fd>,
 ) -> Result<()> {
     // Initialize and get registry
     client.init()?;
@@ -331,7 +300,7 @@ pub(crate) fn run_window(
     // Wait for input devices
     client.roundtrip()?;
 
-    event_loop(client, state, font, search_enabled, theme)
+    event_loop(client, state, font, search_enabled, theme, close_requests)
 }
 
 /// How long the loop may park before something is due: the held key's next
@@ -343,14 +312,15 @@ fn park_ms(repeat_due_ms: Option<u32>, since_blink_ms: u64) -> u64 {
     repeat_due_ms.map_or(blink, |ms| blink.min(u64::from(ms)))
 }
 
-/// Run until something dismisses the launcher: Enter, Escape, focus loss, or the
-/// compositor closing the surface.
+/// Run until something dismisses the launcher: Enter, Escape, focus loss, the
+/// hotkey pressed again, or the compositor closing the surface.
 fn event_loop(
     client: &mut Client,
     state: &mut AppState,
     font: &font::Font,
     search_enabled: bool,
     theme: &Theme,
+    close_requests: Option<&syscall::Fd>,
 ) -> Result<()> {
     // Caret blink state. The caret is solid for one interval then toggles; any
     // input activity resets it to solid below.
@@ -393,6 +363,10 @@ fn event_loop(
     let arm_failed = || Error::msg("io_uring submission queue full");
     ring.prep_poll_add(wl_fd, syscall::POLLIN as u32, K_WAYLAND)
         .map_err(|_| arm_failed())?;
+    if let Some(listener) = close_requests {
+        ring.prep_poll_add(listener.as_raw_fd(), syscall::POLLIN as u32, K_CLOSE)
+            .map_err(|_| arm_failed())?;
+    }
     // The serial of the paste whose pipe has a poll in flight.
     let mut paste_armed: Option<u64> = None;
     let mut output_armed = false;
@@ -401,7 +375,8 @@ fn event_loop(
 
     // Event loop. Enter or a click on a row ends it, except that a launch waits
     // for a paste still arriving, until it lands or runs out of time, so the
-    // launch sees the pasted text the way it was typed.
+    // launch sees the pasted text the way it was typed. Escape and a second
+    // press of the hotkey end that wait too, without launching.
     while client.running || launch_awaits_paste(client) {
         // Paint what the last turn changed, if the compositor is ready for a
         // frame, then send what is queued, as far as the socket takes it. The
@@ -462,6 +437,7 @@ fn event_loop(
         ring.submit_and_wait_timeout(park * 1_000_000)
             .map_err(Error::from_errno)?;
         let mut readable = input_pending;
+        let mut close_requested = false;
         while let Some(cqe) = ring.next_cqe() {
             // A poll completes with the events that are ready, or a negated
             // errno when the poll itself failed.
@@ -481,6 +457,9 @@ fn event_loop(
                     }
                     client.socket.flush()?;
                 }
+                // A second instance connected: the hotkey was pressed again. A
+                // failed poll leaves the launcher open, as without a listener.
+                K_CLOSE => close_requested = cqe.res > 0,
                 // The paste's pipe is read below, every turn; its poll only
                 // wakes the loop.
                 tag if tag == K_PASTE | client.paste_serial => paste_armed = None,
@@ -526,6 +505,12 @@ fn event_loop(
 
         // Handle pointer clicks on a result row, and click/drag in the input box
         handle_pointer_input(client, &mut state.selected, font, total_rows);
+
+        // The second press closes the launcher after this turn's input is
+        // handled, so an Enter or a click in the same turn cannot undo it.
+        if close_requested {
+            client.dismiss();
+        }
 
         // Three things change the picture: the input, the selection, and the
         // caret blink. They differ only in what they settle first.
@@ -750,34 +735,6 @@ fn resolve_results<'a>(
 mod tests {
     use crate::app::*;
     use crate::client::KeyRepeat;
-
-    /// A second instance finds the lock busy and leaves quietly. A lock that
-    /// cannot be taken at all is an error the caller reports, not a busy lock:
-    /// otherwise the launcher exits silently and the hotkey does nothing.
-    #[test]
-    fn the_lock_tells_another_instance_apart_from_a_failure() {
-        let dir = format!(
-            "{}/bnk_lock_{}",
-            std::env::temp_dir().display(),
-            std::process::id()
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
-        let path = format!("{dir}/bnklaunch.lock");
-
-        let first = try_acquire_lock(&path).expect("first");
-        assert!(matches!(first, Lock::Held(_)));
-        // flock belongs to the open file, so a second open in this process
-        // contends with the first exactly as another instance would.
-        assert!(matches!(try_acquire_lock(&path), Ok(Lock::Busy)));
-        drop(first);
-        assert!(matches!(try_acquire_lock(&path), Ok(Lock::Held(_))));
-
-        let unreachable = format!("{dir}/missing/bnklaunch.lock");
-        assert!(try_acquire_lock(&unreachable).is_err());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     fn entries(names: &[(&str, &str)]) -> desktop::Catalog {
         let mut out = desktop::Catalog::new();
