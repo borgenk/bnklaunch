@@ -96,8 +96,16 @@ impl Editor {
     ///
     /// Nothing changes when the result would not fit. Deleting the selection
     /// first and then failing to insert would leave the user with neither their
-    /// own text nor the pasted text.
+    /// own text nor the pasted text. Nothing changes either when the text holds
+    /// nothing but control characters.
     pub fn paste(&mut self, s: &str) -> bool {
+        let Some(s) = one_line(s) else {
+            return false;
+        };
+        let s = s.as_str();
+        if s.is_empty() {
+            return true;
+        }
         let selected_bytes = match self.selection() {
             Some((start, end)) => self.byte(end) - self.byte(start),
             None => 0,
@@ -282,9 +290,30 @@ impl Editor {
     }
 }
 
+/// Pasted text as the input can hold it: without control characters, which
+/// typed input never carries, and with each run of line breaks and tabs between
+/// words turned into one space. A run at either end is dropped, so a copy that
+/// ends in a newline pastes as the word alone. None when it does not fit.
+fn one_line(s: &str) -> Option<ArrayString<INPUT_CAP>> {
+    let mut out: ArrayString<INPUT_CAP> = ArrayString::new();
+    let mut gap = false;
+    for c in s.chars() {
+        if matches!(c, '\t' | '\n' | '\r') {
+            gap = true;
+        } else if !c.is_control() {
+            if gap && !out.is_empty() {
+                out.push(' ').ok()?;
+            }
+            gap = false;
+            out.push(c).ok()?;
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::editor::*;
 
     fn editor(text: &str) -> Editor {
         let mut e = Editor::new();
@@ -442,6 +471,34 @@ mod tests {
         let exact = "x".repeat(INPUT_CAP);
         assert!(e.paste(&exact));
         assert_eq!(e.len(), INPUT_CAP);
+    }
+
+    /// Typed input never carries a control character, and a paste must not
+    /// either: a newline in the query matches nothing and draws a missing glyph.
+    #[test]
+    fn a_paste_drops_control_characters_and_joins_lines_with_a_space() {
+        let pasted = |s: &str| {
+            let mut e = editor("ab");
+            assert!(e.paste(s));
+            (e.text_owned(), e.cursor())
+        };
+        // A triple-click copy carries its newline; a terminal copy its CRLF.
+        assert_eq!(pasted("firefox\n").0.as_str(), "abfirefox");
+        assert_eq!(pasted("firefox\r\n").0.as_str(), "abfirefox");
+        // A break or tab between words is one space; one at either end goes.
+        assert_eq!(pasted("\tweb\r\n\tbrowser\n").0.as_str(), "abweb browser");
+        // The rest of C0, DEL and C1 are dropped wherever they sit, and the
+        // caret lands after what was inserted, not after what was pasted.
+        let (text, cursor) = pasted("x\u{1b}[0m\u{7f}é\u{9b}y");
+        assert_eq!(text.as_str(), "abx[0méy");
+        assert_eq!(cursor, 8);
+
+        // Text that is nothing but control characters leaves the input alone.
+        let mut e = editor("abcd");
+        e.select_all();
+        assert!(e.paste("\r\n"));
+        assert_eq!(e.text(), "abcd");
+        assert_eq!(e.selection(), Some((0, 4)), "the selection survives");
     }
 
     #[test]
