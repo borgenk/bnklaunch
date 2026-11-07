@@ -16,7 +16,7 @@ use crate::desktop::{Catalog, DesktopEntry};
 use crate::dev::png;
 use crate::font::Font;
 use crate::shm::PixelBuffer;
-use crate::ui::{calculate_height, draw_ui, Caret, Theme, TEXT_W, TEXT_X, WINDOW_WIDTH};
+use crate::ui::{calculate_height, draw_ui, Caret, Rows, Theme, TEXT_W, TEXT_X, WINDOW_WIDTH};
 
 const FIXTURE_FONT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-font.ttf");
 const REFERENCE: &str = concat!(
@@ -25,17 +25,21 @@ const REFERENCE: &str = concat!(
 );
 const SCREENSHOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/screenshot.png");
 
-/// What has been typed, and the rows a search for it turns up. The first row is
-/// the selected one. The second exec carries a field code, which the subtitle
-/// drops, so the frame covers that path too.
-const QUERY: &str = "fi";
-const RESULTS: [(&str, &str); 5] = [
-    ("Firefox", "firefox"),
-    ("Files", "nautilus --new-window %U"),
-    ("Filelight", "filelight"),
-    ("File Roller", "file-roller"),
-    ("Firmware Updater", "gnome-firmware"),
+/// The window as it opens: nothing typed, and the recent launches under the
+/// input, most recent first. The first row is the selected one.
+const QUERY: &str = "";
+const RESULTS: [(&str, &str); 4] = [
+    ("Bnknotes", "bnknotes %f"),
+    ("Steam", "steam %U"),
+    ("Spotify", "spotify %U"),
+    ("Discord", "discord"),
 ];
+
+/// The default colors, with the rows drawn without their second line.
+const SCENE_THEME: Theme = Theme {
+    rows: Rows::OneLine,
+    ..Theme::DEFAULT
+};
 
 /// Where the columns past every text run start: TEXT_W stops a name or a command
 /// line well short of the window edge, and only window colors reach past it.
@@ -56,6 +60,11 @@ const BOUNDS_TOLERANCE: u32 = 2;
 /// A small radius on the screenshot's corners. The frame itself is square.
 const CORNER_RADIUS: f32 = 4.0;
 
+/// The desktop the screenshot's window sits over, a dark slate, as red, green
+/// and blue. The window is translucent, so without one the picture would take
+/// its shade from whatever page shows it.
+const DESKTOP: [u32; 3] = [0x28, 0x2c, 0x34];
+
 /// Paint the scene into an offscreen buffer, and return it with its size.
 fn frame(font: &Font) -> (Vec<u32>, u32, u32) {
     let entries: Vec<DesktopEntry> = RESULTS
@@ -71,7 +80,7 @@ fn frame(font: &Font) -> (Vec<u32>, u32, u32) {
         visible: true,
     };
 
-    let height = calculate_height(rows.len(), Theme::DEFAULT.rows);
+    let height = calculate_height(rows.len(), SCENE_THEME.rows);
     let mut buffer = PixelBuffer::new(WINDOW_WIDTH, height).expect("offscreen buffer");
     draw_ui(
         &mut buffer,
@@ -81,7 +90,7 @@ fn frame(font: &Font) -> (Vec<u32>, u32, u32) {
         font,
         false,
         &caret,
-        &Theme::DEFAULT,
+        &SCENE_THEME,
     );
     (buffer.pixels_u32().to_vec(), WINDOW_WIDTH, height)
 }
@@ -95,6 +104,19 @@ fn straight_alpha(pixels: &mut [u32]) {
         }
         let channel = |shift: u32| ((((*p >> shift) & 0xff) * 0xff + alpha / 2) / alpha) << shift;
         *p = alpha << 24 | channel(16) | channel(8) | channel(0);
+    }
+}
+
+/// Composite the premultiplied frame over DESKTOP, which leaves it opaque.
+fn over_desktop(pixels: &mut [u32]) {
+    for p in pixels {
+        let cover = 0xff - (*p >> 24);
+        let channel = |shift: u32, desktop: u32| {
+            let own = (*p >> shift) & 0xff;
+            (own + (cover * desktop + 127) / 255).min(0xff) << shift
+        };
+        *p =
+            0xff00_0000 | channel(16, DESKTOP[0]) | channel(8, DESKTOP[1]) | channel(0, DESKTOP[2]);
     }
 }
 
@@ -356,7 +378,20 @@ fn report(pixels: &[u32], width: u32, height: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dev::screenshot::*;
+
+    /// The screenshot shows the window the way it looks over a dark desktop,
+    /// opaque, so no page behind it can lighten or darken it.
+    #[test]
+    fn the_screenshot_window_is_opaque_over_the_desktop() {
+        let mut pixels = vec![
+            SCENE_THEME.background.argb(),
+            crate::ui::Color::rgba(0xec, 0xec, 0xec, 0xff).argb(),
+        ];
+        over_desktop(&mut pixels);
+        // The default background, 94% over 0x282c34, and opaque text as it was.
+        assert_eq!(pixels, [0xff1f_2225, 0xffec_ecec]);
+    }
 
     /// Paint the scene with this machine's font and write it out, which is what
     /// make screenshot runs. Ignored otherwise: what it draws depends on the
@@ -366,7 +401,7 @@ mod tests {
     fn write_screenshot() {
         let font = Font::load().expect("a system font");
         let (mut pixels, width, height) = frame(&font);
-        straight_alpha(&mut pixels);
+        over_desktop(&mut pixels);
         round_corners(&mut pixels, width, height, CORNER_RADIUS);
         let dir = std::path::Path::new(SCREENSHOT)
             .parent()
@@ -481,7 +516,7 @@ mod tests {
         // A row of text gone, painted out in the color the row already is,
         // which no band can see.
         let mut missing = pixels.clone();
-        let rows = Theme::DEFAULT.rows;
+        let rows = SCENE_THEME.rows;
         let row = (calculate_height(1, rows) - calculate_height(0, rows)) as usize * width as usize;
         let start = calculate_height(0, rows) as usize * width as usize;
         let wash = pixels[start + GUTTER_X as usize];
