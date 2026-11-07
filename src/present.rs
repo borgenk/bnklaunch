@@ -14,6 +14,7 @@ use crate::platform::arena::ArrayVec;
 use crate::platform::conn::Connection;
 use crate::platform::error::{Error, Result};
 use crate::platform::protocol::{self as proto, KeyboardInteractivity, Layer, ShmFormat};
+use crate::platform::time::Instant;
 use crate::platform::wire::Arg;
 use crate::shm::PixelBuffer;
 
@@ -42,6 +43,8 @@ pub struct Surface {
     pub height: u32,
     /// The size last asked for with set_size.
     pub requested: (u32, u32),
+    /// When a set_size went out that no configure has answered yet.
+    pub awaiting_configure: Option<Instant>,
 }
 
 /// One shared-memory frame, with the protocol objects that expose it.
@@ -156,6 +159,7 @@ impl Present {
             width,
             height,
             requested: (width, height),
+            awaiting_configure: None,
         });
         conn.flush()
     }

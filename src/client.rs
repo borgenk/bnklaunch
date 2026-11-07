@@ -18,6 +18,8 @@ use crate::shm::PixelBuffer;
 
 /// Most recycled ids held at once.
 const MAX_IDS: usize = 256;
+/// Longest a frame holds for the configure that answers a resize.
+const CONFIGURE_GRACE_MS: u64 = 100;
 /// Most globals the compositor advertises that we track.
 const MAX_GLOBALS: usize = 64;
 /// Byte capacity of a stored interface name. The reader hands out a borrowed
@@ -422,6 +424,7 @@ impl Client {
                             &[Arg::Uint(serial)],
                         )?;
                         surface.configured = true;
+                        surface.awaiting_configure = None;
                     }
                     proto::zwlr_layer_surface_v1::EV_CLOSED => {
                         self.running = false;
@@ -952,6 +955,7 @@ impl Client {
             return Ok(());
         }
         surface.requested = (width, height);
+        surface.awaiting_configure = Some(Instant::now());
         let (layer_surface_id, surface_id) = (surface.layer_surface_id, surface.id);
         self.socket.request(
             layer_surface_id,
@@ -971,13 +975,25 @@ impl Client {
             .unwrap_or(false)
     }
 
+    /// While a resize waits for its configure, how much longer a frame holds
+    /// for it. A compositor answers a set_size at once, so the frame that goes
+    /// out is drawn at the new size; one that takes longer than the grace gets
+    /// the frame at the old size, so typing still shows. None once the
+    /// configure has come or the grace has run out.
+    pub fn configure_wait_ms(&self) -> Option<u64> {
+        let since = self.present.surface.as_ref()?.awaiting_configure?;
+        CONFIGURE_GRACE_MS
+            .checked_sub(since.elapsed_ms())
+            .filter(|&ms| ms > 0)
+    }
+
     /// Draw the next frame and show it, if one can go now. It waits while the
     /// compositor has not asked for the next frame yet, or holds both buffers;
     /// the caller keeps the window marked for a repaint and tries again on a
     /// later turn, once the frame callback or a release has come in. Returns
     /// whether a frame went out.
     pub fn paint(&mut self, draw: impl FnOnce(&mut Client)) -> Result<bool> {
-        if !self.running || self.frame_callback.is_some() {
+        if !self.running || self.frame_callback.is_some() || self.configure_wait_ms().is_some() {
             return Ok(false);
         }
         let shm_id = self

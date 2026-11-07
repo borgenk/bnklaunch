@@ -450,6 +450,12 @@ fn event_loop(
         if let Some(paste) = &client.paste {
             park = park.min(paste.remaining_ms());
         }
+        // A frame held for a resize's configure is due when the grace runs out.
+        if needs_paint {
+            if let Some(ms) = client.configure_wait_ms() {
+                park = park.min(ms);
+            }
+        }
         // Messages left over from a burst are handled first, without parking.
         if input_pending {
             park = 0;

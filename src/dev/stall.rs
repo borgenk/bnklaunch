@@ -23,7 +23,7 @@ use crate::platform::conn::Connection;
 use crate::platform::protocol as proto;
 use crate::platform::syscall::{self, Fd, RawFd};
 use crate::platform::wire::{self, Arg};
-use crate::platform::xkb::keycode::{KEY_A, KEY_C, KEY_ENTER, KEY_RIGHT, KEY_V};
+use crate::platform::xkb::keycode::{KEY_A, KEY_BACKSPACE, KEY_C, KEY_ENTER, KEY_RIGHT, KEY_V};
 use crate::ui::Theme;
 
 const FIXTURE_FONT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-font.ttf");
@@ -103,6 +103,11 @@ struct Peer {
     withheld: Option<(u32, u32)>,
     attached: Option<u32>,
     held: Vec<u32>,
+    /// Each buffer's size, and the size the launcher last asked for.
+    buffer_sizes: HashMap<u32, (u32, u32)>,
+    last_requested: Option<(u32, u32)>,
+    /// Frames committed at a size other than the one last asked for.
+    off_size_commits: usize,
     frame_callbacks: Vec<u32>,
     frame_due: Option<Instant>,
 
@@ -145,6 +150,9 @@ impl Peer {
             withheld: None,
             attached: None,
             held: Vec::new(),
+            buffer_sizes: HashMap::new(),
+            last_requested: None,
+            off_size_commits: 0,
             frame_callbacks: Vec::new(),
             frame_due: None,
             answer_configure: true,
@@ -351,6 +359,7 @@ impl Peer {
                 let width = r.u32().expect("width");
                 let height = r.u32().expect("height");
                 self.requested = Some((width, height));
+                self.last_requested = Some((width, height));
             }
             (Kind::Surface, proto::wl_surface::ATTACH) => {
                 let buffer = r.u32().expect("buffer");
@@ -368,7 +377,11 @@ impl Peer {
             }
             (Kind::Pool, proto::wl_shm_pool::CREATE_BUFFER) => {
                 let buffer = r.u32().expect("buffer");
+                let _offset = r.i32().expect("offset");
+                let width = r.i32().expect("width") as u32;
+                let height = r.i32().expect("height") as u32;
                 self.objects.insert(buffer, Kind::Buffer);
+                self.buffer_sizes.insert(buffer, (width, height));
             }
             (Kind::Pool, proto::wl_shm_pool::DESTROY)
             | (Kind::Buffer, proto::wl_buffer::DESTROY)
@@ -428,6 +441,11 @@ impl Peer {
     fn commit(&mut self) {
         if let Some(buffer) = self.attached.take() {
             self.commits.push(Instant::now());
+            if self.last_requested.is_some()
+                && self.buffer_sizes.get(&buffer).copied() != self.last_requested
+            {
+                self.off_size_commits += 1;
+            }
             // Latching a new buffer is what frees the one shown before it.
             if self.release_buffers {
                 self.release_held();
@@ -1156,6 +1174,21 @@ fn first_frame() -> String {
     )
 }
 
+/// The list growing and shrinking with a compositor that configures at once.
+fn frames_at_the_old_size() -> String {
+    let mut h = Harness::start("stall-size");
+    h.tap_to_frame(KEY_A, Duration::from_secs(1));
+    h.peer.pump_for(Duration::from_millis(100));
+    h.tap_to_frame(KEY_BACKSPACE, Duration::from_secs(1));
+    h.peer.pump_for(Duration::from_millis(100));
+    let off = h.peer.off_size_commits;
+    let out = h.finish();
+    format!(
+        "{off} frames committed at the old size over two resizes{}",
+        ended(&out)
+    )
+}
+
 /// Wakeups while nothing happens.
 fn wakeups_while_idle() -> String {
     let mut h = Harness::start("stall-idle");
@@ -1180,13 +1213,14 @@ type Scenario = (&'static str, fn() -> String);
 #[test]
 #[ignore]
 fn stall_report() {
-    let scenarios: [Scenario; 11] = [
+    let scenarios: [Scenario; 12] = [
         ("startup", first_frame),
         ("paste, owner never writes", paste_from_a_silent_owner),
         ("paste, owner trickles", paste_from_a_trickling_owner),
         ("paste, then Enter", enter_during_a_paste),
         ("copy, requester's pipe full", copy_to_a_full_pipe),
         ("resize, configure withheld", resize_without_a_configure),
+        ("resize, configure at once", frames_at_the_old_size),
         (
             "key repeat, both frames held",
             key_repeat_while_frames_are_held,
