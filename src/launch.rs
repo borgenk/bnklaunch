@@ -12,6 +12,8 @@ use crate::platform::{env, fs};
 extern "C" {
     /// PATH-searching exec; replaces the process image or returns -1 on failure.
     fn execvp(file: *const c_char, argv: *const *const c_char) -> i32;
+    /// The calling thread's errno, which a failed execvp sets.
+    fn __errno_location() -> *mut i32;
 }
 
 /// The arguments after the program: the tokenized command line, with up to two
@@ -26,6 +28,11 @@ const TERMINAL_RUNNER: &str = "xdg-terminal-exec";
 /// manifest binds the host's /usr under /run/host.
 const HOST_BIN_DIRS: [&str; 2] = ["/run/host/usr/local/bin", "/run/host/usr/bin"];
 
+/// How long a launch waits for the child to reach its exec. The window stays up
+/// until the launcher exits, so an exec that takes longer, held up by a PATH
+/// entry on a mount that stopped answering, counts as launched.
+const EXEC_REPORT_MS: i32 = 500;
+
 /// Byte capacity of a URL the launcher builds or opens. Larger than the search
 /// URL template it is built from (config::SEARCH_URL_CAP), since the
 /// percent-encoded query goes in as well.
@@ -35,8 +42,9 @@ pub const URL_CAP: usize = 2048;
 ///
 /// The Exec value is tokenized per the Desktop Entry spec and exec'd directly,
 /// never through a shell, so quoting metacharacters in a .desktop file cannot
-/// run subcommands. Spawns in a new process group and returns immediately; the
-/// child is detached from the launcher's group and reparents to init on exit.
+/// run subcommands. Spawns in a new process group and returns once the exec has
+/// gone through, or with its errno when it failed; the child is detached from
+/// the launcher's group and reparents to init on exit.
 pub fn launch(entry: &DesktopEntry) -> Result<()> {
     let mut argv: ArrayVec<ArrayString<ARG_CAP>, MAX_ARGS> = ArrayVec::new();
     // A command line that does not tokenize whole is refused, never trimmed to
@@ -143,8 +151,9 @@ pub fn launch_url(url: &str) -> Result<()> {
 }
 
 /// Fork and exec a program, searching PATH, with stdio sent to /dev/null and
-/// the child in its own process group. Returns once the child is started; the
-/// child is detached and reparents to init on exit.
+/// the child in its own process group. Returns once the exec has gone through,
+/// or with its errno when it failed; the child is detached and reparents to
+/// init on exit.
 fn spawn<const CAP: usize>(program: &str, args: &[&str]) -> Result<()> {
     // Build NUL-terminated C strings (program then args) and a NULL-terminated
     // pointer array. Both live on the stack, alive across the exec below. CAP is
@@ -173,8 +182,18 @@ fn spawn<const CAP: usize>(program: &str, args: &[&str]) -> Result<()> {
 
     let devnull_path = syscall::CPath::new("/dev/null");
 
+    // The child reports a failed exec through this pipe. Both ends are
+    // close-on-exec, so an exec that goes through closes the child's write end
+    // and the parent reads end of file.
+    let mut fds = [0i32; 2];
+    let r = syscall::pipe2(&mut fds, syscall::O_CLOEXEC);
+    if r < 0 {
+        return Err(Error::from_errno(-r));
+    }
+    let (read_end, write_end) = (syscall::Fd::new(fds[0]), syscall::Fd::new(fds[1]));
+
     // SAFETY: the process is single-threaded, so the child runs only the
-    // async-signal-safe setup below before execvp replaces its image.
+    // async-signal-safe calls below until execvp replaces its image or it exits.
     let pid = unsafe { syscall::fork() };
     if pid < 0 {
         return Err(Error::from_errno(-pid));
@@ -205,17 +224,41 @@ fn spawn<const CAP: usize>(program: &str, args: &[&str]) -> Result<()> {
             }
         }
         // Only stdio goes to the application. The launcher's own fds are
-        // close-on-exec, but one it inherited without the flag is not.
-        // SAFETY: the child execs or exits next, so none of the Fd values it
-        // copied from the parent is ever dropped.
-        unsafe { syscall::close_range(3, u32::MAX) };
+        // close-on-exec, but one it inherited without the flag is not. Marking
+        // them keeps the report pipe open until the exec.
+        syscall::close_range_on_exec(3, u32::MAX);
         // SAFETY: ptrs[0] and ptrs point at the NUL-terminated argv built above,
         // alive on the stack; execvp only reads them.
         unsafe { execvp(ptrs[0], ptrs.as_ptr()) };
         // execvp only returns on failure.
+        // SAFETY: __errno_location returns this thread's errno slot, valid for
+        // as long as the thread runs.
+        let errno = unsafe { *__errno_location() };
+        syscall::write_fd(write_end.as_raw_fd(), &errno.to_ne_bytes());
         syscall::exit_group(127);
     }
-    // Parent: detached, do not wait.
+    // Parent: detached, so it waits for the exec, never for the exit. Its own
+    // write end closes first, or the pipe would never reach end of file.
+    drop(write_end);
+    exec_outcome(&read_end, EXEC_REPORT_MS)
+}
+
+/// What a child reports through its pipe: end of file once its exec went
+/// through, or the errno of an exec that failed. Silence past timeout_ms counts
+/// as launched. A write this small to a pipe arrives whole.
+fn exec_outcome(read_end: &syscall::Fd, timeout_ms: i32) -> Result<()> {
+    let mut pfd = syscall::pollfd {
+        fd: read_end.as_raw_fd(),
+        events: syscall::POLLIN,
+        revents: 0,
+    };
+    if syscall::poll(core::slice::from_mut(&mut pfd), timeout_ms) <= 0 {
+        return Ok(());
+    }
+    let mut errno = [0u8; 4];
+    if syscall::read_fd(read_end.as_raw_fd(), &mut errno) == errno.len() as isize {
+        return Err(Error::from_errno(i32::from_ne_bytes(errno)));
+    }
     Ok(())
 }
 
@@ -293,6 +336,28 @@ mod tests {
         let mut out: ArrayString<URL_CAP> = ArrayString::new();
         build_search_url(template, query, &mut out).expect("build");
         out.as_str().to_string()
+    }
+
+    /// The exec runs in the child, after the fork has succeeded. The spawn
+    /// still has to report it failing, or the app is never logged and goes
+    /// into the recents anyway.
+    #[test]
+    fn a_spawn_reports_a_program_that_is_not_installed() {
+        assert_eq!(
+            spawn::<{ ARG_CAP + 1 }>("bnklaunch-test-no-such-program", &[]),
+            Err(Error::from_errno(syscall::ENOENT))
+        );
+        assert_eq!(spawn::<{ ARG_CAP + 1 }>("true", &[]), Ok(()));
+    }
+
+    /// The window stays up until the launcher exits, so a child that never
+    /// reaches its exec must not hold the launcher with it.
+    #[test]
+    fn a_child_that_never_reports_counts_as_launched() {
+        let mut fds = [0i32; 2];
+        assert_eq!(syscall::pipe2(&mut fds, syscall::O_CLOEXEC), 0);
+        let (read_end, _write_end) = (syscall::Fd::new(fds[0]), syscall::Fd::new(fds[1]));
+        assert_eq!(exec_outcome(&read_end, 10), Ok(()));
     }
 
     #[test]

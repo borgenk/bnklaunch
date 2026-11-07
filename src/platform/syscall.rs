@@ -899,15 +899,23 @@ pub unsafe fn close(fd: RawFd) -> i32 {
     syscall1(nr::CLOSE, fd as usize) as i32
 }
 
-/// Close every file descriptor from first to last, inclusive. Returns 0 or a
-/// negated errno.
-///
-/// # Safety
-///
-/// No live Fd may own a descriptor in the range: it would close that number
-/// again when dropped, by then possibly someone else's.
-pub unsafe fn close_range(first: u32, last: u32) -> i32 {
-    syscall3(nr::CLOSE_RANGE, first as usize, last as usize, 0) as i32
+/// close_range flag: mark the descriptors close-on-exec, closing none (Linux 5.11).
+const CLOSE_RANGE_CLOEXEC: usize = 1 << 2;
+
+/// Mark every file descriptor from first to last, inclusive, close-on-exec.
+/// Returns 0 or a negated errno. Nothing closes before an exec, so an Fd that
+/// owns one of them still owns an open descriptor.
+pub fn close_range_on_exec(first: u32, last: u32) -> i32 {
+    // SAFETY: no pointer crosses the boundary, and with the flag the kernel only
+    // marks each descriptor close-on-exec.
+    unsafe {
+        syscall3(
+            nr::CLOSE_RANGE,
+            first as usize,
+            last as usize,
+            CLOSE_RANGE_CLOEXEC,
+        ) as i32
+    }
 }
 
 /// Write a buffer to a file descriptor. Returns the bytes written or a negated
