@@ -26,8 +26,9 @@
 //!   version      u8
 //!   fingerprint  u64   newest mtime of the scanned application dirs (nanos)
 //!   count        u32
-//!   per entry:   u16 name len + utf-8, u16 exec len + utf-8, then u8 flags
-//!                (bit 0: Terminal=true)
+//!   per entry:   u16 name len + utf-8, u16 exec len + utf-8, u8 flags
+//!                (bit 0: Terminal=true), then u16 TryExec len + utf-8, empty
+//!                for none
 //!   recents:     u16 count, then per name u16 len + utf-8
 
 use crate::desktop::{Catalog, DesktopEntry, NAME_CAP, RESULT_CAP};
@@ -38,7 +39,7 @@ use crate::platform::syscall::{self, Fd, AT_FDCWD, O_CLOEXEC, O_WRONLY, SEEK_SET
 use crate::platform::{env, fs};
 
 const MAGIC: &[u8; 4] = b"BNKL";
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 
 /// The flags byte's bit for an entry that runs in a terminal.
 const FLAG_TERMINAL: u8 = 1;
@@ -226,6 +227,7 @@ pub(crate) fn encode(
         write_string(&mut out, &entry.exec)?;
         let flags = if entry.terminal { FLAG_TERMINAL } else { 0 };
         write_bytes(&mut out, &[flags])?;
+        write_string(&mut out, &entry.try_exec)?;
     }
     let recents_offset = out.len() as u64;
     write_bytes(&mut out, &encode_recents(recents)?)?;
@@ -273,12 +275,18 @@ pub(crate) fn decode(data: &[u8]) -> Option<Cached> {
         let name = r.string()?;
         let exec = r.string()?;
         let flags = r.u8()?;
+        let try_exec = r.string()?;
         // A stored field longer than an entry can hold is dropped, not
-        // truncated; the record is still consumed so the stream stays aligned.
-        if let Some(mut entry) = DesktopEntry::new(name, exec) {
-            entry.terminal = flags & FLAG_TERMINAL != 0;
-            let _ = entries.push(entry);
+        // truncated; the record is already consumed, so the stream stays
+        // aligned.
+        let Some(mut entry) = DesktopEntry::new(name, exec) else {
+            continue;
+        };
+        if entry.try_exec.push_str(try_exec).is_err() {
+            continue;
         }
+        entry.terminal = flags & FLAG_TERMINAL != 0;
+        let _ = entries.push(entry);
     }
 
     let recents_offset = r.cur.pos() as u64;
@@ -389,6 +397,7 @@ mod tests {
             assert_eq!(x.name, y.name);
             assert_eq!(x.exec, y.exec);
             assert_eq!(x.terminal, y.terminal);
+            assert_eq!(x.try_exec, y.try_exec);
         }
     }
 
@@ -405,6 +414,7 @@ mod tests {
     fn round_trips_entries_fingerprint_and_recents() {
         let mut btop = entry("btop", "btop");
         btop.terminal = true;
+        btop.try_exec.push_str("btop").unwrap();
         let entries = vec![
             entry("Firefox", "firefox %u"),
             btop,
@@ -466,9 +476,11 @@ mod tests {
         write_string(&mut data, "Keep").unwrap();
         write_string(&mut data, "ok").unwrap();
         let _ = data.push(0); // flags
+        write_string(&mut data, "").unwrap(); // no TryExec
         write_string(&mut data, &long).unwrap();
         write_string(&mut data, "exec").unwrap();
         let _ = data.push(0); // flags
+        write_string(&mut data, "").unwrap(); // no TryExec
         let _ = data.extend_from_slice(&0u16.to_le_bytes()); // no recents
 
         let decoded = decode(&data).expect("decode");
@@ -504,7 +516,7 @@ mod tests {
         assert!(decoded.recents.is_empty());
     }
 
-    /// One entry whose name and exec sit at their field caps: 1285 encoded
+    /// One entry whose name and exec sit at their field caps: 1287 encoded
     /// bytes, so 409 of them overflow CACHE_MAX.
     fn max_entry(i: usize) -> DesktopEntry {
         let mut name = format!("{:04}", i);
@@ -517,9 +529,9 @@ mod tests {
     fn encode_at_the_cap_still_round_trips() {
         let mut entries: Vec<DesktopEntry> = Vec::new();
         let mut encoded = 17; // magic, version, fingerprint, count
-        while encoded + 1285 + RECENTS_ENC_CAP <= CACHE_MAX {
+        while encoded + 1287 + RECENTS_ENC_CAP <= CACHE_MAX {
             entries.push(max_entry(entries.len()));
-            encoded += 1285;
+            encoded += 1287;
         }
         let recents = names(&["0000"]);
         let decoded = decode(&bytes(&entries, 1, &recents)).expect("decode");

@@ -88,27 +88,41 @@ fn exec_target<'a>(
     Ok(program)
 }
 
-/// Drop the entries that cannot start here. A Terminal=true app starts through
-/// the terminal runner, and without one it would run with no window at all.
-/// in_flatpak and path are the sandbox check and PATH, passed in.
+/// Drop the entries that cannot start here: one whose TryExec program is not
+/// installed, and a Terminal=true app when the terminal runner is not, since it
+/// would run with no window at all. in_flatpak and path are the sandbox check
+/// and PATH, passed in.
 pub fn drop_unlaunchable(entries: &mut Catalog, in_flatpak: bool, path: Option<&str>) {
-    if !entries.iter().any(|e| e.terminal) || terminal_runner_found(in_flatpak, path) {
-        return;
-    }
-    entries.retain(|e| !e.terminal);
+    let runner_found =
+        entries.iter().any(|e| e.terminal) && program_found(TERMINAL_RUNNER, in_flatpak, path);
+    entries.retain(|e| {
+        (!e.terminal || runner_found)
+            && (e.try_exec.is_empty() || program_found(&e.try_exec, in_flatpak, path))
+    });
 }
 
-/// Whether the terminal runner is installed: on PATH, or in the host's program
-/// directories when sandboxed, since flatpak-spawn runs it on the host.
-fn terminal_runner_found(in_flatpak: bool, path: Option<&str>) -> bool {
-    let found = |dir: &str| fs::join(dir, TERMINAL_RUNNER).is_some_and(|p| fs::is_executable(&p));
+/// Whether a program is installed. A bare name is looked up on PATH, or in the
+/// host's program directories when sandboxed, since flatpak-spawn runs it on
+/// the host. The sandbox sees only the host's /usr, so an absolute path outside
+/// it counts as installed.
+fn program_found(program: &str, in_flatpak: bool, path: Option<&str>) -> bool {
+    let in_dir = |dir: &str| fs::join(dir, program).is_some_and(|p| fs::is_executable(&p));
+    if let Some(relative) = program.strip_prefix('/') {
+        if !in_flatpak {
+            return fs::is_executable(program);
+        }
+        if !program.starts_with("/usr/") {
+            return true;
+        }
+        return fs::join("/run/host", relative).is_some_and(|p| fs::is_executable(&p));
+    }
     if in_flatpak {
-        return HOST_BIN_DIRS.iter().any(|dir| found(dir));
+        return HOST_BIN_DIRS.iter().any(|dir| in_dir(dir));
     }
     path.unwrap_or_default()
         .split(':')
         .filter(|dir| !dir.is_empty())
-        .any(found)
+        .any(in_dir)
 }
 
 /// Open a URL in the user's default browser via xdg-open.
@@ -450,6 +464,57 @@ mod tests {
 
         std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         assert_eq!(offered(&path), ["Files", "btop"], "a runner on PATH");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An entry whose TryExec program is not installed is not offered. A bare
+    /// name is looked up on PATH, an absolute path is checked as written, and
+    /// an entry with no TryExec is always offered.
+    #[test]
+    fn entries_are_offered_only_when_their_try_exec_program_is_installed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = format!(
+            "{}/bnk_launch_try_exec_{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let program = format!("{dir}/bnk-try-exec-probe");
+        std::fs::write(&program, "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let offered = |try_exec: &str, path: &str| {
+            let mut entries = Catalog::new();
+            let mut entry = DesktopEntry::new("Probe", "probe").expect("entry");
+            entry.try_exec.push_str(try_exec).expect("fits");
+            entries.push(entry).expect("room");
+            drop_unlaunchable(&mut entries, false, Some(path));
+            !entries.is_empty()
+        };
+
+        let path = format!("/nonexistent:{dir}");
+        assert!(offered("", "/nonexistent"), "no TryExec");
+        assert!(offered("bnk-try-exec-probe", &path), "found on PATH");
+        assert!(
+            !offered("bnk-try-exec-probe", "/nonexistent"),
+            "not on PATH"
+        );
+        assert!(
+            offered(&program, "/nonexistent"),
+            "an absolute path that exists"
+        );
+        assert!(
+            !offered(&format!("{dir}/bnk-no-such-program"), &path),
+            "an absolute path that does not"
+        );
+
+        // A sandbox sees the host's /usr under /run/host and nothing else of
+        // its filesystem, so a path outside /usr cannot be checked and stands.
+        assert!(program_found("/opt/probe/bin/probe", true, None));
+        assert!(!program_found("/usr/bin/bnk-no-such-program", true, None));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

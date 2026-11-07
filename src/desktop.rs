@@ -24,6 +24,10 @@ pub const NAME_CAP: usize = 256;
 /// past a few hundred bytes, and dropping those installed apps is worse than
 /// the extra catalog bytes.
 pub const EXEC_CAP: usize = 1024;
+
+/// Byte capacity of an entry's TryExec program: a command name or an absolute
+/// path. A longer one skips the entry, as an oversized Name or Exec does.
+pub const TRY_EXEC_CAP: usize = 128;
 /// Byte capacity of one tokenized Exec argument. Tokenizing only ever removes
 /// characters from the Exec value, so an argument cannot outgrow the value it
 /// came from: matching EXEC_CAP here makes a truncated argument impossible
@@ -110,6 +114,9 @@ pub struct DesktopEntry {
     /// Terminal=true: the program runs in a terminal window, which the launch
     /// has to open for it.
     pub terminal: bool,
+    /// TryExec: a program that has to be installed for the entry to be offered,
+    /// or empty.
+    pub try_exec: ArrayString<TRY_EXEC_CAP>,
 }
 
 impl DesktopEntry {
@@ -131,6 +138,7 @@ impl DesktopEntry {
             name_chars: 0,
             exec: ArrayString::new(),
             terminal: false,
+            try_exec: ArrayString::new(),
         }
     }
 
@@ -161,6 +169,7 @@ impl DesktopEntry {
         let mut no_display = false;
         let mut hidden = false;
         let mut terminal = false;
+        let mut try_exec: Option<&str> = None;
 
         for line in content.lines() {
             let line = line.trim();
@@ -198,6 +207,7 @@ impl DesktopEntry {
                     "NoDisplay" => no_display = value == "true",
                     "Hidden" => hidden = value == "true",
                     "Terminal" => terminal = value == "true",
+                    "TryExec" => try_exec = Some(value),
                     _ => {}
                 }
             }
@@ -217,6 +227,9 @@ impl DesktopEntry {
         let mut e = DesktopEntry::blank();
         unescape_into(&mut e.name, name?).ok()?;
         unescape_into(&mut e.exec, exec?).ok()?;
+        if let Some(try_exec) = try_exec {
+            unescape_into(&mut e.try_exec, try_exec).ok()?;
+        }
         e.terminal = terminal;
         e.derive_search_keys();
         Some(e)
@@ -770,6 +783,20 @@ Icon=firefox
         assert!(parse("Terminal=true").terminal);
         assert!(!parse("Terminal=false").terminal);
         assert!(!parse("").terminal);
+    }
+
+    #[test]
+    fn parse_reads_the_try_exec_program() {
+        let content = "[Desktop Entry]\nType=Application\nName=Steam\nExec=steam\nTryExec=/usr/bin/st\\\\eam\n";
+        let entry = DesktopEntry::parse(content).expect("entry");
+        // A string key, so its escapes resolve like Name's and Exec's.
+        assert_eq!(entry.try_exec, "/usr/bin/st\\eam");
+
+        let content = "[Desktop Entry]\nType=Application\nName=Steam\nExec=steam\n";
+        assert!(DesktopEntry::parse(content)
+            .expect("entry")
+            .try_exec
+            .is_empty());
     }
 
     #[test]
