@@ -43,6 +43,8 @@ const MAX_RECV_FDS: usize = 16;
 /// Most fds queued to send at once. Each rides with one request: a frame
 /// pool's memfd or a paste's pipe, a few at a time at most.
 const MAX_OUT_FDS: usize = 8;
+/// What a flush reports once a request has found the output queue full.
+const QUEUE_FULL: Error = Error::msg("wayland send buffer full: the compositor stopped reading");
 /// How long to wait for the compositor's parting words after a failed send.
 const DIAGNOSE_TIMEOUT_MS: i32 = 200;
 
@@ -57,6 +59,10 @@ pub struct Connection {
     /// declares it. An fd is sent with the first byte of its request, so a
     /// write starts at one fd's request and stops short of the next one's.
     out_fds: ArrayVec<(usize, Fd), MAX_OUT_FDS>,
+    /// A request found the queue full. The compositor has stopped reading,
+    /// and every flush from then on fails, so the launcher ends rather than go
+    /// on with requests missing from the stream.
+    out_full: bool,
     in_buf: ArrayVec<u8, RECV_CAP>,
     /// Landing buffer for one recvmsg, holding one whole acceptable message.
     /// Owned by the connection and zeroed once at connect: a local of this size
@@ -133,6 +139,7 @@ impl Connection {
             out: ArrayVec::new(),
             out_pos: 0,
             out_fds: ArrayVec::new(),
+            out_full: false,
             in_buf: ArrayVec::new(),
             chunk: [0; MAX_ACCEPTED],
             in_pos: 0,
@@ -153,6 +160,7 @@ impl Connection {
             out: ArrayVec::new(),
             out_pos: 0,
             out_fds: ArrayVec::new(),
+            out_full: false,
             in_buf: ArrayVec::new(),
             chunk: [0; MAX_ACCEPTED],
             in_pos: 0,
@@ -171,7 +179,10 @@ impl Connection {
     pub fn request(&mut self, object: u32, opcode: u16, args: &[Arg]) -> Result<()> {
         if wire::encode(&mut self.out, object, opcode, args).is_err() {
             self.compact_out();
-            wire::encode(&mut self.out, object, opcode, args)?;
+            if let Err(e) = wire::encode(&mut self.out, object, opcode, args) {
+                self.out_full = true;
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -204,9 +215,11 @@ impl Connection {
             self.compact_out();
         }
         let offset = self.out.len();
-        self.out
-            .extend_from_slice(&msg)
-            .map_err(|_| Error::msg("wayland send buffer full"))?;
+        if self.out.remaining() < msg.len() {
+            self.out_full = true;
+            return Err(QUEUE_FULL);
+        }
+        let _ = self.out.extend_from_slice(&msg);
         while let Some(fd) = dups.remove(0) {
             let _ = self.out_fds.push((offset, fd));
         }
@@ -224,6 +237,9 @@ impl Connection {
     /// is writable. On a blocking socket, as during bring-up, the send waits
     /// instead, and the queue is empty when this returns.
     pub fn flush(&mut self) -> Result<()> {
+        if self.out_full {
+            return Err(QUEUE_FULL);
+        }
         while self.out_pos < self.out.len() {
             let pos = self.out_pos;
             let riding = self
@@ -739,6 +755,24 @@ mod tests {
         let mut got = [0u8; 2];
         assert_eq!(syscall::read_fd(read_end.as_raw_fd(), &mut got), 1);
         assert_eq!(syscall::read_fd(read_end.as_raw_fd(), &mut got), 0);
+    }
+
+    #[test]
+    fn a_request_that_finds_the_queue_full_fails_every_flush_after() {
+        // A compositor that stops reading leaves requests piling up. The one
+        // that does not fit is lost, so the stream is missing a request from
+        // then on, and the requests after it must not go out without it.
+        let (mut conn, _peer) = Connection::pair();
+        conn.set_nonblocking(true).expect("nonblocking");
+        stuff(&conn);
+        let mut queued = 0;
+        while conn.request(7, proto::wl_surface::COMMIT, &[]).is_ok() {
+            queued += 1;
+            conn.flush().expect("a full socket is not an error");
+        }
+        assert!(queued > 0, "the queue took nothing");
+        assert_eq!(conn.flush(), Err(QUEUE_FULL));
+        assert_eq!(conn.flush(), Err(QUEUE_FULL), "and it stays failed");
     }
 
     /// Whether the peer has nothing left to read right now.
