@@ -10,7 +10,7 @@
 use crate::editor::INPUT_CAP;
 use crate::platform::arena::{ArrayString, ArrayVec};
 use crate::platform::conn::Connection;
-use crate::platform::error::{Error, Result};
+use crate::platform::error::{elog, Error, Result};
 use crate::platform::protocol as proto;
 use crate::platform::syscall::{self, Fd, RawFd};
 use crate::platform::time::Instant;
@@ -25,82 +25,101 @@ pub const CLIP_CAP: usize = 4096;
 /// only a couple in flight.
 const RETIRED_CAP: usize = 8;
 
-/// Total budget for draining one clipboard pipe.
+/// How long a paste may take, from its request to the owner's last byte.
 ///
-/// The deadline covers the whole transfer, not each wait. A peer that opens the
+/// The deadline covers the whole transfer, not each read. A peer that opens the
 /// pipe and never writes has to be given up on, but so does one that dribbles a
-/// byte just inside every wait: per-wait timeouts alone let it hold the launcher
-/// for as long as it cares to.
+/// byte at a time: a per-read timeout alone lets it hold the paste open for as
+/// long as it cares to.
 const CLIPBOARD_TIMEOUT_MS: u64 = 2000;
 
-/// Drain a clipboard pipe read end and decode it as UTF-8 text.
-pub fn read_text(read_end: Fd) -> Result<ArrayString<CLIP_CAP>> {
-    let buf = read_pipe(read_end)?;
-    // The byte cap can split the final codepoint, so decode the valid prefix
-    // rather than dropping the whole paste when the tail is a partial codepoint.
-    // The prefix stops at the first invalid byte, so this still never mojibakes.
-    let mut text: ArrayString<CLIP_CAP> = ArrayString::new();
-    let valid_len = core::str::from_utf8(&buf).map_or_else(|e| e.valid_up_to(), |s| s.len());
-    if let Ok(s) = core::str::from_utf8(&buf[..valid_len]) {
-        let _ = text.push_str(s);
-    }
-    Ok(text)
+/// A paste in flight: the pipe the clipboard's owner writes into, the bytes so
+/// far, and when it started. The event loop polls the pipe and calls advance
+/// when it is readable, so the launcher keeps working while the owner takes its
+/// time.
+pub struct Paste {
+    read_end: Fd,
+    buf: ArrayVec<u8, CLIP_CAP>,
+    started: Instant,
 }
 
-/// Drain a pipe read end into a buffer, bounded by a byte cap and a total
-/// deadline. Each read is gated on poll, and every wait shares the one budget,
-/// so no peer can hold the launcher past it.
-fn read_pipe(read_end: Fd) -> Result<ArrayVec<u8, CLIP_CAP>> {
-    let fd = read_end.as_raw_fd();
-    let mut buf: ArrayVec<u8, CLIP_CAP> = ArrayVec::new();
-    let mut chunk = [0u8; 8192];
-    let start = Instant::now();
-
-    while !buf.is_full() {
-        let elapsed = start.elapsed_ms();
-        if elapsed >= CLIPBOARD_TIMEOUT_MS {
-            return Err(Error::msg("clipboard read timed out"));
+impl Paste {
+    /// A paste reading from read_end, which is made non-blocking so a read
+    /// never waits on the owner.
+    pub fn new(read_end: Fd) -> Result<Self> {
+        let fd = read_end.as_raw_fd();
+        let flags = syscall::fcntl(fd, syscall::F_GETFL, 0);
+        if flags < 0 {
+            return Err(Error::from_errno(-flags));
         }
-        // Under the deadline, so what is left of it fits an i32 comfortably.
-        let wait_ms = (CLIPBOARD_TIMEOUT_MS - elapsed) as i32;
-
-        let mut pfd = syscall::pollfd {
-            fd,
-            events: syscall::POLLIN,
-            revents: 0,
-        };
-        // An interrupted wait retries through the outer loop, which charges the
-        // time already spent against the deadline first.
-        let ready = syscall::poll(core::slice::from_mut(&mut pfd), wait_ms);
-        if ready == -(syscall::EINTR as isize) {
-            continue;
+        let r = syscall::fcntl(fd, syscall::F_SETFL, flags | syscall::O_NONBLOCK);
+        if r < 0 {
+            return Err(Error::from_errno(-r));
         }
-        if ready < 0 {
-            return Err(Error::from_errno(-ready as i32));
-        }
-        if ready == 0 {
-            return Err(Error::msg("clipboard read timed out"));
-        }
-
-        let want = chunk.len().min(buf.remaining());
-        let n = syscall::read_fd(fd, &mut chunk[..want]);
-        if n == -(syscall::EINTR as isize) {
-            continue;
-        }
-        if n < 0 {
-            let err = -n as i32;
-            if err == syscall::EAGAIN {
-                continue;
-            }
-            return Err(Error::from_errno(err));
-        }
-        if n == 0 {
-            break; // EOF: the owner finished writing and closed its end.
-        }
-        let _ = buf.extend_from_slice(&chunk[..n as usize]);
+        Ok(Self {
+            read_end,
+            buf: ArrayVec::new(),
+            started: Instant::now(),
+        })
     }
 
-    Ok(buf)
+    /// The pipe, for the event loop to poll.
+    pub fn fd(&self) -> RawFd {
+        self.read_end.as_raw_fd()
+    }
+
+    /// Milliseconds left before the paste is given up on.
+    pub fn remaining_ms(&self) -> u64 {
+        CLIPBOARD_TIMEOUT_MS.saturating_sub(self.started.elapsed_ms())
+    }
+
+    /// Take whatever the pipe holds now, without waiting. True once the paste
+    /// is done: the owner closed its end, or the cap was reached. An error once
+    /// the deadline has passed with the owner still not done.
+    pub fn advance(&mut self) -> Result<bool> {
+        let mut chunk = [0u8; 4096];
+        while !self.buf.is_full() {
+            let want = chunk.len().min(self.buf.remaining());
+            let n = syscall::read_fd(self.fd(), &mut chunk[..want]);
+            if n > 0 {
+                let _ = self.buf.extend_from_slice(&chunk[..n as usize]);
+                continue;
+            }
+            if n == 0 {
+                // EOF: the owner finished writing and closed its end.
+                return Ok(true);
+            }
+            match -n as i32 {
+                syscall::EINTR => continue,
+                syscall::EAGAIN if self.remaining_ms() == 0 => {
+                    return Err(Error::msg("clipboard read timed out"));
+                }
+                syscall::EAGAIN => return Ok(false),
+                e => return Err(Error::from_errno(e)),
+            }
+        }
+        Ok(true)
+    }
+
+    /// What has arrived, as text. The byte cap can split the final codepoint,
+    /// so the valid prefix is kept rather than the whole paste dropped; the
+    /// prefix stops at the first invalid byte, so this never mojibakes.
+    pub fn text(&self) -> ArrayString<CLIP_CAP> {
+        let buf = self.buf.as_slice();
+        let mut text: ArrayString<CLIP_CAP> = ArrayString::new();
+        let valid_len = core::str::from_utf8(buf).map_or_else(|e| e.valid_up_to(), |s| s.len());
+        if let Ok(s) = core::str::from_utf8(&buf[..valid_len]) {
+            let _ = text.push_str(s);
+        }
+        text
+    }
+}
+
+/// What a paste gets at once: the text, when the launcher owns the selection,
+/// or a transfer to wait on.
+pub enum Received {
+    Text(ArrayString<CLIP_CAP>),
+    Pending(Paste),
 }
 
 /// Text MIME types accepted from the clipboard, ordered worst to best so the
@@ -248,7 +267,7 @@ impl Clipboard {
                     // it would only add a way for this to fail.
                     if let Some(fd) = conn.take_fd() {
                         if let Some(ref text) = self.source_text {
-                            write_all(fd.as_raw_fd(), text.as_bytes());
+                            send_text(fd.as_raw_fd(), text.as_bytes());
                         }
                         // fd closes as it drops here, which is the EOF the
                         // reader on the other end is waiting for.
@@ -340,17 +359,14 @@ impl Clipboard {
         Ok(())
     }
 
-    /// The text on the clipboard.
-    ///
-    /// When we own the selection the answer is already in hand, and it has to be:
-    /// asking the compositor for our own offer would deadlock, since it would
-    /// send us the request for the data on the same connection we are blocked on
-    /// reading.
-    pub fn read(&mut self, conn: &mut Connection) -> Result<ArrayString<CLIP_CAP>> {
+    /// Ask for the text on the clipboard. When the launcher owns the selection
+    /// the text is already in hand; otherwise the owner is asked to write it
+    /// into a pipe, and the paste waits on that.
+    pub fn receive(&mut self, conn: &mut Connection) -> Result<Received> {
         if let Some(ref owned) = self.source_text {
             let mut text: ArrayString<CLIP_CAP> = ArrayString::new();
             let _ = text.push_str(owned.as_str());
-            return Ok(text);
+            return Ok(Received::Text(text));
         }
 
         let offer_id = self
@@ -382,19 +398,36 @@ impl Clipboard {
         // SCM_RIGHTS, so the pipe reaches EOF once the owner has finished.
         drop(write_end);
 
-        read_text(read_end)
+        Ok(Received::Pending(Paste::new(read_end)?))
     }
 }
 
-/// Write every byte to a file descriptor, riding out partial writes.
-fn write_all(fd: RawFd, data: &[u8]) {
+/// Hand the selection's text to whoever asked for it. The pipe is the
+/// requester's, so it is made non-blocking first: one that never drains its
+/// pipe must not stall the launcher. The text is at most INPUT_CAP bytes, under
+/// a pipe's smallest capacity, so an empty pipe takes it all in one write, and a
+/// requester whose pipe cannot gets what fit.
+fn send_text(fd: RawFd, data: &[u8]) {
+    let flags = syscall::fcntl(fd, syscall::F_GETFL, 0);
+    if flags >= 0 {
+        syscall::fcntl(fd, syscall::F_SETFL, flags | syscall::O_NONBLOCK);
+    }
     let mut offset = 0;
     while offset < data.len() {
         let n = syscall::write_fd(fd, &data[offset..]);
+        if n == -(syscall::EINTR as isize) {
+            continue;
+        }
         if n <= 0 {
             break;
         }
         offset += n as usize;
+    }
+    if offset < data.len() {
+        elog!(
+            "bnklaunch: a clipboard request took {offset} of {} bytes: its pipe is full",
+            data.len()
+        );
     }
 }
 
@@ -418,23 +451,30 @@ mod tests {
         read_end
     }
 
+    /// Advance a paste whose owner has already written everything and closed.
+    fn pasted(data: &[u8]) -> ArrayString<CLIP_CAP> {
+        let mut paste = Paste::new(pipe_with(data)).expect("paste");
+        assert!(
+            paste.advance().expect("advance"),
+            "a closed pipe is a finished paste"
+        );
+        paste.text()
+    }
+
     #[test]
     fn reads_until_the_writer_closes() {
-        let text = read_text(pipe_with(b"hello clipboard")).expect("read");
-        assert_eq!(text, "hello clipboard");
+        assert_eq!(pasted(b"hello clipboard"), "hello clipboard");
     }
 
     #[test]
     fn empty_pipe_yields_empty_text() {
-        let text = read_text(pipe_with(b"")).expect("read");
-        assert!(text.is_empty());
+        assert!(pasted(b"").is_empty());
     }
 
     #[test]
     fn stops_at_the_cap() {
         let data = vec![b'x'; CLIP_CAP + 100];
-        let text = read_text(pipe_with(&data)).expect("read");
-        assert_eq!(text.len(), CLIP_CAP);
+        assert_eq!(pasted(&data).len(), CLIP_CAP);
     }
 
     #[test]
@@ -443,21 +483,42 @@ mod tests {
         // The cap keeps the leading byte only, and decoding stops before it.
         let mut data = vec![b'a'; CLIP_CAP - 1];
         data.extend_from_slice("é".as_bytes());
-        let text = read_text(pipe_with(&data)).expect("read");
+        let text = pasted(&data);
         assert_eq!(text.len(), CLIP_CAP - 1);
         assert!(text.as_str().chars().all(|c| c == 'a'));
     }
 
+    /// The owner writes in pieces. Each advance takes what is there and returns
+    /// without waiting for more, and the text is whole once the owner closes.
     #[test]
-    fn a_writer_that_never_writes_times_out() {
+    fn a_paste_advances_as_its_owner_writes() {
+        let mut fds = [0i32; 2];
+        assert_eq!(syscall::pipe2(&mut fds, syscall::O_CLOEXEC), 0);
+        let (read_end, write_end) = (Fd::new(fds[0]), Fd::new(fds[1]));
+        let mut paste = Paste::new(read_end).expect("paste");
+
+        assert_eq!(paste.advance(), Ok(false));
+        assert_eq!(syscall::write_fd(write_end.as_raw_fd(), b"ab"), 2);
+        assert_eq!(paste.advance(), Ok(false));
+        assert_eq!(syscall::write_fd(write_end.as_raw_fd(), b"c"), 1);
+        drop(write_end);
+        assert_eq!(paste.advance(), Ok(true), "the owner closed");
+        assert_eq!(paste.text(), "abc");
+    }
+
+    #[test]
+    fn an_owner_that_never_writes_runs_out_the_deadline() {
         // The write end stays open and idle, so no data and no EOF ever arrive.
         let mut fds = [0i32; 2];
         assert_eq!(syscall::pipe2(&mut fds, syscall::O_CLOEXEC), 0);
         let (read_end, _write_end) = (Fd::new(fds[0]), Fd::new(fds[1]));
+        let mut paste = Paste::new(read_end).expect("paste");
         let start = Instant::now();
-        assert!(read_text(read_end).is_err());
-        // The whole call is bounded by the one deadline.
+        while paste.remaining_ms() > 0 {
+            assert_eq!(paste.advance(), Ok(false));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(paste.advance().is_err());
         assert!(start.elapsed_ms() >= CLIPBOARD_TIMEOUT_MS);
-        assert!(start.elapsed_ms() < CLIPBOARD_TIMEOUT_MS * 2);
     }
 }

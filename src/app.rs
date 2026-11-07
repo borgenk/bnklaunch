@@ -16,12 +16,17 @@ use crate::{cache, config, denylist, font, launch, ui};
 /// long.
 const CURSOR_BLINK_MS: u64 = 530;
 
-/// Submission-queue depth for the event-loop ring. One operation is in flight
-/// at a time, the socket poll, re-armed as it fires.
+/// Submission-queue depth for the event-loop ring. A few polls are in flight
+/// at a time, each re-armed as it fires: the socket and a paste's pipe, plus a
+/// finished paste's poll that has yet to complete.
 const RING_ENTRIES: u32 = 32;
 
-/// io_uring user_data tag of the socket poll.
+/// io_uring user_data of the socket poll.
 const K_WAYLAND: u64 = 1;
+/// io_uring user_data of a paste pipe's poll: this tag, ored with the paste's
+/// serial, so a poll left over from a finished paste is told apart from the
+/// current one's.
+const K_PASTE: u64 = 1 << 32;
 
 /// What a key press means to the launcher.
 ///
@@ -381,14 +386,37 @@ fn event_loop(
     let arm_failed = || Error::msg("io_uring submission queue full");
     ring.prep_poll_add(wl_fd, syscall::POLLIN as u32, K_WAYLAND)
         .map_err(|_| arm_failed())?;
+    // The serial of the paste whose pipe has a poll in flight.
+    let mut paste_armed: Option<u64> = None;
 
     // Event loop
     while client.running {
-        // Park until the socket is readable or something is due.
-        let park = park_ms(client.key_repeat.time_until_due(), last_blink.elapsed_ms());
+        // Watch a pending paste's pipe. A poll is armed once per readiness, and
+        // its completion clears the mark so the next turn arms it again.
+        if let Some(paste) = &client.paste {
+            if paste_armed != Some(client.paste_serial) {
+                ring.prep_poll_add(
+                    paste.fd(),
+                    syscall::POLLIN as u32,
+                    K_PASTE | client.paste_serial,
+                )
+                .map_err(|_| arm_failed())?;
+                paste_armed = Some(client.paste_serial);
+            }
+        }
+
+        // Park until the socket or a paste's pipe is readable, or something is
+        // due: a key repeat, the caret blink, or a paste's deadline.
+        let mut park = park_ms(client.key_repeat.time_until_due(), last_blink.elapsed_ms());
+        if let Some(paste) = &client.paste {
+            park = park.min(paste.remaining_ms());
+        }
         ring.submit_and_wait_timeout(park * 1_000_000)
             .map_err(Error::from_errno)?;
         while let Some(cqe) = ring.next_cqe() {
+            if cqe.user_data == K_PASTE | client.paste_serial {
+                paste_armed = None;
+            }
             if cqe.user_data != K_WAYLAND {
                 continue;
             }
@@ -410,6 +438,7 @@ fn event_loop(
             }
         }
         client.process_key_repeat();
+        client.advance_paste();
 
         // Handle pending actions. Up and Down wrap around the result list. A
         // move only repaints the highlight; it must not touch the caret blink.

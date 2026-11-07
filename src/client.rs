@@ -1,6 +1,6 @@
 //! High-level Wayland client state machine.
 
-use crate::clipboard::{self, Clipboard};
+use crate::clipboard::{self, Clipboard, Paste, Received};
 use crate::platform::arena::{ArrayString, ArrayVec};
 use crate::platform::error::{elog, Error, Result};
 use crate::platform::syscall;
@@ -215,6 +215,10 @@ pub struct Client {
     pub clipboard_op: clipboard::Op,
     /// The clipboard's protocol state.
     pub clipboard: Clipboard,
+    /// A paste waiting on the clipboard's owner. paste_serial counts every paste
+    /// started, so the event loop can tell this one's poll from an earlier one's.
+    pub paste: Option<Paste>,
+    pub paste_serial: u64,
     /// Serial of the most recent input event, required to set the selection.
     pub last_serial: u32,
     /// Flag indicating input changed (for redraw)
@@ -251,6 +255,8 @@ impl Client {
             editor: Editor::new(),
             clipboard_op: clipboard::Op::None,
             clipboard: Clipboard::default(),
+            paste: None,
+            paste_serial: 0,
             last_serial: 0,
             input_changed: false,
             pending_action: PendingAction::None,
@@ -744,6 +750,30 @@ impl Client {
         self.input_changed = true;
     }
 
+    /// Take what the pending paste's pipe holds, and finish the paste once the
+    /// owner is done or its deadline has passed.
+    pub fn advance_paste(&mut self) {
+        let Some(paste) = self.paste.as_mut() else {
+            return;
+        };
+        match paste.advance() {
+            Ok(false) => return,
+            Ok(true) => {
+                let text = paste.text();
+                self.insert_paste(text.as_str());
+            }
+            Err(e) => elog!("bnklaunch: paste failed: {e}"),
+        }
+        self.paste = None;
+    }
+
+    fn insert_paste(&mut self, text: &str) {
+        if !self.editor.paste(text) {
+            elog!("bnklaunch: the pasted text does not fit the input");
+        }
+        self.input_changed = true;
+    }
+
     /// Service the clipboard operation the last key press asked for.
     pub fn process_clipboard(&mut self) {
         let op = core::mem::take(&mut self.clipboard_op);
@@ -776,12 +806,14 @@ impl Client {
                 self.editor.delete_selection();
                 self.input_changed = true;
             }
-            clipboard::Op::Paste => match self.clipboard.read(&mut self.socket) {
-                Ok(text) => {
-                    if !self.editor.paste(&text) {
-                        elog!("bnklaunch: the pasted text does not fit the input");
-                    }
-                    self.input_changed = true;
+            // One paste at a time: another while the first is still arriving
+            // is dropped.
+            clipboard::Op::Paste if self.paste.is_some() => {}
+            clipboard::Op::Paste => match self.clipboard.receive(&mut self.socket) {
+                Ok(Received::Text(text)) => self.insert_paste(text.as_str()),
+                Ok(Received::Pending(paste)) => {
+                    self.paste = Some(paste);
+                    self.paste_serial += 1;
                 }
                 Err(e) => elog!("bnklaunch: paste failed: {e}"),
             },
@@ -1061,6 +1093,13 @@ mod tests {
         (Fd::new(fds[0]), Fd::new(fds[1]))
     }
 
+    /// Everything written into a pipe whose writers have all closed.
+    fn drained(read_end: Fd) -> String {
+        let mut paste = Paste::new(read_end).expect("paste");
+        assert!(paste.advance().expect("read"), "a writer is still open");
+        paste.text().as_str().to_string()
+    }
+
     /// Have the peer ask a data source for its text, passing the write end of a
     /// pipe the way the compositor does.
     fn send_to_source(peer: &Fd, source: u32, write_end: Fd) {
@@ -1095,11 +1134,8 @@ mod tests {
 
         // The stale pipe closes with nothing in it. Read first, because if its
         // fd stayed queued, the live send took it and wrote here instead.
-        assert_eq!(clipboard::read_text(stale_read).expect("stale pipe"), "");
-        assert_eq!(
-            clipboard::read_text(live_read).expect("live pipe"),
-            "second"
-        );
+        assert_eq!(drained(stale_read), "");
+        assert_eq!(drained(live_read), "second");
     }
 
     /// The compositor cancels a source when another client takes the
