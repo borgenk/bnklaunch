@@ -6,12 +6,13 @@
 //! code, so nothing here builds a msghdr.
 //!
 //! The socket is non-blocking, because the event loop waits on it through
-//! io_uring rather than inside a read. Two consequences shape the code here.
-//! fill takes no timeout: the waiting happens a layer up, and a drained socket
-//! simply reports a would-block. And flush has to answer a would-block itself
-//! rather than pass it on, because a write can be cut short halfway through a
-//! request: the bytes already in the compositor's buffer are half a message, and
-//! only finishing them makes the stream whole again.
+//! io_uring rather than inside a read or a write. fill takes no timeout: the
+//! waiting happens a layer up, and a drained socket simply reports a
+//! would-block. flush sends what the socket takes and keeps the rest, whole and
+//! in order, for the next flush, which the loop makes once the socket is
+//! writable: a write cut short halfway through a request has left half a message
+//! in the compositor's buffer, and only the rest of that same message, sent
+//! next, makes the stream whole again.
 
 use crate::platform::arena::{ArrayString, ArrayVec};
 use crate::platform::env;

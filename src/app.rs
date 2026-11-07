@@ -16,10 +16,9 @@ use crate::{cache, config, denylist, font, launch, ui};
 /// long.
 const CURSOR_BLINK_MS: u64 = 530;
 
-/// Submission-queue depth for the event-loop ring. A few polls are in flight
-/// at a time, each re-armed as it fires: the socket for reading and, while
-/// requests are backed up, for writing; a paste's pipe; and a finished paste's
-/// poll that has yet to complete.
+/// Submission-queue depth for the event-loop ring. A turn queues at most three
+/// polls, each one-shot and re-armed as it fires: the socket for reading and,
+/// while requests are backed up, for writing, and a paste's pipe.
 const RING_ENTRIES: u32 = 32;
 
 /// Most messages one loop turn handles. A burst bigger than this is finished
