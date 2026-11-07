@@ -12,9 +12,10 @@
 //! dead and never read without being written first. len drops before a vacated
 //! top slot can be observed, and a bulk drop sets len to its final value before
 //! dropping anything, so a panicking Drop cannot revisit a slot already dropped.
-//! ArrayString keeps the parallel invariant that buf[..len] is always valid
-//! UTF-8, since every writer appends or moves whole code points and checks char
-//! boundaries. The SAFETY comments below name this rather than restate it.
+//! ArrayString holds [MaybeUninit<u8>; N] under the same rule, and buf[..len] is
+//! also always valid UTF-8, since every writer appends or moves whole code
+//! points and checks char boundaries. The SAFETY comments below name this
+//! rather than restate it.
 
 use core::fmt;
 use core::mem::MaybeUninit;
@@ -255,16 +256,18 @@ impl<T, const N: usize> DerefMut for ArrayVec<T, N> {
 ///
 /// Only whole str and char pushes are accepted, so the bytes stay valid UTF-8
 /// and as_str needs no revalidation. Writes that would overflow are reported.
+/// The bytes past len are not written until they are needed, so making one
+/// writes nothing whatever its capacity.
 #[derive(Clone, Copy)]
 pub struct ArrayString<const N: usize> {
-    buf: [u8; N],
+    buf: [MaybeUninit<u8>; N],
     len: usize,
 }
 
 impl<const N: usize> ArrayString<N> {
     pub const fn new() -> Self {
         Self {
-            buf: [0; N],
+            buf: [MaybeUninit::uninit(); N],
             len: 0,
         }
     }
@@ -282,13 +285,13 @@ impl<const N: usize> ArrayString<N> {
     }
 
     pub fn as_str(&self) -> &str {
-        // SAFETY: only push_str and push(char) write the buffer, both of which
-        // append valid UTF-8, so buf[..len] is always a valid str.
-        unsafe { core::str::from_utf8_unchecked(&self.buf[..self.len]) }
+        // SAFETY: buf[..len] is valid UTF-8 (the module invariant).
+        unsafe { core::str::from_utf8_unchecked(self.as_bytes()) }
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.buf[..self.len]
+        // SAFETY: buf[..len] is initialized (the module invariant), and len <= N.
+        unsafe { core::slice::from_raw_parts(self.buf.as_ptr().cast::<u8>(), self.len) }
     }
 
     /// Append a string slice. Returns Err and writes nothing when it would not
@@ -298,7 +301,7 @@ impl<const N: usize> ArrayString<N> {
         if self.len + bytes.len() > N {
             return Err(());
         }
-        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        write_bytes(&mut self.buf[self.len..self.len + bytes.len()], bytes);
         self.len += bytes.len();
         Ok(())
     }
@@ -319,7 +322,7 @@ impl<const N: usize> ArrayString<N> {
             return Err(());
         }
         self.buf.copy_within(idx..self.len, idx + add);
-        self.buf[idx..idx + add].copy_from_slice(s.as_bytes());
+        write_bytes(&mut self.buf[idx..idx + add], s.as_bytes());
         self.len += add;
         Ok(())
     }
@@ -358,6 +361,13 @@ impl<const N: usize> ArrayString<N> {
         self.buf.copy_within(end..self.len, start);
         self.len -= end - start;
         Ok(())
+    }
+}
+
+/// Copy src into dst, which has the same length.
+fn write_bytes(dst: &mut [MaybeUninit<u8>], src: &[u8]) {
+    for (slot, &byte) in dst.iter_mut().zip(src) {
+        slot.write(byte);
     }
 }
 
