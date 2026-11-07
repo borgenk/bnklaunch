@@ -605,10 +605,15 @@ fn dispatch_launch(
             let launched = {
                 let (results, _) =
                     resolve_results(text, search_enabled, &state.entries, &state.recents);
-                match results.get(state.selected) {
-                    Some(entry) if launch::launch(entry).is_ok() => Some(entry.name),
-                    _ => None,
-                }
+                results
+                    .get(state.selected)
+                    .and_then(|entry| match launch::launch(entry) {
+                        Ok(()) => Some(entry.name),
+                        Err(e) => {
+                            elog!("bnklaunch: failed to launch {}: {e}", entry.name.as_str());
+                            None
+                        }
+                    })
             };
             if let (Some(name), Some(offset)) = (launched, recents_offset) {
                 let _ = cache::record(offset, &mut state.recents, name.as_str());
