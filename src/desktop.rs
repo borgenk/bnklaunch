@@ -4,6 +4,7 @@
 //! See: https://specifications.freedesktop.org/desktop-entry-spec/latest/
 
 use crate::platform::arena::{ArrayString, ArrayVec};
+use crate::platform::bytes;
 use crate::platform::fs::{join, ScanPath};
 use crate::platform::syscall::{DT_DIR, DT_LNK, DT_REG};
 use crate::platform::{env, fs};
@@ -149,17 +150,19 @@ impl DesktopEntry {
         self.name_chars = self.name.chars().count() as u32;
     }
 
-    /// Parse a desktop file from the given path.
-    pub fn from_file(path: &str) -> Option<Self> {
+    /// Parse a desktop file from the given path. desktops is as for parse.
+    pub fn from_file(path: &str, desktops: &str) -> Option<Self> {
         let mut buf: ArrayVec<u8, DESKTOP_FILE_MAX> = ArrayVec::new();
         fs::read_file(path, &mut buf).ok()?;
         let content = core::str::from_utf8(&buf).ok()?;
-        Self::parse(content)
+        Self::parse(content, desktops)
     }
 
     /// Parse desktop entry content. None when the entry is not a launchable,
     /// visible Application or a required field is missing or oversized.
-    pub(crate) fn parse(content: &str) -> Option<Self> {
+    /// desktops is XDG_CURRENT_DESKTOP's value, which OnlyShowIn and NotShowIn
+    /// are judged against.
+    pub(crate) fn parse(content: &str, desktops: &str) -> Option<Self> {
         let mut in_desktop_entry = false;
         // Track only the keys that matter, as slices into content. A repeated
         // key keeps the last value, matching a map insert.
@@ -170,6 +173,8 @@ impl DesktopEntry {
         let mut hidden = false;
         let mut terminal = false;
         let mut try_exec: Option<&str> = None;
+        let mut only_show_in: Option<&str> = None;
+        let mut not_show_in: Option<&str> = None;
 
         for line in content.lines() {
             let line = line.trim();
@@ -208,6 +213,8 @@ impl DesktopEntry {
                     "Hidden" => hidden = value == "true",
                     "Terminal" => terminal = value == "true",
                     "TryExec" => try_exec = Some(value),
+                    "OnlyShowIn" => only_show_in = Some(value),
+                    "NotShowIn" => not_show_in = Some(value),
                     _ => {}
                 }
             }
@@ -217,7 +224,7 @@ impl DesktopEntry {
         if EntryType::parse(type_value) != EntryType::Application {
             return None;
         }
-        if no_display || hidden {
+        if no_display || hidden || !shown_in(only_show_in, not_show_in, desktops) {
             return None;
         }
 
@@ -284,6 +291,30 @@ impl DesktopEntry {
         push_lower(&mut q, query);
         self.score(q.as_str())
     }
+}
+
+/// Whether an entry with these OnlyShowIn and NotShowIn lists is shown on the
+/// desktops XDG_CURRENT_DESKTOP names, colon separated and in order. The first
+/// of them either list names decides. When neither names any, an entry with
+/// OnlyShowIn is hidden and any other is shown.
+fn shown_in(only: Option<&str>, not: Option<&str>, desktops: &str) -> bool {
+    let named_in = |list: Option<&str>, desktop: &str| {
+        list.is_some_and(|l| l.split(';').any(|name| name == desktop))
+    };
+    for desktop in desktops.split(':').filter(|d| !d.is_empty()) {
+        if named_in(only, desktop) {
+            return true;
+        }
+        if named_in(not, desktop) {
+            return false;
+        }
+    }
+    only.is_none()
+}
+
+/// The desktops the session runs, from XDG_CURRENT_DESKTOP, or empty.
+pub(crate) fn current_desktops() -> &'static str {
+    env::var("XDG_CURRENT_DESKTOP").unwrap_or_default()
 }
 
 /// Copy a Desktop Entry string value into out with its escape sequences
@@ -446,7 +477,7 @@ pub fn discover_entries(out: &mut ArrayVec<DesktopEntry, MAX_ENTRIES>) {
     // about the others.
     let mut paths: ArrayVec<ScanPath, MAX_ENTRIES> = ArrayVec::new();
     collect_all_paths(&mut paths);
-    read_entries(&paths, out);
+    read_entries(&paths, current_desktops(), out);
 
     // Sort alphabetically by name, on the lowercased key each entry carries.
     out.as_mut_slice()
@@ -493,9 +524,13 @@ pub(crate) fn collect_all_paths(paths: &mut ArrayVec<ScanPath, MAX_ENTRIES>) {
 /// The capability stays in the platform layer, tested, because the finding is
 /// worth being able to re-check. `make scan-bench` times both against each
 /// other.
-pub(crate) fn read_entries(paths: &[ScanPath], out: &mut ArrayVec<DesktopEntry, MAX_ENTRIES>) {
+pub(crate) fn read_entries(
+    paths: &[ScanPath],
+    desktops: &str,
+    out: &mut ArrayVec<DesktopEntry, MAX_ENTRIES>,
+) {
     for path in paths {
-        if let Some(entry) = DesktopEntry::from_file(path) {
+        if let Some(entry) = DesktopEntry::from_file(path, desktops) {
             let _ = out.push(entry);
         }
     }
@@ -505,6 +540,7 @@ pub(crate) fn read_entries(paths: &[ScanPath], out: &mut ArrayVec<DesktopEntry, 
 pub(crate) fn read_entries_batched(
     ring: &mut uring::Ring,
     paths: &[ScanPath],
+    desktops: &str,
     out: &mut ArrayVec<DesktopEntry, MAX_ENTRIES>,
 ) {
     // One slot per file in the batch. A slot holds any desktop file worth the
@@ -536,7 +572,7 @@ pub(crate) fn read_entries_batched(
             // The batch did not go through; read it the plain way rather than
             // drop the applications in it.
             for path in chunk {
-                if let Some(entry) = DesktopEntry::from_file(path) {
+                if let Some(entry) = DesktopEntry::from_file(path, desktops) {
                     let _ = out.push(entry);
                 }
             }
@@ -550,11 +586,11 @@ pub(crate) fn read_entries_batched(
             }
             let entry = if len == FILE_SLOT {
                 // It filled the slot, so it may have more to give. Read it whole.
-                DesktopEntry::from_file(path)
+                DesktopEntry::from_file(path, desktops)
             } else {
                 core::str::from_utf8(&bufs[i * FILE_SLOT..i * FILE_SLOT + len])
                     .ok()
-                    .and_then(DesktopEntry::parse)
+                    .and_then(|content| DesktopEntry::parse(content, desktops))
             };
             if let Some(entry) = entry {
                 let _ = out.push(entry);
@@ -691,13 +727,23 @@ fn push_data_dir(out: &mut ArrayVec<ScanPath, MAX_DATA_DIRS>, base: &str, suffix
     }
 }
 
-/// Fingerprint of the application directories: the newest mtime across the
-/// applications subdirs that discover_entries scans. A directory's mtime
+/// Fingerprint of what a scan's result depends on: the newest mtime across the
+/// applications subdirs that discover_entries scans, and the current desktop,
+/// which OnlyShowIn and NotShowIn are judged against. A directory's mtime
 /// changes whenever a .desktop file is added to or removed from it, which is
-/// the install/uninstall signal the cache needs to notice. Returns 0 when no
-/// directory resolves (in-place edits that keep the same filename do not move
-/// a directory's mtime, but app installs and removals always do).
+/// the install/uninstall signal the cache needs to notice (in-place edits that
+/// keep the same filename do not move a directory's mtime, but app installs and
+/// removals always do).
 pub fn dirs_fingerprint() -> u64 {
+    scan_fingerprint(newest_apps_mtime(), current_desktops())
+}
+
+fn scan_fingerprint(newest_apps_mtime: u64, desktops: &str) -> u64 {
+    newest_apps_mtime ^ bytes::fnv1a(desktops.as_bytes())
+}
+
+/// The newest mtime across the applications subdirs, or 0 when none resolves.
+fn newest_apps_mtime() -> u64 {
     let mut newest = 0u64;
     let mut dirs: ArrayVec<ScanPath, MAX_DATA_DIRS> = ArrayVec::new();
     get_data_dirs(&mut dirs);
@@ -766,7 +812,7 @@ Name=Firefox
 Exec=firefox %u
 Icon=firefox
 "#;
-        let entry = DesktopEntry::parse(content).expect("should parse successfully");
+        let entry = DesktopEntry::parse(content, "").expect("should parse successfully");
         assert_eq!(entry.name, "Firefox");
         // Exec is stored raw; field codes are handled at launch time.
         assert_eq!(entry.exec, "firefox %u");
@@ -778,22 +824,67 @@ Icon=firefox
             let content = format!(
                 "[Desktop Entry]\nType=Application\nName=btop\nExec=btop\n{terminal_line}\n"
             );
-            DesktopEntry::parse(&content).expect("entry")
+            DesktopEntry::parse(&content, "").expect("entry")
         };
         assert!(parse("Terminal=true").terminal);
         assert!(!parse("Terminal=false").terminal);
         assert!(!parse("").terminal);
     }
 
+    /// OnlyShowIn and NotShowIn are judged against XDG_CURRENT_DESKTOP, a
+    /// colon separated list read in order: the first desktop either key names
+    /// decides, and with no match an OnlyShowIn entry stays hidden.
+    #[test]
+    fn parse_shows_an_entry_only_on_the_desktops_it_names() {
+        let shown = |keys: &str, desktops: &str| {
+            let content = format!(
+                "[Desktop Entry]\nType=Application\nName=Settings\nExec=settings\n{keys}\n"
+            );
+            DesktopEntry::parse(&content, desktops).is_some()
+        };
+
+        assert!(shown("OnlyShowIn=GNOME;", "GNOME"));
+        assert!(shown("OnlyShowIn=GNOME;", "ubuntu:GNOME"));
+        assert!(!shown("OnlyShowIn=GNOME;", "KDE"));
+        assert!(!shown("OnlyShowIn=GNOME;", ""), "no desktop named");
+
+        assert!(!shown("NotShowIn=GNOME;", "GNOME"));
+        assert!(shown("NotShowIn=GNOME;", "hubabuba"));
+        assert!(shown("NotShowIn=GNOME;", ""), "no desktop named");
+
+        let both = "OnlyShowIn=GNOME;\nNotShowIn=KDE;";
+        assert!(!shown(both, "KDE:GNOME"), "KDE comes first and hides it");
+        assert!(shown(both, "GNOME:KDE"), "GNOME comes first and shows it");
+    }
+
+    /// The scan judges OnlyShowIn and NotShowIn against the session's desktop,
+    /// so a cache built under one desktop must not be reused under another.
+    #[test]
+    fn the_scan_fingerprint_changes_with_the_desktop() {
+        let mtime = 1_700_000_000_000_000_000;
+        assert_ne!(
+            scan_fingerprint(mtime, "GNOME"),
+            scan_fingerprint(mtime, "KDE")
+        );
+        assert_ne!(
+            scan_fingerprint(mtime, "GNOME"),
+            scan_fingerprint(mtime, "")
+        );
+        assert_eq!(
+            scan_fingerprint(mtime, "KDE"),
+            scan_fingerprint(mtime, "KDE")
+        );
+    }
+
     #[test]
     fn parse_reads_the_try_exec_program() {
         let content = "[Desktop Entry]\nType=Application\nName=Steam\nExec=steam\nTryExec=/usr/bin/st\\\\eam\n";
-        let entry = DesktopEntry::parse(content).expect("entry");
+        let entry = DesktopEntry::parse(content, "").expect("entry");
         // A string key, so its escapes resolve like Name's and Exec's.
         assert_eq!(entry.try_exec, "/usr/bin/st\\eam");
 
         let content = "[Desktop Entry]\nType=Application\nName=Steam\nExec=steam\n";
-        assert!(DesktopEntry::parse(content)
+        assert!(DesktopEntry::parse(content, "")
             .expect("entry")
             .try_exec
             .is_empty());
@@ -808,7 +899,7 @@ Name=Hidden App
 Exec=hidden
 NoDisplay=true
 "#;
-        let result = DesktopEntry::parse(content);
+        let result = DesktopEntry::parse(content, "");
         assert!(result.is_none(), "NoDisplay=true should be skipped");
     }
 
@@ -821,7 +912,7 @@ Name=Hidden App
 Exec=hidden
 Hidden=true
 "#;
-        let result = DesktopEntry::parse(content);
+        let result = DesktopEntry::parse(content, "");
         assert!(result.is_none(), "Hidden=true should be skipped");
     }
 
@@ -833,7 +924,7 @@ Type=Link
 Name=Some Link
 URL=https://example.com
 "#;
-        let result = DesktopEntry::parse(content);
+        let result = DesktopEntry::parse(content, "");
         assert!(result.is_none(), "Type=Link should be skipped");
     }
 
@@ -846,7 +937,7 @@ Name=Firefox
 Name[de]=Feuerfuchs
 Exec=firefox
 "#;
-        let result = DesktopEntry::parse(content);
+        let result = DesktopEntry::parse(content, "");
         let entry = result.unwrap();
         assert_eq!(entry.name, "Firefox", "should use non-localized Name");
     }
@@ -863,7 +954,7 @@ Exec=myapp
 Name=New Window
 Exec=myapp --new
 "#;
-        let result = DesktopEntry::parse(content);
+        let result = DesktopEntry::parse(content, "");
         let entry = result.unwrap();
         assert_eq!(entry.name, "MyApp");
         assert_eq!(entry.exec, "myapp");
@@ -956,7 +1047,7 @@ Exec=myapp --new
                        Type=Application\n\
                        Name=My\\sApp\n\
                        Exec=prog --title=a\\\\b\n";
-        let entry = DesktopEntry::parse(content).expect("entry");
+        let entry = DesktopEntry::parse(content, "").expect("entry");
         assert_eq!(entry.name, "My App");
         // The \\ collapses to one backslash before the Exec quoting rules run.
         assert_eq!(entry.exec, r"prog --title=a\b");
@@ -968,7 +1059,7 @@ Exec=myapp --new
                        Type=Application\n\
                        Name=A\\qB\n\
                        Exec=prog\n";
-        let entry = DesktopEntry::parse(content).expect("entry");
+        let entry = DesktopEntry::parse(content, "").expect("entry");
         assert_eq!(entry.name, r"A\qB");
     }
 
@@ -1124,7 +1215,7 @@ Exec=myapp --new
         let mut paths: ArrayVec<ScanPath, MAX_ENTRIES> = ArrayVec::new();
         let mut entries: ArrayVec<DesktopEntry, MAX_ENTRIES> = ArrayVec::new();
         collect_paths(&apps, &apps, &mut seen, &mut paths);
-        read_entries(&paths, &mut entries);
+        read_entries(&paths, "", &mut entries);
 
         let names: HashSet<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains("Aaa"));
@@ -1163,7 +1254,7 @@ Exec=myapp --new
         // high precedence scanned first.
         collect_paths(&high, &high, &mut seen, &mut paths);
         collect_paths(&low, &low, &mut seen, &mut paths);
-        read_entries(&paths, &mut entries);
+        read_entries(&paths, "", &mut entries);
 
         assert!(seen.iter().any(|s| s.as_str() == "foo"));
         assert!(

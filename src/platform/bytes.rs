@@ -9,6 +9,14 @@ pub fn find_byte(hay: &[u8], needle: u8) -> Option<usize> {
     hay.iter().position(|&b| b == needle)
 }
 
+/// The 64-bit FNV-1a hash of bytes: a fingerprint that changes when they do,
+/// not a defence against anyone choosing them.
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &b| {
+        (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// A bounds-checked forward cursor over a borrowed byte slice: the shared
 /// mechanics behind the wire and cache readers. It only hands out sub-slices and
 /// advances past them, never decoding integers itself, so each format layers its

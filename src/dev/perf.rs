@@ -130,7 +130,7 @@ fn measure_all() -> Vec<Measurement> {
         // Cold start: every .desktop file on the machine is parsed.
         bench("desktop_parse", 200, || {
             for f in &files {
-                std::hint::black_box(DesktopEntry::parse(std::hint::black_box(f)));
+                std::hint::black_box(DesktopEntry::parse(std::hint::black_box(f), ""));
             }
         }),
         // Every keystroke: the whole catalog is filtered and ranked.
@@ -268,6 +268,7 @@ fn scan_bench() {
     let only = std::env::var("BNKLAUNCH_SCAN_MODE").unwrap_or_default();
     let samples = if only.is_empty() { SAMPLES } else { 1 };
 
+    let desktops = crate::desktop::current_desktops();
     let mut ring = crate::platform::uring::Ring::new(crate::desktop::RING_ENTRIES).ok();
     let mut best_ring = f64::MAX;
     let mut best_serial = f64::MAX;
@@ -275,7 +276,7 @@ fn scan_bench() {
         if only == "serial" {
             let mut out = crate::desktop::Catalog::new();
             let start = Instant::now();
-            crate::desktop::read_entries(&paths, &mut out);
+            crate::desktop::read_entries(&paths, desktops, &mut out);
             best_serial = start.elapsed().as_secs_f64() * 1e6;
             continue;
         }
@@ -286,7 +287,7 @@ fn scan_bench() {
             };
             let mut out = crate::desktop::Catalog::new();
             let start = Instant::now();
-            crate::desktop::read_entries_batched(ring, &paths, &mut out);
+            crate::desktop::read_entries_batched(ring, &paths, desktops, &mut out);
             best_ring = start.elapsed().as_secs_f64() * 1e6;
             continue;
         }
@@ -294,13 +295,13 @@ fn scan_bench() {
         if let Some(ring) = ring.as_mut() {
             let mut out = crate::desktop::Catalog::new();
             let start = Instant::now();
-            crate::desktop::read_entries_batched(ring, &paths, &mut out);
+            crate::desktop::read_entries_batched(ring, &paths, desktops, &mut out);
             best_ring = best_ring.min(start.elapsed().as_secs_f64() * 1e6);
         }
 
         let mut out = crate::desktop::Catalog::new();
         let start = Instant::now();
-        crate::desktop::read_entries(&paths, &mut out);
+        crate::desktop::read_entries(&paths, desktops, &mut out);
         best_serial = best_serial.min(start.elapsed().as_secs_f64() * 1e6);
     }
 
