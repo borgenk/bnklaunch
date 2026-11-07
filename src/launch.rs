@@ -220,7 +220,7 @@ fn spawn<const CAP: usize>(program: &str, args: &[&str]) -> Result<()> {
 }
 
 /// Whether a URL carries a scheme the launcher is willing to open.
-fn has_allowed_scheme(url: &str) -> bool {
+pub(crate) fn has_allowed_scheme(url: &str) -> bool {
     const ALLOWED: [&str; 4] = ["http://", "https://", "file://", "mailto:"];
     ALLOWED.iter().any(|scheme| url.starts_with(scheme))
 }

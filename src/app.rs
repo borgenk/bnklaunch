@@ -134,9 +134,10 @@ pub(crate) fn parse_action(input: &str, search_enabled: bool) -> InputAction<'_>
 
 use crate::launch::URL_CAP;
 
-/// Prepend https:// if the URL has no scheme, into out.
+/// Prepend https:// if the URL has no scheme, into out. mailto: carries no
+/// slashes, so a scheme the launcher opens counts as one too.
 pub(crate) fn normalize_url(url: &str, out: &mut arena::ArrayString<URL_CAP>) {
-    if !url.contains("://") {
+    if !url.contains("://") && !launch::has_allowed_scheme(url) {
         let _ = out.push_str("https://");
     }
     let _ = out.push_str(url);
@@ -892,6 +893,10 @@ mod tests {
         assert_eq!(norm("example.com"), "https://example.com");
         assert_eq!(norm("http://example.com"), "http://example.com");
         assert_eq!(norm("file:///tmp/x"), "file:///tmp/x");
+        // mailto has no slashes, and is still a scheme the launcher opens.
+        assert_eq!(norm("mailto:a@b.c"), "mailto:a@b.c");
+        // A host and port is not a scheme.
+        assert_eq!(norm("localhost:3000"), "https://localhost:3000");
     }
 
     #[test]
