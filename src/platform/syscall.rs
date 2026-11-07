@@ -148,6 +148,9 @@ pub const EEXIST: i32 = 17;
 /// errno for an argument the kernel rejects.
 pub const EINVAL: i32 = 22;
 
+/// errno for an io_uring wait whose timeout passed before a completion came.
+pub const ETIME: i32 = 62;
+
 /// Control-message buffer size, large enough for the fds passed either way.
 const CMSG_BUF: usize = 256;
 
@@ -216,14 +219,20 @@ pub const IORING_OFF_SQES: i64 = 0x1000_0000;
 /// io_uring_enter flag: also wait for and reap completions, not just submit.
 pub const IORING_ENTER_GETEVENTS: u32 = 1;
 
+/// io_uring_enter flag: the last two arguments are an io_uring_getevents_arg
+/// and its size, which is how a wait takes a timeout.
+pub const IORING_ENTER_EXT_ARG: u32 = 1 << 3;
+
 /// Feature bit reported by io_uring_setup when the submission and completion
 /// rings share one mapping, so only the SQE array needs a second mmap.
 pub const IORING_FEAT_SINGLE_MMAP: u32 = 1;
 
+/// Feature bit for IORING_ENTER_EXT_ARG, from Linux 5.11.
+pub const IORING_FEAT_EXT_ARG: u32 = 1 << 8;
+
 // io_uring operation codes used here.
 pub const IORING_OP_NOP: u8 = 0;
 pub const IORING_OP_POLL_ADD: u8 = 6;
-pub const IORING_OP_TIMEOUT: u8 = 11;
 pub const IORING_OP_OPENAT: u8 = 18;
 pub const IORING_OP_CLOSE: u8 = 19;
 pub const IORING_OP_READ: u8 = 22;
@@ -281,6 +290,17 @@ pub struct pollfd {
 pub struct kernel_timespec {
     pub tv_sec: i64,
     pub tv_nsec: i64,
+}
+
+/// The extended argument to io_uring_enter. ts points at a kernel_timespec
+/// that bounds the wait; a zero sigmask leaves the signal mask alone.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct io_uring_getevents_arg {
+    pub sigmask: u64,
+    pub sigmask_sz: u32,
+    pub min_wait_usec: u32,
+    pub ts: u64,
 }
 
 /// Fixed head of a getdents64 record. The variable-length name follows the
@@ -428,6 +448,7 @@ const _: () = assert!(core::mem::size_of::<io_sqring_offsets>() == 40);
 const _: () = assert!(core::mem::size_of::<io_cqring_offsets>() == 40);
 const _: () = assert!(core::mem::size_of::<io_uring_params>() == 120);
 const _: () = assert!(core::mem::size_of::<kernel_timespec>() == 16);
+const _: () = assert!(core::mem::size_of::<io_uring_getevents_arg>() == 24);
 
 /// Perform a raw syscall with 0 arguments
 #[inline(always)]
@@ -987,9 +1008,25 @@ pub fn io_uring_setup(entries: u32, params: &mut io_uring_params) -> RawFd {
 }
 
 /// Submit queued entries and optionally wait for completions. Returns the
-/// number consumed from the submission queue or a negated errno.
-pub fn io_uring_enter(fd: RawFd, to_submit: u32, min_complete: u32, flags: u32) -> isize {
-    // SAFETY: no pointer crosses the boundary; the signal mask is null.
+/// number consumed from the submission queue or a negated errno. With arg, the
+/// flags must carry IORING_ENTER_EXT_ARG, and arg's timespec bounds the wait.
+pub fn io_uring_enter(
+    fd: RawFd,
+    to_submit: u32,
+    min_complete: u32,
+    flags: u32,
+    arg: Option<&io_uring_getevents_arg>,
+) -> isize {
+    let (arg_ptr, arg_len) = match arg {
+        Some(a) => (
+            a as *const io_uring_getevents_arg as usize,
+            core::mem::size_of::<io_uring_getevents_arg>(),
+        ),
+        None => (0, 0),
+    };
+    // SAFETY: arg, when given, is a live io_uring_getevents_arg the kernel
+    // reads during this call only, and its ts field is the caller's to keep
+    // valid for the same span. Without it, both trailing arguments are zero.
     unsafe {
         syscall6(
             nr::IO_URING_ENTER,
@@ -997,8 +1034,8 @@ pub fn io_uring_enter(fd: RawFd, to_submit: u32, min_complete: u32, flags: u32) 
             to_submit as usize,
             min_complete as usize,
             flags as usize,
-            0, // sig: no signal mask
-            0, // sigsz
+            arg_ptr,
+            arg_len,
         )
     }
 }

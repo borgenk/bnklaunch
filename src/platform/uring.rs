@@ -11,9 +11,9 @@
 //!   next_cqe() <-  [ CQ ring ]  <----completion-----------+
 //! ```
 //!
-//! Buffers handed to prep_read, prep_openat, and prep_timeout must stay put and
-//! alive until the matching completion arrives: the kernel reads and writes them
-//! asynchronously, after the call that submitted them has returned.
+//! Buffers handed to prep_read and prep_openat must stay put and alive until the
+//! matching completion arrives: the kernel reads and writes them asynchronously,
+//! after the call that submitted them has returned.
 //!
 //! # What this is for, and what it is not for
 //!
@@ -45,21 +45,21 @@
 //! So the scan reads its files one at a time (see desktop::read_entries), and
 //! `make scan-bench` times both against each other so the claim stays checkable.
 //!
-//! The event loop still waits here, and that costs nothing: a poll and a timeout
-//! never block, so neither is ever handed to a worker, and no pool is ever stood
-//! up. Ring::new itself is 5 us. One wait point serves the socket and the clock
-//! together, and it does it with no thread and no executor behind it, which is
-//! the whole point of the thing.
+//! The event loop still waits here, and that costs nothing: a poll never blocks,
+//! so none is ever handed to a worker, and no pool is ever stood up. Ring::new
+//! itself is 5 us. One wait serves every file descriptor the loop watches and its
+//! next deadline together, the deadline as the wait's own timeout, with no thread
+//! and no executor behind it, which is the whole point of the thing.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::platform::arena::ArrayVec;
 use crate::platform::syscall::{
-    self, io_uring_cqe, io_uring_params, io_uring_sqe, kernel_timespec, CPath, RawFd, AT_FDCWD,
-    IORING_ENTER_GETEVENTS, IORING_FEAT_SINGLE_MMAP, IORING_OFF_CQ_RING, IORING_OFF_SQES,
-    IORING_OFF_SQ_RING, IORING_OP_CLOSE, IORING_OP_NOP, IORING_OP_OPENAT, IORING_OP_POLL_ADD,
-    IORING_OP_READ, IORING_OP_TIMEOUT, IOSQE_IO_LINK, MAP_POPULATE, MAP_SHARED, O_RDONLY,
-    PROT_READ, PROT_WRITE,
+    self, io_uring_cqe, io_uring_getevents_arg, io_uring_params, io_uring_sqe, kernel_timespec,
+    CPath, RawFd, AT_FDCWD, IORING_ENTER_EXT_ARG, IORING_ENTER_GETEVENTS, IORING_FEAT_EXT_ARG,
+    IORING_FEAT_SINGLE_MMAP, IORING_OFF_CQ_RING, IORING_OFF_SQES, IORING_OFF_SQ_RING,
+    IORING_OP_CLOSE, IORING_OP_NOP, IORING_OP_OPENAT, IORING_OP_POLL_ADD, IORING_OP_READ,
+    IOSQE_IO_LINK, MAP_POPULATE, MAP_SHARED, O_RDONLY, PROT_READ, PROT_WRITE,
 };
 
 /// An io_uring instance with its mapped rings.
@@ -90,6 +90,9 @@ pub struct Ring {
     cq_ktail: *const AtomicU32,
     cq_mask: u32,
     cqes: *const io_uring_cqe,
+
+    // Whether a wait can carry its own timeout (IORING_FEAT_EXT_ARG).
+    ext_arg: bool,
 }
 
 impl Ring {
@@ -227,6 +230,7 @@ impl Ring {
                 cq_ktail: cq_ptr.add(co.tail as usize) as *const AtomicU32,
                 cq_mask,
                 cqes: cq_ptr.add(co.cqes as usize) as *const io_uring_cqe,
+                ext_arg: params.features & IORING_FEAT_EXT_ARG != 0,
             };
             Ok(ring)
         }
@@ -272,7 +276,7 @@ impl Ring {
             // SAFETY: head is a kernel-updated atomic in the mapped ring.
             let head = unsafe { (*self.sq_khead).load(Ordering::Acquire) };
             let to_submit = self.sq_tail_local.wrapping_sub(head);
-            let ret = syscall::io_uring_enter(self.ring_fd, to_submit, wait_nr, flags);
+            let ret = syscall::io_uring_enter(self.ring_fd, to_submit, wait_nr, flags, None);
             if ret < 0 {
                 let e = -ret as i32;
                 if e == syscall::EINTR {
@@ -281,6 +285,43 @@ impl Ring {
                 return Err(e);
             }
             return Ok(ret as u32);
+        }
+    }
+
+    /// Whether submit_and_wait_timeout is available: the kernel is 5.11 or
+    /// later.
+    pub fn supports_wait_timeout(&self) -> bool {
+        self.ext_arg
+    }
+
+    /// Publish prepared entries and park until a completion arrives or
+    /// timeout_ns passes, whichever is first. Returns the count the kernel
+    /// consumed from the submission queue. A timeout and an interrupted wait
+    /// both return normally: the caller reaps what is there and checks the
+    /// clock, so neither needs telling apart from a completion.
+    pub fn submit_and_wait_timeout(&mut self, timeout_ns: u64) -> Result<u32, i32> {
+        // SAFETY: release the prepared tail so the kernel sees the new SQEs.
+        unsafe { (*self.sq_ktail).store(self.sq_tail_local, Ordering::Release) };
+        let ts = kernel_timespec {
+            tv_sec: (timeout_ns / 1_000_000_000) as i64,
+            tv_nsec: (timeout_ns % 1_000_000_000) as i64,
+        };
+        // The kernel reads ts during the call, so a local outlives every use.
+        let arg = io_uring_getevents_arg {
+            ts: &ts as *const kernel_timespec as u64,
+            ..Default::default()
+        };
+        // SAFETY: head is a kernel-updated atomic in the mapped ring.
+        let head = unsafe { (*self.sq_khead).load(Ordering::Acquire) };
+        let to_submit = self.sq_tail_local.wrapping_sub(head);
+        let flags = IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG;
+        let ret = syscall::io_uring_enter(self.ring_fd, to_submit, 1, flags, Some(&arg));
+        if ret >= 0 {
+            return Ok(ret as u32);
+        }
+        match -ret as i32 {
+            syscall::ETIME | syscall::EINTR => Ok(0),
+            e => Err(e),
         }
     }
 
@@ -322,28 +363,6 @@ impl Ring {
         sqe.opcode = IORING_OP_POLL_ADD;
         sqe.fd = fd;
         sqe.op_flags = poll_mask;
-        sqe.user_data = user_data;
-        Ok(())
-    }
-
-    /// Arm a single relative timer that fires once after ts. The caller re-arms
-    /// after each fire. A one-shot timeout works on every io_uring kernel,
-    /// unlike multishot timeout (which needs 6.4+).
-    ///
-    /// # Safety
-    ///
-    /// ts is handed to the kernel, which reads it after submit and outside this
-    /// call. It must stay valid and unmoved until the op completes, so it has to
-    /// live somewhere longer-lived than the frame that submits it.
-    pub unsafe fn prep_timeout(
-        &mut self,
-        ts: *const kernel_timespec,
-        user_data: u64,
-    ) -> Result<(), ()> {
-        let sqe = self.get_sqe().ok_or(())?;
-        sqe.opcode = IORING_OP_TIMEOUT;
-        sqe.addr = ts as u64;
-        sqe.len = 1;
         sqe.user_data = user_data;
         Ok(())
     }
@@ -736,25 +755,33 @@ mod tests {
         assert!(read_files(&mut ring, &paths[..MAX_BATCH], &mut bufs, 1, &mut lens).is_ok());
     }
 
-    // A short one-shot timeout posts a completion tagged with its user_data,
-    // the wakeup the loop uses for key repeat and the caret blink. Tolerant of
-    // kernels that reject the op so it never hangs or flakes.
+    // A wait with nothing to complete returns once its timeout passes, and one
+    // with a completion ready returns at once: the two ways the event loop
+    // wakes.
     #[test]
-    fn timeout_posts_a_completion() {
+    fn a_wait_ends_at_its_timeout_or_at_a_completion() {
         let mut ring = match Ring::new(8) {
             Ok(r) => r,
             Err(_) => return,
         };
-        let ts = kernel_timespec {
-            tv_sec: 0,
-            tv_nsec: 2_000_000,
-        };
-        // SAFETY: ts outlives the timeout op, which is waited on below.
-        if unsafe { ring.prep_timeout(&ts, 7) }.is_err() || ring.submit_and_wait(1).is_err() {
-            return;
-        }
-        if let Some(cqe) = ring.next_cqe() {
-            assert_eq!(cqe.user_data, 7);
-        }
+        assert!(
+            ring.supports_wait_timeout(),
+            "the event loop needs Linux 5.11"
+        );
+
+        let start = std::time::Instant::now();
+        assert_eq!(ring.submit_and_wait_timeout(20_000_000), Ok(0));
+        let waited = start.elapsed();
+        assert!(ring.next_cqe().is_none());
+        assert!(
+            waited >= std::time::Duration::from_millis(20),
+            "returned after {waited:?}"
+        );
+
+        assert_eq!(ring.prep_nop(5), Ok(()));
+        let start = std::time::Instant::now();
+        assert_eq!(ring.submit_and_wait_timeout(5_000_000_000), Ok(1));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(ring.next_cqe().map(|c| c.user_data), Some(5));
     }
 }

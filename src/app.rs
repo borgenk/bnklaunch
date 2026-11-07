@@ -1,7 +1,7 @@
 //! The launcher application: single-instance lock, desktop-entry resolution,
 //! the io_uring event loop, and input handling.
 
-use crate::client::{Client, KeyRepeat, PendingAction};
+use crate::client::{Client, PendingAction};
 use crate::clipboard;
 use crate::desktop::{self, DesktopEntry};
 use crate::platform::error::elog;
@@ -16,19 +16,12 @@ use crate::{cache, config, denylist, font, launch, ui};
 /// long.
 const CURSOR_BLINK_MS: u64 = 530;
 
-/// Submission-queue depth for the event-loop ring. Two operations are in flight
-/// at a time, the socket poll and the tick, and each is re-armed as it fires.
+/// Submission-queue depth for the event-loop ring. One operation is in flight
+/// at a time, the socket poll, re-armed as it fires.
 const RING_ENTRIES: u32 = 32;
 
-/// Longest tick the loop parks for. The caret blink needs a wake this often.
-const TICK_NANOS: i64 = 33_000_000;
-
-/// Shortest tick the loop arms, so a deadline already past cannot spin it.
-const MIN_TICK_NANOS: i64 = 1_000_000;
-
-/// io_uring user_data tags identifying which submission a completion belongs to.
+/// io_uring user_data tag of the socket poll.
 const K_WAYLAND: u64 = 1;
-const K_TIMER: u64 = 2;
 
 /// What a key press means to the launcher.
 ///
@@ -329,19 +322,13 @@ pub(crate) fn run_window(
     event_loop(client, state, font, search_enabled, theme)
 }
 
-/// How long to park before the loop next has something to do. Only a held key
-/// asks for less than a full tick; parking for exactly its remaining time is
-/// what lands each repeat on its interval.
-fn next_tick(repeat: &KeyRepeat) -> i64 {
-    clamp_tick(repeat.time_until_due())
-}
-
-/// A due time in milliseconds as a tick to park for.
-fn clamp_tick(due_ms: Option<u32>) -> i64 {
-    match due_ms {
-        Some(ms) => (ms as i64 * 1_000_000).clamp(MIN_TICK_NANOS, TICK_NANOS),
-        None => TICK_NANOS,
-    }
+/// How long the loop may park before something is due: the held key's next
+/// repeat or the caret's next blink, whichever comes first. Parking for exactly
+/// that long is what lands each repeat on its interval, and nothing else wakes
+/// an idle launcher.
+fn park_ms(repeat_due_ms: Option<u32>, since_blink_ms: u64) -> u64 {
+    let blink = CURSOR_BLINK_MS.saturating_sub(since_blink_ms);
+    repeat_due_ms.map_or(blink, |ms| blink.min(u64::from(ms)))
 }
 
 /// Run until something dismisses the launcher: Enter, Escape, focus loss, or the
@@ -382,63 +369,51 @@ fn event_loop(
     client.socket.set_nonblocking(true)?;
 
     // Drive the loop with io_uring. A one-shot poll on the Wayland socket wakes
-    // the loop the instant the compositor sends events; a one-shot timer paces
-    // key repeat and the caret blink. Each is re-armed after it fires. Between
-    // wakeups the thread is parked in io_uring_enter rather than sleep-polling.
+    // the loop the instant the compositor sends events, and the wait's own
+    // timeout wakes it when the next key repeat or caret blink is due. The poll
+    // is re-armed after it fires. Between wakeups the thread is parked in
+    // io_uring_enter rather than sleep-polling.
     let wl_fd = client.socket.fd();
-    // tick is declared ahead of the ring so it is dropped after it: the kernel
-    // reads the timespec asynchronously, and the ring must be gone (its ops
-    // canceled) before the memory behind that pointer goes away.
-    let mut tick = syscall::kernel_timespec {
-        tv_sec: 0,
-        tv_nsec: TICK_NANOS,
-    };
     let mut ring = uring::Ring::new(RING_ENTRIES).map_err(Error::from_errno)?;
-    // Both submissions are one-shot and re-armed as they complete. A failed
-    // re-arm is fatal: the loop parks in io_uring_enter waiting for a
-    // completion that nothing will ever produce.
+    if !ring.supports_wait_timeout() {
+        return Err(Error::msg(
+            "io_uring cannot bound a wait with a timeout here (needs Linux 5.11)",
+        ));
+    }
+    // The poll is one-shot and re-armed as it completes. A failed re-arm is
+    // fatal: the socket would never wake the loop again.
     let arm_failed = || Error::msg("io_uring submission queue full");
     ring.prep_poll_add(wl_fd, syscall::POLLIN as u32, K_WAYLAND)
         .map_err(|_| arm_failed())?;
-    // SAFETY: tick outlives the ring (see above), so the timespec the kernel
-    // reads stays valid for as long as any timeout op can be in flight.
-    unsafe { ring.prep_timeout(&tick, K_TIMER) }.map_err(|_| arm_failed())?;
 
     // Event loop
     while client.running {
-        // Park until the socket is readable or the timer fires.
-        if ring.submit_and_wait(1).is_err() {
-            break;
-        }
-        let mut timer_fired = false;
+        // Park until the socket is readable or something is due.
+        let park = park_ms(client.key_repeat.time_until_due(), last_blink.elapsed_ms());
+        ring.submit_and_wait_timeout(park * 1_000_000)
+            .map_err(Error::from_errno)?;
         while let Some(cqe) = ring.next_cqe() {
-            match cqe.user_data {
-                K_WAYLAND => {
-                    // Re-arm the one-shot poll for the next readiness.
-                    ring.prep_poll_add(wl_fd, syscall::POLLIN as u32, K_WAYLAND)
-                        .map_err(|_| arm_failed())?;
-                    // Readiness means at least one message; drain them all.
-                    loop {
-                        match client.dispatch() {
-                            Ok(()) => {}
-                            Err(ref e) if e.would_block() => break,
-                            Err(e) => return Err(e),
-                        }
-                    }
+            if cqe.user_data != K_WAYLAND {
+                continue;
+            }
+            // A poll completes with the events that are ready, or a negated
+            // errno when the poll itself failed.
+            if cqe.res < 0 {
+                return Err(Error::from_errno(-cqe.res));
+            }
+            // Re-arm the one-shot poll for the next readiness.
+            ring.prep_poll_add(wl_fd, syscall::POLLIN as u32, K_WAYLAND)
+                .map_err(|_| arm_failed())?;
+            // Readiness means at least one message; drain them all.
+            loop {
+                match client.dispatch() {
+                    Ok(()) => {}
+                    Err(ref e) if e.would_block() => break,
+                    Err(e) => return Err(e),
                 }
-                K_TIMER => timer_fired = true,
-                _ => {}
             }
         }
-        if timer_fired {
-            client.process_key_repeat();
-            // Armed after the repeat has gone out: before it, the held key is
-            // still due and the answer would be the floor. The one timeout in
-            // flight has completed, so nothing is reading tick.
-            tick.tv_nsec = next_tick(&client.key_repeat);
-            // SAFETY: tick outlives the ring, as above.
-            unsafe { ring.prep_timeout(&tick, K_TIMER) }.map_err(|_| arm_failed())?;
-        }
+        client.process_key_repeat();
 
         // Handle pending actions. Up and Down wrap around the result list. A
         // move only repaints the highlight; it must not touch the caret blink.
@@ -697,6 +672,7 @@ fn resolve_results<'a>(
 #[cfg(test)]
 mod tests {
     use crate::app::*;
+    use crate::client::KeyRepeat;
 
     /// A second instance finds the lock busy and leaves quietly. A lock that
     /// cannot be taken at all is an error the caller reports, not a busy lock:
@@ -740,14 +716,15 @@ mod tests {
         out.as_str().to_string()
     }
 
-    /// Step the event loop: park for what the tick asks, then see whether the
-    /// key is due. Returns the gap between each repeat and the one before it,
+    /// Step the event loop: park for what park_ms asks, then see whether the
+    /// key is due. The caret's blink is held at zero elapsed, as typing keeps
+    /// resetting it. Returns the gap between each repeat and the one before it,
     /// in milliseconds.
     fn repeat_gaps(repeat: &KeyRepeat, rounds: usize) -> Vec<u32> {
         let mut since_last = 0;
         let mut gaps = Vec::new();
         for _ in 0..rounds {
-            let waited = (clamp_tick(repeat.due_in(0, Some(since_last))) / 1_000_000) as u32;
+            let waited = park_ms(repeat.due_in(0, Some(since_last)), 0) as u32;
             since_last += waited;
             if repeat.due_in(0, Some(since_last)) == Some(0) {
                 gaps.push(since_last);
@@ -758,10 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn a_repeat_lands_on_its_interval_rather_than_on_the_next_tick() {
-        // The default rate of 25 wants a repeat every 40ms, against a 33ms
-        // tick. Waiting a fixed tick misses every deadline and takes the tick
-        // after it, which comes out a steady 66.
+    fn a_repeat_lands_on_its_interval() {
         let repeat = KeyRepeat {
             held_key: Some(1),
             repeating: true,
@@ -774,44 +748,27 @@ mod tests {
             gaps.iter().all(|&g| g == 40),
             "every gap should be the interval: {gaps:?}"
         );
+
+        let slower = KeyRepeat { rate: 20, ..repeat };
+        assert!(repeat_gaps(&slower, 60).iter().all(|&g| g == 50));
     }
 
     #[test]
-    fn a_repeat_rate_that_divides_the_tick_is_exact_too() {
-        // 20 a second is 50ms, which no number of 33ms ticks lands on either.
-        let repeat = KeyRepeat {
-            held_key: Some(1),
-            repeating: true,
-            rate: 20,
-            ..Default::default()
-        };
-        assert!(repeat_gaps(&repeat, 60).iter().all(|&g| g == 50));
-    }
-
-    #[test]
-    fn the_tick_never_runs_long_or_spins() {
-        // Nothing held parks for the full tick, so the caret keeps blinking.
+    fn an_idle_loop_parks_until_the_caret_blinks() {
         let idle = KeyRepeat::default();
-        assert_eq!(clamp_tick(idle.time_until_due()), TICK_NANOS);
+        assert_eq!(park_ms(idle.time_until_due(), 0), CURSOR_BLINK_MS);
+        assert_eq!(park_ms(idle.time_until_due(), 500), 30);
+        // A blink already due parks for nothing; handling it moves the deadline.
+        assert_eq!(park_ms(idle.time_until_due(), 900), 0);
 
-        // A deadline further out than a tick still parks only a tick.
-        let waiting = KeyRepeat {
-            held_key: Some(1),
-            ..Default::default()
-        };
-        assert_eq!(clamp_tick(waiting.due_in(0, None)), TICK_NANOS);
-        // One already past parks briefly rather than not at all.
-        assert_eq!(clamp_tick(Some(0)), MIN_TICK_NANOS);
-
-        // A repeat that has just gone out is not due again for an interval.
-        // Asked before it goes out, the same key is due now: the floor.
+        // A held key due sooner than the blink wins.
         let held = KeyRepeat {
             held_key: Some(1),
             repeating: true,
             ..Default::default()
         };
-        assert_eq!(clamp_tick(held.due_in(0, Some(0))), TICK_NANOS);
-        assert_eq!(clamp_tick(held.due_in(0, Some(40))), MIN_TICK_NANOS);
+        assert_eq!(park_ms(held.due_in(0, Some(0)), 0), 40);
+        assert_eq!(park_ms(held.due_in(0, Some(0)), 510), 20);
     }
 
     #[test]
@@ -821,10 +778,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(repeat.delay_ms, 400);
-        // Most of the delay is longer than a tick, so it parks a tick at a
-        // time, then exactly the remainder.
-        assert_eq!(clamp_tick(repeat.due_in(0, None)), TICK_NANOS);
-        assert_eq!(clamp_tick(repeat.due_in(390, None)), 10_000_000);
+        assert_eq!(park_ms(repeat.due_in(0, None), 0), 400);
+        assert_eq!(park_ms(repeat.due_in(390, None), 0), 10);
         assert_eq!(repeat.due_in(400, None), Some(0));
     }
 
