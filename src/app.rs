@@ -281,7 +281,7 @@ pub(crate) fn run_window(
     let initial_rows = cache::resolve(&state.recents, &state.entries)
         .len()
         .min(MAX_RESULTS);
-    client.create_layer_surface(WINDOW_WIDTH, calculate_height(initial_rows))?;
+    client.create_layer_surface(WINDOW_WIDTH, calculate_height(initial_rows, theme.rows))?;
 
     // Wait for the configure event. The compositor may send closed instead
     // (no output available, or an output destroyed mid-resize), which sets
@@ -504,7 +504,7 @@ fn event_loop(
         }
 
         // Handle pointer clicks on a result row, and click/drag in the input box
-        handle_pointer_input(client, &mut state.selected, font, total_rows);
+        handle_pointer_input(client, &mut state.selected, font, total_rows, theme.rows);
 
         // The second press closes the launcher after this turn's input is
         // handled, so an Enter or a click in the same turn cannot undo it.
@@ -535,7 +535,7 @@ fn event_loop(
             }
 
             // The window grows and shrinks with the row count.
-            client.request_size(WINDOW_WIDTH, calculate_height(total_rows))?;
+            client.request_size(WINDOW_WIDTH, calculate_height(total_rows, theme.rows))?;
             needs_paint = true;
         } else if selection_moved {
             // The highlight moved. The caret keeps its phase and the window its
@@ -661,6 +661,7 @@ fn handle_pointer_input(
     selected: &mut usize,
     font: &font::Font,
     total_rows: usize,
+    rows: ui::Rows,
 ) {
     let px = client.pointer.x;
     let py = client.pointer.y;
@@ -669,7 +670,7 @@ fn handle_pointer_input(
     // is where Enter arrives too. Clearing the redraw flag on the way out keeps
     // the last pass from resizing a window that is about to go away.
     if client.pointer.clicked {
-        if let Some(row) = ui::row_at(px, py, total_rows) {
+        if let Some(row) = ui::row_at(px, py, total_rows, rows) {
             *selected = row;
             client.pointer.clicked = false;
             client.input_changed = false;

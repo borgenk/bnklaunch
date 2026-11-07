@@ -71,7 +71,7 @@ fn frame(font: &Font) -> (Vec<u32>, u32, u32) {
         visible: true,
     };
 
-    let height = calculate_height(rows.len());
+    let height = calculate_height(rows.len(), Theme::DEFAULT.rows);
     let mut buffer = PixelBuffer::new(WINDOW_WIDTH, height).expect("offscreen buffer");
     draw_ui(
         &mut buffer,
@@ -481,8 +481,9 @@ mod tests {
         // A row of text gone, painted out in the color the row already is,
         // which no band can see.
         let mut missing = pixels.clone();
-        let row = (calculate_height(1) - calculate_height(0)) as usize * width as usize;
-        let start = calculate_height(0) as usize * width as usize;
+        let rows = Theme::DEFAULT.rows;
+        let row = (calculate_height(1, rows) - calculate_height(0, rows)) as usize * width as usize;
+        let start = calculate_height(0, rows) as usize * width as usize;
         let wash = pixels[start + GUTTER_X as usize];
         missing[start..start + row].fill(wash);
         assert!(

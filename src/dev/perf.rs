@@ -109,7 +109,7 @@ fn measure_all() -> Vec<Measurement> {
     // An offscreen frame the size of the real window with a full result list.
     let mut pixels = crate::shm::PixelBuffer::new(
         crate::ui::WINDOW_WIDTH,
-        crate::ui::calculate_height(crate::ui::MAX_RESULTS),
+        crate::ui::calculate_height(crate::ui::MAX_RESULTS, crate::ui::Theme::DEFAULT.rows),
     )
     .expect("offscreen buffer");
     let font = crate::font::Font::from_path(concat!(

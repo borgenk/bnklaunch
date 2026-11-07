@@ -8,12 +8,13 @@
 //! and they accumulate.
 //!
 //! A color is #RRGGBB, or #RRGGBBAA to carry alpha. One that does not parse
-//! leaves its field at the default, as an unknown field does.
+//! leaves its field at the default, as an unknown field does. second_line takes
+//! on or off, and off drops the line under each result's name.
 
 use crate::desktop::NAME_CAP;
 use crate::platform::arena::{ArrayString, ArrayVec};
 use crate::platform::{env, fs};
-use crate::ui::{Color, Theme};
+use crate::ui::{Color, Rows, Theme};
 
 const FILENAME: &str = "config";
 
@@ -125,6 +126,11 @@ fn parse(text: &str) -> Config {
             "highlight" => set_color(&mut config.theme.highlight, value),
             "caret" => set_color(&mut config.theme.caret, value),
             "selection" => set_color(&mut config.theme.selection, value),
+            "second_line" => match value {
+                "on" => config.theme.rows = Rows::TwoLines,
+                "off" => config.theme.rows = Rows::OneLine,
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -172,7 +178,7 @@ fn hex_digit(c: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::config::*;
 
     #[test]
     fn parse_reads_search_url() {
@@ -307,6 +313,21 @@ mod tests {
         assert_eq!(cfg.theme.text, Theme::DEFAULT.text);
         assert_eq!(cfg.theme.highlight, Theme::DEFAULT.highlight);
         assert_eq!(parse("").theme, Theme::DEFAULT);
+    }
+
+    #[test]
+    fn parse_turns_the_second_line_off_and_on() {
+        assert_eq!(parse("").theme.rows, Rows::TwoLines);
+        assert_eq!(parse("second_line off\n").theme.rows, Rows::OneLine);
+        assert_eq!(
+            parse("second_line off\nsecond_line on\n").theme.rows,
+            Rows::TwoLines
+        );
+        // A value it cannot read leaves the line where it was.
+        assert_eq!(
+            parse("second_line off\nsecond_line no\n").theme.rows,
+            Rows::OneLine
+        );
     }
 
     #[test]

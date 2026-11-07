@@ -46,6 +46,27 @@ pub(crate) struct Theme {
     pub caret: Color,
     /// Behind selected input text.
     pub selection: Color,
+    /// Whether result rows carry a second line under the name.
+    pub rows: Rows,
+}
+
+/// Whether a result row carries a second line: the command under an app's
+/// name, or the query under a web search. A row without it is a little shorter,
+/// and a web search puts its query beside the title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rows {
+    TwoLines,
+    OneLine,
+}
+
+impl Rows {
+    /// Height of each result row.
+    const fn height(self) -> u32 {
+        match self {
+            Rows::TwoLines => RESULT_HEIGHT,
+            Rows::OneLine => ONE_LINE_HEIGHT,
+        }
+    }
 }
 
 impl Theme {
@@ -56,6 +77,7 @@ impl Theme {
         highlight: Color::rgba(0xff, 0xff, 0xff, 0x0d),
         caret: Color::rgba(0x6f, 0xd3, 0xef, 0xff),
         selection: Color::rgba(0x2f, 0x7b, 0xa6, 0xff),
+        rows: Rows::TwoLines,
     };
 }
 
@@ -87,22 +109,28 @@ pub(crate) const TEXT_W: u32 = WINDOW_WIDTH - TEXT_X - 115;
 /// Y position where results start, flush under the input field
 const RESULTS_START_Y: u32 = INPUT_BOX_H;
 
-/// Height of each result item
+/// Height of a result row with its second line.
 const RESULT_HEIGHT: u32 = 50;
+
+/// Height of a result row without the second line.
+const ONE_LINE_HEIGHT: u32 = 42;
+
+/// Space between a one-line row's title and the query beside it.
+const DETAIL_GAP: u32 = 12;
 
 /// Window height for a number of result rows: the input field plus a row each,
 /// up to MAX_RESULTS.
-pub(crate) fn calculate_height(num_results: usize) -> u32 {
-    let rows = num_results.min(MAX_RESULTS) as u32;
-    INPUT_BOX_H + rows * RESULT_HEIGHT
+pub(crate) fn calculate_height(num_results: usize, rows: Rows) -> u32 {
+    let count = num_results.min(MAX_RESULTS) as u32;
+    INPUT_BOX_H + count * rows.height()
 }
 
 /// The result row a pointer position falls in, given how many rows are drawn.
 /// None for a position above the list, past the last row, or outside the window
 /// horizontally. The same arithmetic draw_ui lays the rows out with, read
 /// backwards, so the two cannot disagree about where a row is.
-pub(crate) fn row_at(x: f64, y: f64, num_results: usize) -> Option<usize> {
-    let rows = num_results.min(MAX_RESULTS);
+pub(crate) fn row_at(x: f64, y: f64, num_results: usize, rows: Rows) -> Option<usize> {
+    let count = num_results.min(MAX_RESULTS);
     if x < 0.0 || x >= WINDOW_WIDTH as f64 {
         return None;
     }
@@ -110,8 +138,8 @@ pub(crate) fn row_at(x: f64, y: f64, num_results: usize) -> Option<usize> {
     if offset < 0.0 {
         return None;
     }
-    let row = (offset / RESULT_HEIGHT as f64) as usize;
-    (row < rows).then_some(row)
+    let row = (offset / rows.height() as f64) as usize;
+    (row < count).then_some(row)
 }
 
 /// Whether a pointer position is in the input field.
@@ -228,17 +256,25 @@ fn draw_results(
     font: &font::Font,
     theme: &Theme,
 ) {
+    let height = theme.rows.height();
     for (i, entry) in results.iter().take(MAX_RESULTS).enumerate() {
-        let y = RESULTS_START_Y + (i as u32 * RESULT_HEIGHT);
+        let y = RESULTS_START_Y + (i as u32 * height);
 
         if i == state.selected {
-            pixels.stamp_rect(0, y, WINDOW_WIDTH, RESULT_HEIGHT, wash(theme));
+            pixels.stamp_rect(0, y, WINDOW_WIDTH, height, wash(theme));
         }
 
-        // The subtitle previews the resolved command with field codes dropped.
-        let mut subtitle: arena::ArrayString<{ desktop::SUBTITLE_CAP }> = arena::ArrayString::new();
-        desktop::exec_subtitle(&entry.exec, &mut subtitle);
-        draw_row(pixels, y, &entry.name, &subtitle, font, theme);
+        match theme.rows {
+            Rows::TwoLines => {
+                // The subtitle previews the resolved command with field codes
+                // dropped.
+                let mut subtitle: arena::ArrayString<{ desktop::SUBTITLE_CAP }> =
+                    arena::ArrayString::new();
+                desktop::exec_subtitle(&entry.exec, &mut subtitle);
+                draw_row(pixels, y, &entry.name, &subtitle, font, theme);
+            }
+            Rows::OneLine => draw_line(pixels, y, &entry.name, "", font, theme),
+        }
     }
 }
 
@@ -257,7 +293,7 @@ fn draw_row(
     let subtitle_h = font.text_height(font::SUBTITLE_SIZE);
     let gap = 2.0;
     let block_h = title_h + gap + subtitle_h;
-    let top = y as f32 + (RESULT_HEIGHT as f32 - block_h) / 2.0;
+    let top = y as f32 + (Rows::TwoLines.height() as f32 - block_h) / 2.0;
 
     pixels.draw_text(
         TEXT_X,
@@ -279,6 +315,41 @@ fn draw_row(
     );
 }
 
+/// Draw a one-line row: the title, then any detail beside it in the second
+/// line's color, centered in the row starting at y. Neither runs past TEXT_W.
+fn draw_line(
+    pixels: &mut shm::PixelBuffer,
+    y: u32,
+    title: &str,
+    detail: &str,
+    font: &font::Font,
+    theme: &Theme,
+) {
+    let line_h = font.text_height(font::NAME_SIZE);
+    let top = (y as f32 + (Rows::OneLine.height() as f32 - line_h) / 2.0) as u32;
+    let title_w = pixels.draw_text(
+        TEXT_X,
+        top,
+        title,
+        theme.text.argb(),
+        TEXT_W,
+        font,
+        font::NAME_SIZE,
+    );
+    let detail_x = title_w + DETAIL_GAP;
+    if !detail.is_empty() && detail_x < TEXT_W {
+        pixels.draw_text(
+            TEXT_X + detail_x,
+            top,
+            detail,
+            theme.subtitle.argb(),
+            TEXT_W - detail_x,
+            font,
+            font::NAME_SIZE,
+        );
+    }
+}
+
 /// Draw a single preview row for prefix actions (s: / u:).
 fn draw_preview_row(
     pixels: &mut shm::PixelBuffer,
@@ -288,13 +359,16 @@ fn draw_preview_row(
     theme: &Theme,
 ) {
     let y = RESULTS_START_Y;
-    pixels.stamp_rect(0, y, WINDOW_WIDTH, RESULT_HEIGHT, wash(theme));
-    draw_row(pixels, y, title, subtitle, font, theme);
+    pixels.stamp_rect(0, y, WINDOW_WIDTH, theme.rows.height(), wash(theme));
+    match theme.rows {
+        Rows::TwoLines => draw_row(pixels, y, title, subtitle, font, theme),
+        Rows::OneLine => draw_line(pixels, y, title, subtitle, font, theme),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::ui::*;
 
     /// A point comfortably inside the window horizontally, which is what every
     /// vertical case below wants to hold still.
@@ -347,12 +421,15 @@ mod tests {
 
     #[test]
     fn the_window_grows_a_row_at_a_time_up_to_the_list() {
-        assert_eq!(calculate_height(0), INPUT_BOX_H);
-        assert_eq!(calculate_height(2), INPUT_BOX_H + 2 * RESULT_HEIGHT);
+        assert_eq!(calculate_height(0, Rows::TwoLines), INPUT_BOX_H);
+        assert_eq!(
+            calculate_height(2, Rows::TwoLines),
+            INPUT_BOX_H + 2 * RESULT_HEIGHT
+        );
         // draw_ui paints at most MAX_RESULTS rows, so the window stops there too.
         assert_eq!(
-            calculate_height(MAX_RESULTS + 5),
-            calculate_height(MAX_RESULTS)
+            calculate_height(MAX_RESULTS + 5, Rows::TwoLines),
+            calculate_height(MAX_RESULTS, Rows::TwoLines)
         );
     }
 
@@ -379,8 +456,8 @@ mod tests {
             visible: false,
         };
 
-        let mut buf =
-            shm::PixelBuffer::new(WINDOW_WIDTH, calculate_height(rows)).expect("offscreen buffer");
+        let mut buf = shm::PixelBuffer::new(WINDOW_WIDTH, calculate_height(rows, theme.rows))
+            .expect("offscreen buffer");
         for _ in 0..passes {
             draw_ui(
                 &mut buf,
@@ -507,9 +584,15 @@ mod tests {
     #[test]
     fn row_at_maps_a_position_to_the_row_drawn_there() {
         let top = RESULTS_START_Y as f64;
-        assert_eq!(row_at(MID_X, top, 3), Some(0));
-        assert_eq!(row_at(MID_X, top + RESULT_HEIGHT as f64, 3), Some(1));
-        assert_eq!(row_at(MID_X, top + 2.0 * RESULT_HEIGHT as f64, 3), Some(2));
+        assert_eq!(row_at(MID_X, top, 3, Rows::TwoLines), Some(0));
+        assert_eq!(
+            row_at(MID_X, top + RESULT_HEIGHT as f64, 3, Rows::TwoLines),
+            Some(1)
+        );
+        assert_eq!(
+            row_at(MID_X, top + 2.0 * RESULT_HEIGHT as f64, 3, Rows::TwoLines),
+            Some(2)
+        );
     }
 
     #[test]
@@ -517,31 +600,40 @@ mod tests {
         // The rows butt up against each other, so the pixel a row starts on is
         // that row's and the one before it ends a pixel short.
         let boundary = (RESULTS_START_Y + RESULT_HEIGHT) as f64;
-        assert_eq!(row_at(MID_X, boundary - 0.5, 3), Some(0));
-        assert_eq!(row_at(MID_X, boundary, 3), Some(1));
+        assert_eq!(row_at(MID_X, boundary - 0.5, 3, Rows::TwoLines), Some(0));
+        assert_eq!(row_at(MID_X, boundary, 3, Rows::TwoLines), Some(1));
     }
 
     #[test]
     fn row_at_ignores_everything_that_is_not_a_row() {
         let top = RESULTS_START_Y as f64;
         // The input field sits above the list.
-        assert_eq!(row_at(MID_X, top - 1.0, 3), None);
-        assert_eq!(row_at(MID_X, 0.0, 3), None);
+        assert_eq!(row_at(MID_X, top - 1.0, 3, Rows::TwoLines), None);
+        assert_eq!(row_at(MID_X, 0.0, 3, Rows::TwoLines), None);
         // Past the last row drawn, which is not the same as past the window: a
         // shorter list leaves the rows below it undrawn.
-        assert_eq!(row_at(MID_X, top + 3.0 * RESULT_HEIGHT as f64, 3), None);
-        assert_eq!(row_at(MID_X, top + RESULT_HEIGHT as f64, 1), None);
+        assert_eq!(
+            row_at(MID_X, top + 3.0 * RESULT_HEIGHT as f64, 3, Rows::TwoLines),
+            None
+        );
+        assert_eq!(
+            row_at(MID_X, top + RESULT_HEIGHT as f64, 1, Rows::TwoLines),
+            None
+        );
         // No results at all means no row anywhere.
-        assert_eq!(row_at(MID_X, top, 0), None);
+        assert_eq!(row_at(MID_X, top, 0, Rows::TwoLines), None);
     }
 
     #[test]
     fn row_at_stops_at_the_edges_of_the_window() {
         let top = RESULTS_START_Y as f64;
-        assert_eq!(row_at(0.0, top, 3), Some(0));
-        assert_eq!(row_at(-1.0, top, 3), None);
-        assert_eq!(row_at((WINDOW_WIDTH - 1) as f64, top, 3), Some(0));
-        assert_eq!(row_at(WINDOW_WIDTH as f64, top, 3), None);
+        assert_eq!(row_at(0.0, top, 3, Rows::TwoLines), Some(0));
+        assert_eq!(row_at(-1.0, top, 3, Rows::TwoLines), None);
+        assert_eq!(
+            row_at((WINDOW_WIDTH - 1) as f64, top, 3, Rows::TwoLines),
+            Some(0)
+        );
+        assert_eq!(row_at(WINDOW_WIDTH as f64, top, 3, Rows::TwoLines), None);
     }
 
     #[test]
@@ -550,9 +642,9 @@ mod tests {
         // the hit test must not hand back an index into a row nothing painted.
         let top = RESULTS_START_Y as f64;
         let past = top + (MAX_RESULTS as f64) * RESULT_HEIGHT as f64;
-        assert_eq!(row_at(MID_X, past, MAX_RESULTS + 5), None);
+        assert_eq!(row_at(MID_X, past, MAX_RESULTS + 5, Rows::TwoLines), None);
         assert_eq!(
-            row_at(MID_X, past - 1.0, MAX_RESULTS + 5),
+            row_at(MID_X, past - 1.0, MAX_RESULTS + 5, Rows::TwoLines),
             Some(MAX_RESULTS - 1)
         );
     }
@@ -566,5 +658,75 @@ mod tests {
         assert!(!input_box_contains(TEXT_X as f64 - 1.0, inside));
         assert!(!input_box_contains(WINDOW_WIDTH as f64, inside));
         assert!(!input_box_contains(TEXT_X as f64, RESULTS_START_Y as f64));
+    }
+
+    #[test]
+    fn a_one_line_row_is_shorter_and_a_click_lands_on_the_row_drawn_there() {
+        let rows = Rows::OneLine;
+        assert_eq!(calculate_height(3, rows), INPUT_BOX_H + 3 * ONE_LINE_HEIGHT);
+        assert!(calculate_height(3, rows) < calculate_height(3, Rows::TwoLines));
+        // The first and last pixel of each row belong to it, at the shorter
+        // height the window is sized to.
+        for row in 0..3 {
+            let top = calculate_height(row, rows) as f64;
+            let bottom = calculate_height(row + 1, rows) as f64 - 1.0;
+            assert_eq!(row_at(MID_X, top, 3, rows), Some(row));
+            assert_eq!(row_at(MID_X, bottom, 3, rows), Some(row));
+        }
+    }
+
+    /// A theme whose second line is pure red, which nothing else in the frame
+    /// is, so the frame shows where that line was drawn.
+    fn red_second_line(rows: Rows) -> Theme {
+        Theme {
+            subtitle: Color::rgba(0xFF, 0x00, 0x00, 0xFF),
+            rows,
+            ..Theme::DEFAULT
+        }
+    }
+
+    /// The rows of a frame holding pixels of the red second line.
+    fn rows_with_red(frame: &[u32]) -> Vec<u32> {
+        let mut rows: Vec<u32> = frame
+            .iter()
+            .enumerate()
+            .filter(|&(_, &p)| (p >> 16 & 0xFF) > (p >> 8 & 0xFF) + 0x40)
+            .map(|(i, _)| i as u32 / WINDOW_WIDTH)
+            .collect();
+        rows.dedup();
+        rows
+    }
+
+    #[test]
+    fn without_the_second_line_a_result_shows_its_name_alone() {
+        let alpha = DesktopEntry::new("Alpha", "alpha --new-window").expect("entry");
+        let shown = frame(
+            &red_second_line(Rows::TwoLines),
+            "a",
+            false,
+            &[&alpha],
+            1,
+            1,
+        );
+        assert!(
+            !rows_with_red(&shown).is_empty(),
+            "the command is drawn under the name"
+        );
+        let hidden = frame(&red_second_line(Rows::OneLine), "a", false, &[&alpha], 1, 1);
+        assert_eq!(rows_with_red(&hidden), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn without_the_second_line_a_web_search_keeps_its_query_in_the_row() {
+        let none: [&DesktopEntry; 0] = [];
+        let theme = red_second_line(Rows::OneLine);
+        let frame = frame(&theme, "s:cats", true, &none, 1, 1);
+        let rows = rows_with_red(&frame);
+        assert!(!rows.is_empty(), "the query is drawn beside the title");
+        let row = RESULTS_START_Y..RESULTS_START_Y + ONE_LINE_HEIGHT;
+        assert!(
+            rows.iter().all(|y| row.contains(y)),
+            "the query stays inside the one row: {rows:?}"
+        );
     }
 }
