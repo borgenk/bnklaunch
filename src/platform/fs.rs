@@ -7,10 +7,10 @@
 
 use crate::platform::arena::{ArrayString, ArrayVec};
 use crate::platform::bytes;
-use crate::platform::error::{elog, Error, Result};
+use crate::platform::error::{Error, Result, elog};
 use crate::platform::syscall::{
-    self, linux_dirent64, stat, Fd, RawFd, AT_FDCWD, AT_SYMLINK_NOFOLLOW, EEXIST, EINTR, O_CREAT,
-    O_DIRECTORY, O_RDONLY, O_TRUNC, O_WRONLY, S_IFDIR, S_IFMT, S_IFREG,
+    self, AT_FDCWD, AT_SYMLINK_NOFOLLOW, EEXIST, EINTR, Fd, O_CREAT, O_DIRECTORY, O_RDONLY,
+    O_TRUNC, O_WRONLY, RawFd, S_IFDIR, S_IFMT, S_IFREG, linux_dirent64, stat,
 };
 
 /// Longest path the helpers handle.

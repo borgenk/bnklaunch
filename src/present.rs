@@ -329,13 +329,13 @@ impl Present {
 
         // A retired frame's release is the last thing that has to happen before
         // its memory can go: the compositor is done scanning it out.
-        if let Some(idx) = self.retired.iter().position(|r| r.buffer_id == buffer_id) {
-            if let Some(retired) = self.retired.swap_remove(idx) {
-                conn.request(retired.buffer_id, proto::wl_buffer::DESTROY, &[])?;
-                conn.request(retired.pool_id, proto::wl_shm_pool::DESTROY, &[])?;
-                conn.flush()?;
-                // retired._pixels drops here: munmap plus close of the memfd.
-            }
+        if let Some(idx) = self.retired.iter().position(|r| r.buffer_id == buffer_id)
+            && let Some(retired) = self.retired.swap_remove(idx)
+        {
+            conn.request(retired.buffer_id, proto::wl_buffer::DESTROY, &[])?;
+            conn.request(retired.pool_id, proto::wl_shm_pool::DESTROY, &[])?;
+            conn.flush()?;
+            // retired._pixels drops here: munmap plus close of the memfd.
         }
         Ok(())
     }

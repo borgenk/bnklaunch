@@ -205,11 +205,7 @@ impl<T: Copy, const N: usize> ArrayVec<T, N> {
             );
         }
         self.len += take;
-        if take == src.len() {
-            Ok(())
-        } else {
-            Err(take)
-        }
+        if take == src.len() { Ok(()) } else { Err(take) }
     }
 }
 

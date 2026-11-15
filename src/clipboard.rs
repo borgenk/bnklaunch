@@ -10,7 +10,7 @@
 use crate::editor::INPUT_CAP;
 use crate::platform::arena::{ArrayString, ArrayVec};
 use crate::platform::conn::Connection;
-use crate::platform::error::{elog, Error, Result};
+use crate::platform::error::{Error, Result, elog};
 use crate::platform::protocol as proto;
 use crate::platform::syscall::{self, Fd, RawFd};
 use crate::platform::time::Instant;
@@ -230,10 +230,10 @@ impl Clipboard {
                     }
                     // A cleared selection, or one naming some other offer, leaves
                     // the pending offer with no owner.
-                    if let Some(p) = pending {
-                        if Some(p) != self.selection_offer {
-                            let _ = conn.request(p, proto::wl_data_offer::DESTROY, &[]);
-                        }
+                    if let Some(p) = pending
+                        && Some(p) != self.selection_offer
+                    {
+                        let _ = conn.request(p, proto::wl_data_offer::DESTROY, &[]);
                     }
                 }
                 _ => {}
@@ -246,13 +246,13 @@ impl Clipboard {
         // failing over, so a malformed event is dropped, not the session.
         if Some(object) == self.pending_offer && opcode == proto::wl_data_offer::EV_OFFER {
             let mut r = crate::platform::wire::Reader::new(body);
-            if let Ok(mime) = r.string() {
-                if let Some(m) = TextMime::from_mime(mime) {
-                    self.pending_mime = Some(match self.pending_mime {
-                        Some(cur) => cur.max(m),
-                        None => m,
-                    });
-                }
+            if let Ok(mime) = r.string()
+                && let Some(m) = TextMime::from_mime(mime)
+            {
+                self.pending_mime = Some(match self.pending_mime {
+                    Some(cur) => cur.max(m),
+                    None => m,
+                });
             }
             return Ok(true);
         }
@@ -265,13 +265,13 @@ impl Clipboard {
                     // MIME it names is one of the two we advertised, and both are
                     // served the same bytes, so the argument is not read: parsing
                     // it would only add a way for this to fail.
-                    if let Some(fd) = conn.take_fd() {
-                        if let Some(ref text) = self.source_text {
-                            send_text(fd.as_raw_fd(), text.as_bytes());
-                        }
-                        // fd closes as it drops here, which is the EOF the
-                        // reader on the other end is waiting for.
+                    if let Some(fd) = conn.take_fd()
+                        && let Some(ref text) = self.source_text
+                    {
+                        send_text(fd.as_raw_fd(), text.as_bytes());
                     }
+                    // fd closes as it drops here, which is the EOF the
+                    // reader on the other end is waiting for.
                 }
                 proto::wl_data_source::EV_CANCELLED => {
                     // Another app took the clipboard.

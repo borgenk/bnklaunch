@@ -27,7 +27,7 @@ use crate::platform::error::elog;
 /// libc) calls this; it runs the launcher and maps the result to an exit code.
 /// Absent under `cargo test`, where the harness provides main.
 #[cfg(not(test))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8) -> i32 {
     match app::run() {
         Ok(()) => 0,

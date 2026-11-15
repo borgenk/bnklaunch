@@ -1143,10 +1143,11 @@ fn input_during_a_pointer_flood() -> String {
         h.peer.read_available();
         h.peer.handle_requests();
         h.peer.fire_frame_callbacks();
-        if let Some((at, before)) = key_sent {
-            if key_latency.is_none() && h.peer.commits.len() > before {
-                key_latency = Some(at.elapsed());
-            }
+        if let Some((at, before)) = key_sent
+            && key_latency.is_none()
+            && h.peer.commits.len() > before
+        {
+            key_latency = Some(at.elapsed());
         }
         if h.peer.commits.len() > last_commits {
             frames += h.peer.commits.len() - last_commits;
@@ -1155,14 +1156,14 @@ fn input_during_a_pointer_flood() -> String {
     }
     h.peer.flush_all();
     let flood_end = Instant::now();
-    if key_latency.is_none() {
-        if let Some((at, before)) = key_sent {
-            h.peer.pump_until(flood_end + Duration::from_secs(2), |p| {
-                p.commits.len() > before
-            });
-            if h.peer.commits.len() > before {
-                key_latency = Some(at.elapsed());
-            }
+    if key_latency.is_none()
+        && let Some((at, before)) = key_sent
+    {
+        h.peer.pump_until(flood_end + Duration::from_secs(2), |p| {
+            p.commits.len() > before
+        });
+        if h.peer.commits.len() > before {
+            key_latency = Some(at.elapsed());
         }
     }
     let out = h.finish();

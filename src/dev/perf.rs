@@ -170,10 +170,10 @@ fn read_baseline() -> std::collections::BTreeMap<String, f64> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some((name, ns)) = line.split_once(char::is_whitespace) {
-            if let Ok(ns) = ns.trim().parse::<f64>() {
-                out.insert(name.to_string(), ns);
-            }
+        if let Some((name, ns)) = line.split_once(char::is_whitespace)
+            && let Ok(ns) = ns.trim().parse::<f64>()
+        {
+            out.insert(name.to_string(), ns);
         }
     }
     out

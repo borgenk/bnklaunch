@@ -2,18 +2,18 @@
 
 use crate::clipboard::{self, Clipboard, Paste, Received};
 use crate::platform::arena::{ArrayString, ArrayVec};
-use crate::platform::error::{elog, Error, Result};
+use crate::platform::error::{Error, Result, elog};
 use crate::platform::syscall;
 use crate::platform::time::Instant;
 
-use crate::app::{key_action, KeyAction};
+use crate::app::{KeyAction, key_action};
 use crate::editor::Editor;
 use crate::platform::conn::Connection;
 use crate::platform::protocol::{self as proto, KeyboardInteractivity};
 use crate::platform::wire::Arg;
 use crate::platform::wire::Message;
 use crate::platform::xkb::Xkb;
-use crate::present::{Present, MAX_SURFACE_DIM};
+use crate::present::{MAX_SURFACE_DIM, Present};
 use crate::shm::PixelBuffer;
 
 /// Most recycled ids held at once.
@@ -403,36 +403,36 @@ impl Client {
         }
 
         // Layer surface events
-        if let Some(ref mut surface) = self.present.surface {
-            if msg.object == surface.layer_surface_id {
-                match msg.opcode {
-                    proto::zwlr_layer_surface_v1::EV_CONFIGURE => {
-                        let mut r = msg.reader();
-                        let serial = r.u32()?;
-                        let width = r.u32()?;
-                        let height = r.u32()?;
-                        if (1..=MAX_SURFACE_DIM).contains(&width)
-                            && (1..=MAX_SURFACE_DIM).contains(&height)
-                        {
-                            surface.width = width;
-                            surface.height = height;
-                        }
-                        let layer_surface_id = surface.layer_surface_id;
-                        self.socket.request(
-                            layer_surface_id,
-                            proto::zwlr_layer_surface_v1::ACK_CONFIGURE,
-                            &[Arg::Uint(serial)],
-                        )?;
-                        surface.configured = true;
-                        surface.awaiting_configure = None;
+        if let Some(ref mut surface) = self.present.surface
+            && msg.object == surface.layer_surface_id
+        {
+            match msg.opcode {
+                proto::zwlr_layer_surface_v1::EV_CONFIGURE => {
+                    let mut r = msg.reader();
+                    let serial = r.u32()?;
+                    let width = r.u32()?;
+                    let height = r.u32()?;
+                    if (1..=MAX_SURFACE_DIM).contains(&width)
+                        && (1..=MAX_SURFACE_DIM).contains(&height)
+                    {
+                        surface.width = width;
+                        surface.height = height;
                     }
-                    proto::zwlr_layer_surface_v1::EV_CLOSED => {
-                        self.running = false;
-                    }
-                    _ => {}
+                    let layer_surface_id = surface.layer_surface_id;
+                    self.socket.request(
+                        layer_surface_id,
+                        proto::zwlr_layer_surface_v1::ACK_CONFIGURE,
+                        &[Arg::Uint(serial)],
+                    )?;
+                    surface.configured = true;
+                    surface.awaiting_configure = None;
                 }
-                return Ok(());
+                proto::zwlr_layer_surface_v1::EV_CLOSED => {
+                    self.running = false;
+                }
+                _ => {}
             }
+            return Ok(());
         }
 
         // wl_seat events
@@ -729,12 +729,12 @@ impl Client {
 
     /// Process key repeat if a key is being held.
     pub fn process_key_repeat(&mut self) {
-        if self.key_repeat.should_repeat() {
-            if let Some(key) = self.key_repeat.held_key {
-                self.key_repeat.repeating = true;
-                self.key_repeat.last_repeat = Some(Instant::now());
-                self.handle_key_action(key);
-            }
+        if self.key_repeat.should_repeat()
+            && let Some(key) = self.key_repeat.held_key
+        {
+            self.key_repeat.repeating = true;
+            self.key_repeat.last_repeat = Some(Instant::now());
+            self.handle_key_action(key);
         }
     }
 

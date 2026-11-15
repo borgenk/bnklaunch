@@ -18,10 +18,10 @@ use crate::platform::arena::{ArrayString, ArrayVec};
 use crate::platform::env;
 use crate::platform::error::{Error, Result};
 use crate::platform::syscall::{
-    self, pollfd, Fd, RawFd, UnixAddr, AF_UNIX, EAGAIN, EINTR, F_DUPFD_CLOEXEC, F_GETFL, F_SETFL,
-    O_NONBLOCK, POLLIN, SOCK_CLOEXEC, SOCK_STREAM,
+    self, AF_UNIX, EAGAIN, EINTR, F_DUPFD_CLOEXEC, F_GETFL, F_SETFL, Fd, O_NONBLOCK, POLLIN, RawFd,
+    SOCK_CLOEXEC, SOCK_STREAM, UnixAddr, pollfd,
 };
-use crate::platform::wire::{self, Arg, Message, HEADER_SIZE, MSG_BODY_CAP};
+use crate::platform::wire::{self, Arg, HEADER_SIZE, MSG_BODY_CAP, Message};
 
 /// The largest message next_message will accept. The wire format can express
 /// one of 64 KB, since the size field is 16 bits, but a body over MSG_BODY_CAP

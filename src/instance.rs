@@ -9,10 +9,10 @@
 
 use crate::platform::arena::ArrayString;
 use crate::platform::env;
-use crate::platform::error::{elog, Error, Result};
+use crate::platform::error::{Error, Result, elog};
 use crate::platform::fs;
 use crate::platform::syscall::{
-    self, Fd, UnixAddr, AF_UNIX, ENOENT, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_STREAM,
+    self, AF_UNIX, ENOENT, Fd, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_STREAM, UnixAddr,
 };
 
 /// What claim found.
@@ -162,7 +162,7 @@ fn ask_to_close(path: &str) {
 #[cfg(test)]
 mod tests {
     use crate::instance::*;
-    use crate::platform::syscall::{pollfd, POLLIN};
+    use crate::platform::syscall::{POLLIN, pollfd};
 
     fn temp_dir(name: &str) -> String {
         let dir = format!(

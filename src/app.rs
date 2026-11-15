@@ -8,9 +8,9 @@ use crate::instance::{self, Claim, Instance};
 use crate::platform::error::elog;
 use crate::platform::error::{Error, Result};
 use crate::platform::time::Instant;
-use crate::platform::xkb::{keycode, Xkb};
+use crate::platform::xkb::{Xkb, keycode};
 use crate::platform::{arena, env, syscall, uring};
-use crate::ui::{calculate_height, draw_ui, Theme, MAX_RESULTS, WINDOW_WIDTH};
+use crate::ui::{MAX_RESULTS, Theme, WINDOW_WIDTH, calculate_height, draw_ui};
 use crate::{cache, config, denylist, font, launch, ui};
 
 /// Caret blink half-period in milliseconds: solid this long, then hidden this
@@ -120,10 +120,8 @@ pub(crate) enum InputAction<'a> {
 }
 
 pub(crate) fn parse_action(input: &str, search_enabled: bool) -> InputAction<'_> {
-    if search_enabled {
-        if let Some(rest) = input.strip_prefix("s:") {
-            return InputAction::Search(rest.trim());
-        }
+    if search_enabled && let Some(rest) = input.strip_prefix("s:") {
+        return InputAction::Search(rest.trim());
     }
     if let Some(rest) = input.strip_prefix("u:") {
         InputAction::OpenUrl(rest.trim())
@@ -407,16 +405,16 @@ fn event_loop(
 
         // Watch a pending paste's pipe. A poll is armed once per readiness, and
         // its completion clears the mark so the next turn arms it again.
-        if let Some(paste) = &client.paste {
-            if paste_armed != Some(client.paste_serial) {
-                ring.prep_poll_add(
-                    paste.fd(),
-                    syscall::POLLIN as u32,
-                    K_PASTE | client.paste_serial,
-                )
-                .map_err(|_| arm_failed())?;
-                paste_armed = Some(client.paste_serial);
-            }
+        if let Some(paste) = &client.paste
+            && paste_armed != Some(client.paste_serial)
+        {
+            ring.prep_poll_add(
+                paste.fd(),
+                syscall::POLLIN as u32,
+                K_PASTE | client.paste_serial,
+            )
+            .map_err(|_| arm_failed())?;
+            paste_armed = Some(client.paste_serial);
         }
 
         // Park until the socket or a paste's pipe is readable, or something is
@@ -426,10 +424,8 @@ fn event_loop(
             park = park.min(paste.remaining_ms());
         }
         // A frame held for a resize's configure is due when the grace runs out.
-        if needs_paint {
-            if let Some(ms) = client.configure_wait_ms() {
-                park = park.min(ms);
-            }
+        if needs_paint && let Some(ms) = client.configure_wait_ms() {
+            park = park.min(ms);
         }
         // Messages left over from a burst are handled first, without parking.
         if input_pending {
@@ -585,10 +581,10 @@ fn dispatch_launch(
     let text = client.editor.text();
     match parse_action(text, search_enabled) {
         InputAction::Search(q) if !q.is_empty() => {
-            if let Some(url) = &cfg.search_url {
-                if let Err(e) = launch::launch_search(url, q) {
-                    elog!("bnklaunch: web search failed: {e}");
-                }
+            if let Some(url) = &cfg.search_url
+                && let Err(e) = launch::launch_search(url, q)
+            {
+                elog!("bnklaunch: web search failed: {e}");
             }
         }
         InputAction::OpenUrl(u) if !u.is_empty() => {
@@ -675,15 +671,15 @@ fn handle_pointer_input(
     // A click on a result row selects it and ends the loop on a launch, which
     // is where Enter arrives too. Clearing the redraw flag on the way out keeps
     // the last pass from resizing a window that is about to go away.
-    if client.pointer.clicked {
-        if let Some(row) = ui::row_at(px, py, total_rows, rows) {
-            *selected = row;
-            client.pointer.clicked = false;
-            client.input_changed = false;
-            client.pending_action = PendingAction::Launch;
-            client.running = false;
-            return;
-        }
+    if client.pointer.clicked
+        && let Some(row) = ui::row_at(px, py, total_rows, rows)
+    {
+        *selected = row;
+        client.pointer.clicked = false;
+        client.input_changed = false;
+        client.pending_action = PendingAction::Launch;
+        client.running = false;
+        return;
     }
 
     let in_input_box = ui::input_box_contains(px, py);

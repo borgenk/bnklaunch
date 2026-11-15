@@ -5,7 +5,7 @@
 
 use crate::platform::arena::{ArrayString, ArrayVec};
 use crate::platform::bytes;
-use crate::platform::fs::{join, ScanPath};
+use crate::platform::fs::{ScanPath, join};
 use crate::platform::syscall::{DT_DIR, DT_LNK, DT_REG};
 use crate::platform::{env, fs};
 #[cfg(test)]
@@ -492,10 +492,10 @@ pub(crate) fn collect_all_paths(paths: &mut ArrayVec<ScanPath, MAX_ENTRIES>) {
     let mut dirs: ArrayVec<ScanPath, MAX_DATA_DIRS> = ArrayVec::new();
     get_data_dirs(&mut dirs);
     for dir in dirs.iter() {
-        if let Some(apps_dir) = join(dir, "applications") {
-            if fs::is_dir(&apps_dir) {
-                collect_paths(&apps_dir, &apps_dir, &mut seen_ids, paths);
-            }
+        if let Some(apps_dir) = join(dir, "applications")
+            && fs::is_dir(&apps_dir)
+        {
+            collect_paths(&apps_dir, &apps_dir, &mut seen_ids, paths);
         }
     }
 }
@@ -748,10 +748,10 @@ fn newest_apps_mtime() -> u64 {
     let mut dirs: ArrayVec<ScanPath, MAX_DATA_DIRS> = ArrayVec::new();
     get_data_dirs(&mut dirs);
     for dir in dirs.iter() {
-        if let Some(apps_dir) = join(dir, "applications") {
-            if let Some(mtime) = fs::mtime_nanos(&apps_dir) {
-                newest = newest.max(mtime);
-            }
+        if let Some(apps_dir) = join(dir, "applications")
+            && let Some(mtime) = fs::mtime_nanos(&apps_dir)
+        {
+            newest = newest.max(mtime);
         }
     }
     newest
@@ -884,10 +884,12 @@ Icon=firefox
         assert_eq!(entry.try_exec, "/usr/bin/st\\eam");
 
         let content = "[Desktop Entry]\nType=Application\nName=Steam\nExec=steam\n";
-        assert!(DesktopEntry::parse(content, "")
-            .expect("entry")
-            .try_exec
-            .is_empty());
+        assert!(
+            DesktopEntry::parse(content, "")
+                .expect("entry")
+                .try_exec
+                .is_empty()
+        );
     }
 
     #[test]

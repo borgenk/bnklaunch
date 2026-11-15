@@ -16,7 +16,7 @@ const NAME_CAP: usize = 128;
 // Links libc, which also resolves the C runtime startup and the mem/str
 // intrinsics the compiler emits (memcpy, memset, strlen, ...).
 #[link(name = "c")]
-extern "C" {
+unsafe extern "C" {
     fn getenv(name: *const c_char) -> *const c_char;
 }
 
@@ -52,10 +52,14 @@ pub fn in_flatpak() -> bool {
 /// ptr must point to a NUL-terminated string that remains valid for 'static.
 unsafe fn cstr_bytes(ptr: *const u8) -> &'static [u8] {
     let mut len = 0;
-    while *ptr.add(len) != 0 {
+    // SAFETY: ptr is NUL-terminated, so every byte up to and including the
+    // terminator is readable, and the walk stops at the terminator.
+    while unsafe { *ptr.add(len) } != 0 {
         len += 1;
     }
-    core::slice::from_raw_parts(ptr, len)
+    // SAFETY: the len bytes before the terminator are readable and, by the
+    // contract above, stay valid for 'static.
+    unsafe { core::slice::from_raw_parts(ptr, len) }
 }
 
 #[cfg(test)]

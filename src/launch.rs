@@ -3,13 +3,13 @@
 use core::ffi::c_char;
 use core::fmt::Write;
 
-use crate::desktop::{exec_argv, Catalog, DesktopEntry, ARG_CAP, MAX_ARGS};
+use crate::desktop::{ARG_CAP, Catalog, DesktopEntry, MAX_ARGS, exec_argv};
 use crate::platform::arena::{ArrayString, ArrayVec};
 use crate::platform::error::{Error, Result};
 use crate::platform::syscall;
 use crate::platform::{env, fs};
 
-extern "C" {
+unsafe extern "C" {
     /// PATH-searching exec; replaces the process image or returns -1 on failure.
     fn execvp(file: *const c_char, argv: *const *const c_char) -> i32;
     /// The calling thread's errno, which a failed execvp sets.

@@ -16,7 +16,7 @@ use crate::desktop::{Catalog, DesktopEntry};
 use crate::dev::png;
 use crate::font::Font;
 use crate::shm::PixelBuffer;
-use crate::ui::{calculate_height, draw_ui, Caret, Rows, Theme, TEXT_W, TEXT_X, WINDOW_WIDTH};
+use crate::ui::{Caret, Rows, TEXT_W, TEXT_X, Theme, WINDOW_WIDTH, calculate_height, draw_ui};
 
 const FIXTURE_FONT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-font.ttf");
 const REFERENCE: &str = concat!(

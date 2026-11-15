@@ -336,9 +336,10 @@ mod tests {
     #[test]
     fn a_keymap_that_does_not_compile_is_an_error() {
         let mut xkb = Xkb::new().expect("xkb context");
-        assert!(xkb
-            .load_keymap(b"this is not a keymap", XKB_KEYMAP_FORMAT_TEXT_V1)
-            .is_err());
+        assert!(
+            xkb.load_keymap(b"this is not a keymap", XKB_KEYMAP_FORMAT_TEXT_V1)
+                .is_err()
+        );
         assert!(xkb.load_keymap(&[], XKB_KEYMAP_FORMAT_TEXT_V1).is_err());
         // A key still types nothing: the failed load left no half-built state.
         assert_eq!(xkb.key_char(keycode::KEY_A), None);

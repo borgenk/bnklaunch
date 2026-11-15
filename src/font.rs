@@ -10,7 +10,7 @@ use crate::platform::arena::ArrayVec;
 use crate::platform::error::{Error, Result};
 use crate::platform::freetype;
 use crate::platform::fs::ScanPath;
-use crate::platform::syscall::{self, Fd, AT_FDCWD, DT_DIR, DT_LNK, DT_REG, O_RDONLY};
+use crate::platform::syscall::{self, AT_FDCWD, DT_DIR, DT_LNK, DT_REG, Fd, O_RDONLY};
 use crate::platform::{env, fs};
 use crate::shm;
 
@@ -88,10 +88,11 @@ impl GlyphCache {
     /// None when the face cannot produce it.
     fn get(&mut self, face: &freetype::Face, ch: char, px: u32) -> Option<Cached> {
         let slot = Self::slot(ch, px);
-        if let Some(hit) = self.slots[slot] {
-            if hit.ch == ch && hit.px == px {
-                return Some(hit);
-            }
+        if let Some(hit) = self.slots[slot]
+            && hit.ch == ch
+            && hit.px == px
+        {
+            return Some(hit);
         }
 
         // A miss, or another glyph sitting in this slot. Rasterize, and take the
@@ -197,10 +198,8 @@ fn font_roots(in_flatpak: bool, home: Option<&str>) -> ArrayVec<ScanPath, MAX_FO
         push(dir);
     }
     // Inside a sandbox the user's tree is /run/host/user-fonts, walked above.
-    if !in_flatpak {
-        if let Some(user_fonts) = home.and_then(|h| fs::join(h, ".local/share/fonts")) {
-            let _ = roots.push(user_fonts);
-        }
+    if !in_flatpak && let Some(user_fonts) = home.and_then(|h| fs::join(h, ".local/share/fonts")) {
+        let _ = roots.push(user_fonts);
     }
     roots
 }

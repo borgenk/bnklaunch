@@ -10,6 +10,14 @@
 //! paths that call them carry no unsafe at all. What is left here is the
 //! assembly plus the few wrappers that still hand back a raw pointer or a
 //! mapping.
+//!
+//! The asm block in each syscallN rests on the x86_64 syscall convention: the
+//! number goes in rax and the arguments in rdi, rsi, rdx, r10, r8 and r9, the
+//! result comes back in rax, and the instruction overwrites rcx and r11, which
+//! are marked clobbered. It touches no user stack, and sysret restores the
+//! flags. What the kernel then does with the arguments is the caller's
+//! contract. The SAFETY comments on those blocks name this rather than restate
+//! it.
 
 #![allow(non_camel_case_types)]
 
@@ -489,14 +497,17 @@ const _: () = assert!(core::mem::size_of::<io_uring_getevents_arg>() == 24);
 #[inline(always)]
 unsafe fn syscall0(nr: usize) -> isize {
     let ret: isize;
-    core::arch::asm!(
-        "syscall",
-        in("rax") nr,
-        lateout("rax") ret,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack, preserves_flags)
-    );
+    // SAFETY: the syscall convention in the module doc.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") nr,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
     ret
 }
 
@@ -504,15 +515,18 @@ unsafe fn syscall0(nr: usize) -> isize {
 #[inline(always)]
 unsafe fn syscall1(nr: usize, a1: usize) -> isize {
     let ret: isize;
-    core::arch::asm!(
-        "syscall",
-        in("rax") nr,
-        in("rdi") a1,
-        lateout("rax") ret,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack, preserves_flags)
-    );
+    // SAFETY: the syscall convention in the module doc.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") nr,
+            in("rdi") a1,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
     ret
 }
 
@@ -520,16 +534,19 @@ unsafe fn syscall1(nr: usize, a1: usize) -> isize {
 #[inline(always)]
 unsafe fn syscall2(nr: usize, a1: usize, a2: usize) -> isize {
     let ret: isize;
-    core::arch::asm!(
-        "syscall",
-        in("rax") nr,
-        in("rdi") a1,
-        in("rsi") a2,
-        lateout("rax") ret,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack, preserves_flags)
-    );
+    // SAFETY: the syscall convention in the module doc.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") nr,
+            in("rdi") a1,
+            in("rsi") a2,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
     ret
 }
 
@@ -537,17 +554,20 @@ unsafe fn syscall2(nr: usize, a1: usize, a2: usize) -> isize {
 #[inline(always)]
 unsafe fn syscall3(nr: usize, a1: usize, a2: usize, a3: usize) -> isize {
     let ret: isize;
-    core::arch::asm!(
-        "syscall",
-        in("rax") nr,
-        in("rdi") a1,
-        in("rsi") a2,
-        in("rdx") a3,
-        lateout("rax") ret,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack, preserves_flags)
-    );
+    // SAFETY: the syscall convention in the module doc.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") nr,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
     ret
 }
 
@@ -555,18 +575,21 @@ unsafe fn syscall3(nr: usize, a1: usize, a2: usize, a3: usize) -> isize {
 #[inline(always)]
 unsafe fn syscall4(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> isize {
     let ret: isize;
-    core::arch::asm!(
-        "syscall",
-        in("rax") nr,
-        in("rdi") a1,
-        in("rsi") a2,
-        in("rdx") a3,
-        in("r10") a4,
-        lateout("rax") ret,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack, preserves_flags)
-    );
+    // SAFETY: the syscall convention in the module doc.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") nr,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            in("r10") a4,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
     ret
 }
 
@@ -582,20 +605,23 @@ unsafe fn syscall6(
     a6: usize,
 ) -> isize {
     let ret: isize;
-    core::arch::asm!(
-        "syscall",
-        in("rax") nr,
-        in("rdi") a1,
-        in("rsi") a2,
-        in("rdx") a3,
-        in("r10") a4,
-        in("r8") a5,
-        in("r9") a6,
-        lateout("rax") ret,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack, preserves_flags)
-    );
+    // SAFETY: the syscall convention in the module doc.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") nr,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            in("r10") a4,
+            in("r8") a5,
+            in("r9") a6,
+            lateout("rax") ret,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack, preserves_flags)
+        );
+    }
     ret
 }
 
@@ -627,15 +653,19 @@ pub unsafe fn mmap(
     fd: RawFd,
     offset: off_t,
 ) -> *mut c_void {
-    syscall6(
-        nr::MMAP,
-        addr as usize,
-        length,
-        prot as usize,
-        flags as usize,
-        fd as usize,
-        offset as usize,
-    ) as *mut c_void
+    // SAFETY: the kernel reads no memory through these arguments. What the new
+    // mapping replaces or exposes is the caller's contract.
+    unsafe {
+        syscall6(
+            nr::MMAP,
+            addr as usize,
+            length,
+            prot as usize,
+            flags as usize,
+            fd as usize,
+            offset as usize,
+        ) as *mut c_void
+    }
 }
 
 /// Whether an mmap return value indicates failure.
@@ -661,7 +691,8 @@ pub fn mmap_errno(ptr: *mut c_void) -> i32 {
 
 /// Unmap a mapped region.
 pub unsafe fn munmap(addr: *mut c_void, length: usize) -> i32 {
-    syscall2(nr::MUNMAP, addr as usize, length) as i32
+    // SAFETY: the caller guarantees nothing still refers into the region.
+    unsafe { syscall2(nr::MUNMAP, addr as usize, length) as i32 }
 }
 
 /// A read-only mapping of a file, unmapped when dropped.
@@ -721,12 +752,16 @@ pub fn read_mapped(fd: RawFd, len: usize) -> Result<Mapped> {
 
 /// Send a message on a socket.
 pub unsafe fn sendmsg(sockfd: RawFd, msg: *const msghdr, flags: i32) -> isize {
-    syscall3(nr::SENDMSG, sockfd as usize, msg as usize, flags as usize)
+    // SAFETY: the caller passes a msghdr whose buffers are live and as long as
+    // it claims, and the kernel only reads them.
+    unsafe { syscall3(nr::SENDMSG, sockfd as usize, msg as usize, flags as usize) }
 }
 
 /// Receive a message from a socket.
 pub unsafe fn recvmsg(sockfd: RawFd, msg: *mut msghdr, flags: i32) -> isize {
-    syscall3(nr::RECVMSG, sockfd as usize, msg as usize, flags as usize)
+    // SAFETY: the caller passes a msghdr whose buffers are live and as long as
+    // it claims, and the kernel writes no more than that.
+    unsafe { syscall3(nr::RECVMSG, sockfd as usize, msg as usize, flags as usize) }
 }
 
 /// The kernel's sigaction, which is not glibc's: the field order here (handler,
@@ -867,7 +902,9 @@ pub fn fcntl(fd: RawFd, cmd: i32, arg: i32) -> i32 {
 /// Fork the process. Returns the child pid in the parent, 0 in the child, or a
 /// negated errno.
 pub unsafe fn fork() -> i32 {
-    syscall0(nr::FORK) as i32
+    // SAFETY: no pointer crosses the boundary. What the child may do after it
+    // is the caller's contract.
+    unsafe { syscall0(nr::FORK) as i32 }
 }
 
 /// Duplicate oldfd onto newfd, closing newfd first. Returns newfd or a negated
@@ -896,7 +933,9 @@ pub fn exit_group(status: i32) -> ! {
 
 /// Close a file descriptor.
 pub unsafe fn close(fd: RawFd) -> i32 {
-    syscall1(nr::CLOSE, fd as usize) as i32
+    // SAFETY: no pointer crosses the boundary, and the caller guarantees fd is
+    // its own to close.
+    unsafe { syscall1(nr::CLOSE, fd as usize) as i32 }
 }
 
 /// close_range flag: mark the descriptors close-on-exec, closing none (Linux 5.11).
@@ -1033,11 +1072,7 @@ pub fn fstat(fd: RawFd) -> Option<stat> {
     // kernel then fills; the pointer is exclusively borrowed for this call.
     let mut st: stat = unsafe { core::mem::zeroed() };
     let r = unsafe { syscall2(nr::FSTAT, fd as usize, &mut st as *mut stat as usize) as i32 };
-    if r < 0 {
-        None
-    } else {
-        Some(st)
-    }
+    if r < 0 { None } else { Some(st) }
 }
 
 /// Stat a path relative to dirfd, or None on error.
@@ -1054,11 +1089,7 @@ pub fn newfstatat(dirfd: RawFd, path: &CPath, flags: i32) -> Option<stat> {
             flags as usize,
         ) as i32
     };
-    if r < 0 {
-        None
-    } else {
-        Some(st)
-    }
+    if r < 0 { None } else { Some(st) }
 }
 
 const _: () = assert!(core::mem::size_of::<stat>() == 144);
@@ -1139,8 +1170,10 @@ pub const fn cmsg_len(data_len: usize) -> usize {
 /// Equivalent to CMSG_FIRSTHDR macro.
 #[inline]
 pub unsafe fn cmsg_firsthdr(msg: *const msghdr) -> *mut cmsghdr {
-    if (*msg).msg_controllen >= core::mem::size_of::<cmsghdr>() {
-        (*msg).msg_control as *mut cmsghdr
+    // SAFETY: the caller passes a pointer to a live msghdr.
+    let (control, control_len) = unsafe { ((*msg).msg_control, (*msg).msg_controllen) };
+    if control_len >= core::mem::size_of::<cmsghdr>() {
+        control as *mut cmsghdr
     } else {
         core::ptr::null_mut()
     }
@@ -1156,15 +1189,22 @@ pub unsafe fn cmsg_firsthdr(msg: *const msghdr) -> *mut cmsghdr {
 #[inline]
 pub unsafe fn cmsg_nxthdr(msg: *const msghdr, cmsg: *const cmsghdr) -> *mut cmsghdr {
     let header = core::mem::size_of::<cmsghdr>();
+    // SAFETY: the caller passes a live msghdr and a whole header inside its
+    // control buffer, aligned for cmsghdr.
+    let (record_len, base, len) = unsafe {
+        (
+            (*cmsg).cmsg_len,
+            (*msg).msg_control as usize,
+            (*msg).msg_controllen,
+        )
+    };
     // A record shorter than its own header is malformed; the kernel does not
     // produce one, and trusting it would run the walk off into the buffer.
-    if (*cmsg).cmsg_len < header {
+    if record_len < header {
         return core::ptr::null_mut();
     }
 
-    let base = (*msg).msg_control as usize;
-    let len = (*msg).msg_controllen;
-    let offset = (cmsg as usize) - base + cmsg_align((*cmsg).cmsg_len);
+    let offset = (cmsg as usize) - base + cmsg_align(record_len);
 
     // The next header must fit whole inside the control buffer.
     if offset.saturating_add(header) > len {
@@ -1290,7 +1330,10 @@ pub fn recv_with_fds<const N: usize>(
 /// Equivalent to CMSG_DATA macro.
 #[inline]
 pub unsafe fn cmsg_data(cmsg: *const cmsghdr) -> *mut u8 {
-    (cmsg as *mut u8).add(cmsg_align(core::mem::size_of::<cmsghdr>()))
+    // SAFETY: the caller passes a whole header inside a control buffer, and the
+    // offset is that header's aligned size, so the result stays within the
+    // buffer or one past its end.
+    unsafe { (cmsg as *mut u8).add(cmsg_align(core::mem::size_of::<cmsghdr>())) }
 }
 
 #[cfg(test)]

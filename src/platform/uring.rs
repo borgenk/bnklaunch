@@ -55,11 +55,11 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::platform::arena::ArrayVec;
 use crate::platform::syscall::{
-    self, io_uring_cqe, io_uring_getevents_arg, io_uring_params, io_uring_sqe, kernel_timespec,
-    CPath, RawFd, AT_FDCWD, IORING_ENTER_EXT_ARG, IORING_ENTER_GETEVENTS, IORING_FEAT_EXT_ARG,
-    IORING_FEAT_SINGLE_MMAP, IORING_OFF_CQ_RING, IORING_OFF_SQES, IORING_OFF_SQ_RING,
+    self, AT_FDCWD, CPath, IORING_ENTER_EXT_ARG, IORING_ENTER_GETEVENTS, IORING_FEAT_EXT_ARG,
+    IORING_FEAT_SINGLE_MMAP, IORING_OFF_CQ_RING, IORING_OFF_SQ_RING, IORING_OFF_SQES,
     IORING_OP_CLOSE, IORING_OP_NOP, IORING_OP_OPENAT, IORING_OP_POLL_ADD, IORING_OP_READ,
-    IOSQE_IO_LINK, MAP_POPULATE, MAP_SHARED, O_RDONLY, PROT_READ, PROT_WRITE,
+    IOSQE_IO_LINK, MAP_POPULATE, MAP_SHARED, O_RDONLY, PROT_READ, PROT_WRITE, RawFd, io_uring_cqe,
+    io_uring_getevents_arg, io_uring_params, io_uring_sqe, kernel_timespec,
 };
 
 /// An io_uring instance with its mapped rings.
@@ -536,10 +536,10 @@ pub fn read_files(
             continue;
         }
         let i = cqe.user_data as usize;
-        if cqe.res > 0 {
-            if let Some(len) = lens.get_mut(i) {
-                *len = cqe.res as usize;
-            }
+        if cqe.res > 0
+            && let Some(len) = lens.get_mut(i)
+        {
+            *len = cqe.res as usize;
         }
     }
     Ok(())

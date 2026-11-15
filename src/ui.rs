@@ -1,7 +1,7 @@
 //! Software rendering of the launcher: theme, layout, and the draw routines
 //! that composite the input field and result rows into the pixel buffer.
 
-use crate::app::{normalize_url, parse_action, AppState, InputAction};
+use crate::app::{AppState, InputAction, normalize_url, parse_action};
 use crate::desktop::{self, DesktopEntry};
 use crate::launch::URL_CAP;
 use crate::platform::arena;

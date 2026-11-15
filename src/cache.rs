@@ -35,7 +35,7 @@ use crate::desktop::{Catalog, DesktopEntry, NAME_CAP, RESULT_CAP};
 use crate::platform::arena::{ArrayString, ArrayVec};
 use crate::platform::bytes::Cursor;
 use crate::platform::error::{Error, Result};
-use crate::platform::syscall::{self, Fd, AT_FDCWD, O_CLOEXEC, O_WRONLY, SEEK_SET};
+use crate::platform::syscall::{self, AT_FDCWD, Fd, O_CLOEXEC, O_WRONLY, SEEK_SET};
 use crate::platform::{env, fs};
 
 const MAGIC: &[u8; 4] = b"BNKL";
@@ -194,10 +194,10 @@ pub fn resolve<'a>(
     let mut out: ArrayVec<&DesktopEntry, RESULT_CAP> = ArrayVec::new();
     // Names are unique, so a linear lookup matches each recent at most once.
     for name in recents {
-        if let Some(entry) = entries.iter().find(|e| e.name.as_str() == name.as_str()) {
-            if out.push(entry).is_err() {
-                break;
-            }
+        if let Some(entry) = entries.iter().find(|e| e.name.as_str() == name.as_str())
+            && out.push(entry).is_err()
+        {
+            break;
         }
     }
     out
