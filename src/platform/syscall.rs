@@ -1166,6 +1166,13 @@ pub const fn cmsg_len(data_len: usize) -> usize {
     cmsg_align(core::mem::size_of::<cmsghdr>()) + data_len
 }
 
+/// A control-message buffer, aligned so a cmsghdr can sit at its start. Every
+/// later header sits a multiple of CMSG_ALIGN_SIZE further on.
+#[repr(C, align(8))]
+struct CmsgBuf([u8; CMSG_BUF]);
+
+const _: () = assert!(core::mem::align_of::<CmsgBuf>() >= core::mem::align_of::<cmsghdr>());
+
 /// Get pointer to the first cmsghdr in a msghdr.
 /// Equivalent to CMSG_FIRSTHDR macro.
 #[inline]
@@ -1223,22 +1230,24 @@ pub fn send_with_fds(fd: RawFd, data: &[u8], fds: &[RawFd]) -> isize {
         iov_base: data.as_ptr() as *mut c_void,
         iov_len: data.len(),
     };
-    let mut cmsg_buf = [0u8; CMSG_BUF];
+    let mut cmsg_buf = CmsgBuf([0; CMSG_BUF]);
     let control_len = cmsg_space(core::mem::size_of_val(fds));
 
     // SAFETY: msg is zeroed, then given one iovec covering data and a control
     // buffer of control_len bytes, both live for the call. control_len is what
     // cmsg_space computes for these fds and cmsg_buf is larger (checked below),
     // so the header and the fd array written through the cmsg pointers stay
-    // inside cmsg_buf. MSG_NOSIGNAL keeps a hung-up peer from raising SIGPIPE.
+    // inside cmsg_buf. CmsgBuf aligns the header, and the fd array starts a
+    // multiple of CMSG_ALIGN_SIZE after it. MSG_NOSIGNAL keeps a hung-up peer
+    // from raising SIGPIPE.
     unsafe {
-        if control_len > cmsg_buf.len() {
+        if control_len > cmsg_buf.0.len() {
             return -(EINVAL as isize);
         }
         let mut msg: msghdr = core::mem::zeroed();
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
-        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut c_void;
+        msg.msg_control = cmsg_buf.0.as_mut_ptr() as *mut c_void;
         msg.msg_controllen = control_len;
 
         let cmsg = cmsg_firsthdr(&msg);
@@ -1272,22 +1281,24 @@ pub fn recv_with_fds<const N: usize>(
         iov_base: buf.as_mut_ptr() as *mut c_void,
         iov_len: buf.len(),
     };
-    let mut cmsg_buf = [0u8; CMSG_BUF];
+    let mut cmsg_buf = CmsgBuf([0; CMSG_BUF]);
 
     // SAFETY: msg is zeroed, then given one iovec covering buf and the whole of
     // cmsg_buf as its control buffer, both live for the call. The kernel writes
     // no more than msg_controllen bytes of ancillary data, and the cmsg walk
-    // below stays inside what it reports back.
+    // below stays inside what it reports back. CmsgBuf aligns the first header,
+    // and cmsg_nxthdr and cmsg_data step by multiples of CMSG_ALIGN_SIZE, so
+    // every header and fd array the walk reads is aligned too.
     unsafe {
         let mut msg: msghdr = core::mem::zeroed();
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
-        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut c_void;
+        msg.msg_control = cmsg_buf.0.as_mut_ptr() as *mut c_void;
 
         let n = loop {
             // recvmsg overwrites these, so reset them per attempt: each retry
             // has to offer the full ancillary buffer.
-            msg.msg_controllen = cmsg_buf.len();
+            msg.msg_controllen = cmsg_buf.0.len();
             msg.msg_flags = 0;
             let r = recvmsg(fd, &mut msg, MSG_CMSG_CLOEXEC);
             if r == -(EINTR as isize) {
